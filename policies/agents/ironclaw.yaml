@@ -14,6 +14,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
+    - "~/.axis"
     - "~/.ironclaw"
     - "~/.config"
   deny:

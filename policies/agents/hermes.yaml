@@ -16,6 +16,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
+    - "~/.axis"
     - "~/.hermes"
     - "~/.config"
   deny:

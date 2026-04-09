@@ -1,6 +1,10 @@
 version: 1
 name: agent-claude-code
 
+# All agent state is contained under ~/.axis/agents/agent-claude-code/
+# Symlinks: ~/.claude -> ~/.axis/agents/agent-claude-code/claude
+#           ~/.local/share/claude -> ~/.axis/agents/agent-claude-code/claude-share
+
 filesystem:
   read_only:
     - /usr
@@ -19,6 +23,7 @@ filesystem:
     - "~/.local/share/claude"
     - "~/.config"
     - "~/Library"
+    - "~/.axis"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

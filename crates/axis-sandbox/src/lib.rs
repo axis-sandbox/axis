@@ -12,5 +12,7 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+pub mod workspace;
+
 mod sandbox;
 pub use sandbox::{Sandbox, SandboxConfig, SandboxError};

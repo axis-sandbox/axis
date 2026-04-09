@@ -16,6 +16,7 @@ filesystem:
     - /Library
   read_write:
     - "{workspace}"
+    - "~/.axis"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

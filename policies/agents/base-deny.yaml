@@ -20,6 +20,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
+    - "~/.axis"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

@@ -56,11 +56,23 @@ pub struct Sandbox {
     pub pid: Option<u32>,
     pub workspace_dir: PathBuf,
     inner: Box<dyn SandboxImpl>,
+    /// Symlinks created for agent state containment (cleaned up on destroy).
+    agent_symlinks: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Sandbox {
     /// Create a new sandbox with platform-specific isolation.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
+        // Prepare agent workspace: create ~/.axis/agents/<name>/ and
+        // symlink agent-expected directories (e.g., ~/.claude) to it.
+        let agent_symlinks = crate::workspace::prepare_agent_workspace(
+            &config.policy.name,
+            &config.policy.filesystem.read_write,
+        ).unwrap_or_else(|e| {
+            tracing::warn!("workspace prep: {e}");
+            Vec::new()
+        });
+
         let inner = create_platform_sandbox(&config)?;
         Ok(Self {
             id: config.id,
@@ -68,6 +80,7 @@ impl Sandbox {
             pid: None,
             workspace_dir: config.workspace_dir,
             inner,
+            agent_symlinks,
         })
     }
 
@@ -89,6 +102,8 @@ impl Sandbox {
     /// Terminate the sandboxed process and clean up resources.
     pub fn destroy(&mut self) -> Result<(), SandboxError> {
         self.inner.destroy()?;
+        // Restore original directories by removing symlinks.
+        crate::workspace::cleanup_agent_symlinks(&self.agent_symlinks);
         self.status = SandboxStatus::Stopped;
         Ok(())
     }
