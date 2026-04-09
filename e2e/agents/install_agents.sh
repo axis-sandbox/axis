@@ -174,32 +174,40 @@ create_wrapper() {
     local agent_name="$1"
     local binary_path="$2"
     local policy_file="$3"
-    local wrapper="$BIN_DIR/axis-${agent_name}"
+    local binary_name="${AGENT_BINARY[$agent_name]}"
 
     # Find axis binary.
     local axis_bin
-    axis_bin=$(command -v axis 2>/dev/null || echo "${BIN_DIR}/../bin/axis")
-    if [ ! -x "$axis_bin" ]; then
-        # Search common locations.
+    axis_bin=$(command -v axis 2>/dev/null || echo "")
+    if [ -z "$axis_bin" ] || [ ! -x "$axis_bin" ]; then
         for candidate in /usr/local/bin/axis /usr/bin/axis "$HOME/.local/bin/axis" "$HOME/.cargo/bin/axis"; do
             if [ -x "$candidate" ]; then axis_bin="$candidate"; break; fi
         done
     fi
+    axis_bin="${axis_bin:-axis}"
+
+    # Create wrapper named as the original binary (e.g., "claude", "codex").
+    # When ~/.axis/bin is first in PATH, running "claude" goes through AXIS.
+    local wrapper="$BIN_DIR/${binary_name}"
 
     cat > "$wrapper" << WRAPPER
 #!/bin/bash
-# AXIS-sandboxed ${agent_name}
-# All execution goes through the AXIS sandbox with default-deny policy.
-# Agent state is contained under ~/.axis/agents/
+# AXIS-sandboxed ${binary_name}
 #
-# Usage: axis-${agent_name} [agent args...]
+# This wrapper ensures ${binary_name} ALWAYS runs inside an AXIS sandbox.
+# Agent state: ~/.axis/agents/
+# Policy:      ${policy_file}
+# Real binary: ${binary_path}
+#
+# Usage: ${binary_name} [args...]       (when ~/.axis/bin is in PATH)
+#    or: axis ${binary_name} [args...]  (via axis subcommand extension)
 
 AXIS_BIN="\${AXIS_BIN:-${axis_bin}}"
 exec "\$AXIS_BIN" run --policy "${policy_file}" -- "${binary_path}" "\$@"
 WRAPPER
 
     chmod +x "$wrapper"
-    echo "  Wrapper: $wrapper"
+    echo "  Wrapper: $wrapper  (run as: ${binary_name})"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -232,7 +240,9 @@ else
         echo "Available: $ALL_AGENTS"
         echo ""
         echo "Agents are installed to ~/.axis/tools/ and wrapped with"
-        echo "AXIS sandbox policies. Run via: axis-<agent-name>"
+        echo "AXIS sandbox policies. Add ~/.axis/bin to PATH, then run"
+        echo "agents normally: claude, codex, aider, etc."
+        echo "Or use: axis claude, axis codex, axis aider"
         exit 0
     fi
 fi
@@ -283,12 +293,17 @@ echo "════════════════════════�
 echo "Installed: $INSTALLED  Failed: $FAILED"
 echo ""
 if [ $INSTALLED -gt 0 ]; then
-    echo "Add to PATH:  export PATH=\"$BIN_DIR:\$PATH\""
+    echo "Add to PATH (before system paths):"
     echo ""
-    echo "Run agents safely:"
+    echo "  export PATH=\"$BIN_DIR:\$PATH\""
+    echo ""
+    echo "Then run agents normally — they go through AXIS automatically:"
+    echo ""
     for agent in $AGENTS; do
-        if [ -x "$BIN_DIR/axis-${agent}" ]; then
-            echo "  axis-${agent} --version"
+        local_bin="${AGENT_BINARY[$agent]:-$agent}"
+        if [ -x "$BIN_DIR/$local_bin" ]; then
+            echo "  $local_bin --version        # runs through AXIS sandbox"
+            echo "  axis $local_bin --version   # same thing, explicit"
         fi
     done
 fi

@@ -27,6 +27,15 @@ pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 skip() { echo "  SKIP: $1"; SKIP=$((SKIP+1)); }
 
+# Agent name → binary name mapping.
+declare -A AGENT_BIN
+AGENT_BIN[claude-code]="claude"
+AGENT_BIN[codex]="codex"
+AGENT_BIN[openclaw]="openclaw"
+AGENT_BIN[ironclaw]="ironclaw"
+AGENT_BIN[aider]="aider"
+AGENT_BIN[goose]="goose"
+
 ALL_AGENTS="claude-code codex openclaw ironclaw aider goose"
 
 if [ "${1:-}" = "--all" ]; then
@@ -36,7 +45,8 @@ else
 fi
 
 for agent in $AGENTS; do
-    WRAPPER="$BIN_DIR/axis-${agent}"
+    BIN_NAME="${AGENT_BIN[$agent]:-$agent}"
+    WRAPPER="$BIN_DIR/${BIN_NAME}"
     echo "--- $agent ---"
 
     # Test 1: Wrapper exists.

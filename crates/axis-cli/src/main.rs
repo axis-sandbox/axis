@@ -139,6 +139,13 @@ enum InferenceAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Git-style subcommand extension: if the first arg matches a wrapper
+    // in ~/.axis/bin/, execute it directly. This lets `axis claude ...`
+    // work as `claude ...` through the AXIS sandbox.
+    if let Some(result) = try_agent_subcommand() {
+        std::process::exit(result);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -578,6 +585,59 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Git-style subcommand extension.
+///
+/// If `axis claude -p "hello"` is run and "claude" is not a built-in
+/// subcommand, check ~/.axis/bin/claude for a wrapper. If found, exec it
+/// with the remaining args. This lets `axis <agent> [args]` work for any
+/// installed agent.
+fn try_agent_subcommand() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Need at least: axis <subcommand>
+    if args.len() < 2 {
+        return None;
+    }
+
+    let subcmd = &args[1];
+
+    // Skip if it's a built-in command, a flag, or --help/--version.
+    if subcmd.starts_with('-') {
+        return None;
+    }
+    let builtins = [
+        "create", "exec", "destroy", "list", "logs", "run", "install",
+        "policy", "model", "inference", "help",
+    ];
+    if builtins.contains(&subcmd.as_str()) {
+        return None;
+    }
+
+    // Look for wrapper in ~/.axis/bin/<subcmd>.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let wrapper = std::path::PathBuf::from(&home)
+        .join(".axis")
+        .join("bin")
+        .join(subcmd);
+
+    if !wrapper.exists() || !wrapper.is_file() {
+        return None;
+    }
+
+    // Found a wrapper — exec it with remaining args.
+    let agent_args: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
+
+    let status = std::process::Command::new(&wrapper)
+        .args(&agent_args)
+        .env("AXIS_BIN", std::env::current_exe().unwrap_or_default())
+        .status()
+        .ok()?;
+
+    Some(status.code().unwrap_or(1))
 }
 
 /// Send a JSON request to the axsd daemon via IPC.
