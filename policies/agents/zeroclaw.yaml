@@ -1,0 +1,34 @@
+version: 1
+name: agent-zeroclaw
+
+# ZeroClaw — zero-trust agent, maximum isolation.
+# No network, no extra filesystem, strict process limits.
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+  read_write:
+    - "{workspace}"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.kube"
+    - "~/.docker"
+    - "~/.config"
+
+process:
+  max_processes: 16
+  max_memory_mb: 2048
+  cpu_rate_percent: 50
+  timeout_sec: 120
+
+network:
+  mode: block

@@ -80,6 +80,9 @@ jobs:
       - name: Daemon e2e test
         run: bash e2e/linux/test_e2e_daemon.sh
 
+      - name: Agent safety tests
+        run: bash e2e/agents/test_agents.sh --platform linux
+
   test-windows:
     name: Test (Windows native)
     needs: changes
@@ -101,3 +104,10 @@ jobs:
           .\target\release\axis.exe policy validate policies\minimal.yaml
           .\target\release\axis.exe policy validate policies\coding-agent.yaml
           .\target\release\axis.exe policy validate policies\gpu-agent.yaml
+
+      - name: Agent policy validation
+        run: |
+          Get-ChildItem policies\agents\*.yaml | ForEach-Object {
+            .\target\release\axis.exe policy validate $_.FullName
+          }
+        shell: pwsh

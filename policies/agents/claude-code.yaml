@@ -1,0 +1,65 @@
+version: 1
+name: agent-claude-code
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+    - /Applications
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+    - "~/.claude"
+    - "~/.local/share/claude"
+    - "~/.config"
+    - "~/Library"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.kube"
+    - "~/.docker"
+
+process:
+  max_processes: 128
+  max_memory_mb: 16384
+  cpu_rate_percent: 90
+  timeout_sec: 600
+
+network:
+  mode: proxy
+  policies:
+    - name: anthropic
+      endpoints:
+        - host: "api.anthropic.com"
+          port: 443
+        - host: "auth.anthropic.com"
+          port: 443
+    - name: telemetry
+      endpoints:
+        - host: "o4509177054044160.ingest.us.sentry.io"
+          port: 443
+        - host: "api.statsig.com"
+          port: 443
+        - host: "featureassets.org"
+          port: 443
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+        - host: "github.com"
+          port: 443
+    - name: packages
+      endpoints:
+        - host: "registry.npmjs.org"
+          port: 443
+        - host: "pypi.org"
+          port: 443
+        - host: "files.pythonhosted.org"
+          port: 443

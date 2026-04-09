@@ -1,0 +1,48 @@
+version: 1
+name: agent-ironclaw
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+    - "~/.ironclaw"
+    - "~/.config"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.kube"
+    - "~/.docker"
+
+process:
+  max_processes: 64
+  max_memory_mb: 8192
+  cpu_rate_percent: 80
+  timeout_sec: 600
+
+network:
+  mode: proxy
+  policies:
+    - name: ironclaw-api
+      endpoints:
+        - host: "api.anthropic.com"
+          port: 443
+        - host: "api.openai.com"
+          port: 443
+        - host: "api.near.ai"
+          port: 443
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+        - host: "github.com"
+          port: 443

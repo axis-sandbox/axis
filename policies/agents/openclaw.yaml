@@ -1,0 +1,62 @@
+version: 1
+name: agent-openclaw
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+    - "~/.openclaw"
+    - "~/.config"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.kube"
+    - "~/.docker"
+
+process:
+  max_processes: 64
+  max_memory_mb: 8192
+  cpu_rate_percent: 80
+  timeout_sec: 600
+  blocked_syscalls:
+    - fork
+
+network:
+  mode: proxy
+  policies:
+    - name: openclaw-api
+      endpoints:
+        - host: "api.anthropic.com"
+          port: 443
+        - host: "api.openai.com"
+          port: 443
+    - name: clawhub
+      endpoints:
+        - host: "clawhub.ai"
+          port: 443
+        - host: "api.clawhub.ai"
+          port: 443
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+        - host: "github.com"
+          port: 443
+    - name: packages
+      endpoints:
+        - host: "registry.npmjs.org"
+          port: 443
+        - host: "pypi.org"
+          port: 443
+        - host: "files.pythonhosted.org"
+          port: 443

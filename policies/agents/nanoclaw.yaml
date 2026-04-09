@@ -1,0 +1,38 @@
+version: 1
+name: agent-nanoclaw
+
+# NanoClaw — lightweight agent, minimal permissions.
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+
+process:
+  max_processes: 32
+  max_memory_mb: 4096
+  cpu_rate_percent: 50
+  timeout_sec: 300
+
+network:
+  mode: proxy
+  policies:
+    - name: llm-api
+      endpoints:
+        - host: "api.anthropic.com"
+          port: 443
+        - host: "api.openai.com"
+          port: 443

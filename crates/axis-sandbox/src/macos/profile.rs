@@ -52,9 +52,10 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
         }
     }
 
-    // Temp directories.
+    // Temp directories (macOS uses /private/var/folders for TMPDIR).
     sb.push_str("(allow file-read* file-write* (subpath \"/tmp\"))\n");
     sb.push_str("(allow file-read* file-write* (subpath \"/private/tmp\"))\n");
+    sb.push_str("(allow file-read* file-write* (subpath \"/private/var/folders\"))\n");
 
     // TTY/PTY for stdout/stderr.
     sb.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys\"))\n");

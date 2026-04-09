@@ -1,0 +1,37 @@
+version: 1
+name: agent-base-deny
+
+# Default deny policy for all agent runtimes.
+# This is the MINIMUM policy — agents get filesystem isolation,
+# network deny, and process limits. Individual agent policies
+# extend this with specific network allowlists.
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+    - /Applications
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.kube"
+    - "~/.docker"
+
+process:
+  max_processes: 64
+  max_memory_mb: 8192
+  cpu_rate_percent: 80
+  timeout_sec: 600
+
+network:
+  mode: block
