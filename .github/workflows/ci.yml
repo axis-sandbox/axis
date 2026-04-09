@@ -3,25 +3,59 @@ name: CI
 on:
   push:
     branches: [main, develop, "users/**"]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".github/workflows/nightly.yml"
-      - ".github/workflows/release.yml"
   pull_request:
     branches: [main, develop]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Format and clippy always run (fast, catch style issues on all changes).
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check || true  # advisory
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -- -D warnings || true  # advisory, don't block
+
+  # Build and test jobs skip on docs-only changes.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'policies/**'
+              - 'data/**'
+              - '.github/workflows/ci.yml'
+
   test-linux:
     name: Test (Linux)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +82,8 @@ jobs:
 
   test-windows:
     name: Test (Windows native)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,24 +101,3 @@ jobs:
           .\target\release\axis.exe policy validate policies\minimal.yaml
           .\target\release\axis.exe policy validate policies\coding-agent.yaml
           .\target\release\axis.exe policy validate policies\gpu-agent.yaml
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings || true  # advisory, don't block
-
-  format:
-    name: Format
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check || true  # advisory
