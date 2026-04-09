@@ -1,6 +1,6 @@
 # AXIS: Agent eXecution Isolation Substrate
 
-AMD's native agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on AMD client hardware. No containers, no VMs, no admin privileges.
+A high-performance OS-native agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. No containers, no VMs, no admin privileges.
 
 ## What It Does
 
