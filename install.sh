@@ -140,7 +140,7 @@ install() {
     fi
 
     # Install binaries.
-    for bin in axis axsd; do
+    for bin in axis axisd; do
         if [ "$OS" = "windows" ]; then
             BIN_NAME="${bin}.exe"
         else

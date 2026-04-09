@@ -4,7 +4,7 @@
 //! Inference server lifecycle management.
 //!
 //! Three modes:
-//! - **Managed**: axsd spawns `llama-server` or `vllm` as a child process
+//! - **Managed**: axisd spawns `llama-server` or `vllm` as a child process
 //! - **External**: connects to a user-specified endpoint
 //! - **Embedded**: loads a GGUF model directly via llama-cpp-rs (in-process)
 
@@ -34,7 +34,7 @@ pub enum ServerError {
 /// Server operation mode.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
-    /// axsd spawns and manages a llama-server or vLLM process.
+    /// axisd spawns and manages a llama-server or vLLM process.
     Managed {
         backend: ManagedBackend,
         binary: PathBuf,

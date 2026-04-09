@@ -1,7 +1,7 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! IPC server for axsd ↔ CLI communication.
+//! IPC server for axisd ↔ CLI communication.
 //! Unix sockets on Linux/macOS, TCP on Windows.
 
 use crate::sandbox_mgr::SandboxManager;
@@ -17,9 +17,9 @@ pub fn default_socket_path() -> PathBuf {
         return PathBuf::from(path);
     }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("axis").join("axsd.sock")
+        PathBuf::from(xdg).join("axis").join("axisd.sock")
     } else {
-        PathBuf::from("/tmp/axis-axsd.sock")
+        PathBuf::from("/tmp/axis-axisd.sock")
     }
 }
 

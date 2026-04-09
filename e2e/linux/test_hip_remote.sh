@@ -12,7 +12,7 @@ WORKER=~/axis/hip-remote/hip-worker
 CLIENT_LIB=~/axis/hip-remote/libamdhip64.so
 ROCM_LIBS=~/axis/hip-remote/rocm-libs
 AXIS=~/axis/axis
-AXSD=~/axis/axsd
+AXSD=~/axis/axisd
 
 export LD_LIBRARY_PATH="$ROCM_LIBS:${LD_LIBRARY_PATH:-}"
 

@@ -1,7 +1,7 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP health check endpoint for axsd.
+//! HTTP health check endpoint for axisd.
 //!
 //! Runs a minimal HTTP server on a configurable port (default 18517).
 //! Returns JSON with daemon status for monitoring/alerting.

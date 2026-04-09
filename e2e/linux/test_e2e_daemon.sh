@@ -1,11 +1,11 @@
 #!/bin/bash
-# End-to-end test: axsd daemon + axis CLI interaction.
+# End-to-end test: axisd daemon + axis CLI interaction.
 # Tests the full create → list → destroy lifecycle.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AXIS="${1:-$SCRIPT_DIR/../../target/release/axis}"
-AXSD="${AXIS%axis}axsd"
+AXSD="${AXIS%axis}axisd"
 
 # Find policies relative to binary or script
 if [ -d "$(dirname "$AXIS")/../../policies" ]; then
@@ -22,7 +22,7 @@ SOCKET="/tmp/axis-e2e-test-$$.sock"
 
 echo "=== AXIS Daemon E2E Test ==="
 echo "axis: $AXIS"
-echo "axsd: $AXSD"
+echo "axisd: $AXSD"
 echo "socket: $SOCKET"
 echo ""
 
@@ -39,16 +39,16 @@ PASS=0; FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
-# ── Start axsd ──
-echo "--- Starting axsd ---"
+# ── Start axisd ──
+echo "--- Starting axisd ---"
 AXIS_SOCKET="$SOCKET" $AXSD &
 AXSD_PID=$!
 sleep 0.5
 
 if kill -0 "$AXSD_PID" 2>/dev/null; then
-    pass "axsd started (pid=$AXSD_PID)"
+    pass "axisd started (pid=$AXSD_PID)"
 else
-    fail "axsd failed to start"
+    fail "axisd failed to start"
     exit 1
 fi
 

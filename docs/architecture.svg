@@ -122,7 +122,7 @@
 
   <!-- ═══ AXIS Daemon ═══ -->
   <rect x="30" y="430" width="840" height="80" rx="12" fill="#F8FAFC" stroke="#94A3B8" stroke-width="1.5" filter="url(#shadow)"/>
-  <text x="50" y="455" font-size="13" font-weight="600" fill="#334155">AXIS Daemon (axsd)</text>
+  <text x="50" y="455" font-size="13" font-weight="600" fill="#334155">AXIS Daemon (axisd)</text>
 
   <rect x="50" y="465" width="120" height="25" rx="5" fill="#E2E8F0" stroke="#94A3B8" stroke-width="1"/>
   <text x="110" y="482" text-anchor="middle" font-size="9" fill="#475569">Sandbox Manager</text>

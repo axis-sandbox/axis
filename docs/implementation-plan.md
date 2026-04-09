@@ -192,7 +192,7 @@ A veth pair (10.200.0.1 host ↔ 10.200.0.2 sandbox) routes all sandbox traffic 
                          └──────┬───────┘
                                 │ Unix socket / Named pipe
                          ┌──────▼───────┐
-                         │  AXIS Daemon │  (axsd)
+                         │  AXIS Daemon │  (axisd)
                          │              │
                          │  Policy Mgr  │──── OPA Engine (regorus)
                          │  Sandbox Mgr │──── Sandbox Pool
@@ -210,7 +210,7 @@ A veth pair (10.200.0.1 host ↔ 10.200.0.2 sandbox) routes all sandbox traffic 
        └─────────────┘  └─────────────┘   └─────────────┘
 ```
 
-**AXIS Daemon (axsd):** A single long-running user-mode process that manages sandbox lifecycles. On Linux, it can optionally be a systemd user service (`systemctl --user enable axsd`). On Windows, it runs as a startup task or tray application. No elevation required.
+**AXIS Daemon (axisd):** A single long-running user-mode process that manages sandbox lifecycles. On Linux, it can optionally be a systemd user service (`systemctl --user enable axisd`). On Windows, it runs as a startup task or tray application. No elevation required.
 
 **Sandbox:** An isolated agent execution context consisting of a child process (the agent), a co-located proxy thread/process, and applied OS isolation primitives. Each sandbox has its own policy, filesystem scope, and network rules.
 
@@ -499,7 +499,7 @@ Traditional GPU isolation requires device-level passthrough (VFIO, MIG partition
 └─────────────────────────────┘                             └─────────────────────────────┘
 ```
 
-The sandbox receives a **drop-in replacement `libamdhip64`** that proxies all HIP API calls over TCP (or Unix domain socket for same-host) to a per-sandbox **HIP worker process** managed by axsd. The agent application uses the standard HIP C API — `hipMalloc`, `hipMemcpy`, `hipModuleLaunchKernel`, etc. — without knowing it is talking to a remote GPU. Device pointers are opaque handles; the client never dereferences them.
+The sandbox receives a **drop-in replacement `libamdhip64`** that proxies all HIP API calls over TCP (or Unix domain socket for same-host) to a per-sandbox **HIP worker process** managed by axisd. The agent application uses the standard HIP C API — `hipMalloc`, `hipMemcpy`, `hipModuleLaunchKernel`, etc. — without knowing it is talking to a remote GPU. Device pointers are opaque handles; the client never dereferences them.
 
 This is the GPU equivalent of AXIS's network proxy: the sandbox never touches the real hardware, and the host enforces policy at the API boundary.
 
@@ -538,7 +538,7 @@ The upstream `hip-remote` is a bare proxy with no security model. AXIS adds:
 
 **1. Per-Sandbox Worker Isolation**
 
-axsd spawns one `hip-worker` per sandbox, each on a unique port or Unix domain socket. Workers are children of axsd and inherit its Job Object / cgroup limits:
+axisd spawns one `hip-worker` per sandbox, each on a unique port or Unix domain socket. Workers are children of axisd and inherit its Job Object / cgroup limits:
 
 ```yaml
 # In sandbox policy
@@ -723,7 +723,7 @@ A core differentiator of AXIS is that agents don't need cloud API keys to be use
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  AXIS Daemon (axsd)                                                  │
+│  AXIS Daemon (axisd)                                                  │
 │                                                                      │
 │  ┌────────────────────┐    ┌──────────────────────────────────────┐  │
 │  │  Inference Manager │───▶│  Managed Inference Server            │  │
@@ -760,9 +760,9 @@ AXIS supports three modes for the local inference backend, selected by configura
 
 | Mode | When to Use | How It Works |
 |---|---|---|
-| **Managed** (default) | User wants zero-config local inference | axsd spawns and manages a vLLM or llama.cpp process. Auto-selects based on available GPUs. |
-| **External** | User already runs their own inference server | axsd connects to a user-specified endpoint. No server lifecycle management. |
-| **Embedded** | Lightweight / single-model / edge scenarios | axsd loads a GGUF model directly via `llama.cpp` linked as a Rust library (via `llama-cpp-rs`). No separate process. |
+| **Managed** (default) | User wants zero-config local inference | axisd spawns and manages a vLLM or llama.cpp process. Auto-selects based on available GPUs. |
+| **External** | User already runs their own inference server | axisd connects to a user-specified endpoint. No server lifecycle management. |
+| **Embedded** | Lightweight / single-model / edge scenarios | axisd loads a GGUF model directly via `llama.cpp` linked as a Rust library (via `llama-cpp-rs`). No separate process. |
 
 Configuration in `axis-config.yaml`:
 
@@ -793,7 +793,7 @@ inference_server:
 
   # Common settings
   bind: "127.0.0.1"                    # never exposed externally
-  port: 0                              # 0 = auto-assign, axsd tracks the port
+  port: 0                              # 0 = auto-assign, axisd tracks the port
   health_check_interval_sec: 10
   startup_timeout_sec: 120
   max_retries: 3
@@ -834,9 +834,9 @@ models:
 
 Model lifecycle:
 - **Discovery:** `axis model list` shows registered models, `axis model pull <name>` downloads from HuggingFace.
-- **Loading:** When the first sandbox requests a model, axsd starts the inference server with that model (managed mode) or verifies it is available (external mode). In embedded mode, the model is loaded into the daemon process.
+- **Loading:** When the first sandbox requests a model, axisd starts the inference server with that model (managed mode) or verifies it is available (external mode). In embedded mode, the model is loaded into the daemon process.
 - **Sharing:** Multiple sandboxes using the same model share a single inference server instance. The server handles concurrent requests via continuous batching.
-- **Swapping:** If a sandbox requests a different model and VRAM is insufficient for both, axsd can unload the current model and load the new one. Configurable via `model_swap_policy: queue | reject | evict_lru`.
+- **Swapping:** If a sandbox requests a different model and VRAM is insufficient for both, axisd can unload the current model and load the new one. Configurable via `model_swap_policy: queue | reject | evict_lru`.
 - **APEX integration:** When APEX is available and `apex_memory_policy.allow_overcommit: true`, models larger than physical VRAM can be loaded with NVMe-backed pages. The inference server sees a larger virtual VRAM pool transparently.
 
 ### 6.4 Multi-Agent Request Scheduling
@@ -917,7 +917,7 @@ The `api_key` field is required by the OpenAI client library but is ignored — 
 
 ### 6.6 Multi-GPU and Multi-Model Serving
 
-On systems with multiple GPUs (e.g., multi-RX 9070 XT or MI300X clusters), axsd can run multiple inference server instances:
+On systems with multiple GPUs (e.g., multi-RX 9070 XT or MI300X clusters), axisd can run multiple inference server instances:
 
 ```yaml
 inference_server:
@@ -974,7 +974,7 @@ The CLI exposes live stats: `axis inference status` shows active models, per-san
 | Windows filesystem ACLs | Sandbox directory with AppContainer SID grants, user directory deny | 3d |
 | `axis-proxy` crate | HTTP CONNECT proxy, binary identity (SHA256 TOFU), OPA network evaluation | 1.5w |
 | Path abstraction layer | Cross-platform path handling (forward slash ↔ backslash, drive letters, env var expansion) | 2d |
-| `axis-daemon` (axsd) | Sandbox lifecycle manager — Unix socket IPC (Linux), named pipe IPC (Windows) | 1w |
+| `axis-daemon` (axisd) | Sandbox lifecycle manager — Unix socket IPC (Linux), named pipe IPC (Windows) | 1w |
 | `axis` CLI | `axis create`, `axis exec`, `axis destroy`, `axis list`, `axis policy validate` | 3d |
 | Windows daemon | Startup task registration, tray icon (optional) | 3d |
 | Cross-platform test suite | e2e tests on both Linux and Windows: sandbox lifecycle, network policy, filesystem policy | 1w |
@@ -1113,7 +1113,7 @@ axis/
 │   │       ├── transport.rs        # UDS / TCP / named pipe abstraction
 │   │       └── protocol.rs        # HIP Remote protocol types (re-export from C headers)
 │   │
-│   ├── axis-daemon/                # axsd — sandbox lifecycle manager
+│   ├── axis-daemon/                # axisd — sandbox lifecycle manager
 │   │   └── src/
 │   │       ├── main.rs             # Daemon entry point
 │   │       ├── ipc.rs              # Unix socket / Named pipe

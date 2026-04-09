@@ -1,7 +1,7 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! AXIS Daemon (axsd) — sandbox lifecycle manager.
+//! AXIS Daemon (axisd) — sandbox lifecycle manager.
 
 mod health;
 mod ipc;
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_dir.join("axsd.log"))
+            .open(log_dir.join("axisd.log"))
             .expect("cannot open log file");
 
         use tracing_subscriber::layer::SubscriberExt;
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
             )
             .init();
 
-        tracing::info!("logging to {}", log_dir.join("axsd.log").display());
+        tracing::info!("logging to {}", log_dir.join("axisd.log").display());
     } else {
         // Default: JSON to stderr.
         tracing_subscriber::fmt()
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    tracing::info!("axsd starting (pid={})", std::process::id());
+    tracing::info!("axisd starting (pid={})", std::process::id());
 
     let mut mgr = sandbox_mgr::SandboxManager::new();
     let socket_path = ipc::default_socket_path();
@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
     // Clean up socket file.
     let _ = std::fs::remove_file(&socket_path);
 
-    tracing::info!("axsd stopped ({} sandboxes cleaned up)", sandbox_ids.len());
+    tracing::info!("axisd stopped ({} sandboxes cleaned up)", sandbox_ids.len());
     Ok(())
 }
 

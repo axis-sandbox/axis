@@ -49,7 +49,7 @@ jobs:
         run: |
           mkdir -p dist/axis-${{ matrix.platform }}
           cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
-          cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
+          cp target/${{ matrix.target }}/release/axisd dist/axis-${{ matrix.platform }}/
           cp policies/*.yaml dist/axis-${{ matrix.platform }}/
           cp README.md LICENSE dist/axis-${{ matrix.platform }}/
           cd dist
@@ -61,7 +61,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist\axis-${{ matrix.platform }} -Force
           Copy-Item target\${{ matrix.target }}\release\axis.exe dist\axis-${{ matrix.platform }}\
-          Copy-Item target\${{ matrix.target }}\release\axsd.exe dist\axis-${{ matrix.platform }}\
+          Copy-Item target\${{ matrix.target }}\release\axisd.exe dist\axis-${{ matrix.platform }}\
           Copy-Item policies\*.yaml dist\axis-${{ matrix.platform }}\
           Copy-Item README.md dist\axis-${{ matrix.platform }}\
           Copy-Item LICENSE dist\axis-${{ matrix.platform }}\

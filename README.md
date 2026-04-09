@@ -59,7 +59,7 @@ That's it. The process runs with Landlock filesystem isolation, seccomp syscall 
 axis run --policy coding-agent.yaml -- python my_agent.py
 
 # Or use the daemon for multi-sandbox management
-axsd &
+axisd &
 axis create --policy policies/coding-agent.yaml -- python my_agent.py
 axis list
 axis destroy <sandbox-id>

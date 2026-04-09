@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[command(name = "axis", about = "AXIS: Agent eXecution Isolation Substrate")]
 #[command(version)]
 struct Cli {
-    /// Path to axsd Unix socket.
+    /// Path to axisd Unix socket.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 
@@ -766,7 +766,7 @@ fn try_prompt_install(subcmd: &str) -> Option<i32> {
     }
 }
 
-/// Send a JSON request to the axsd daemon via IPC.
+/// Send a JSON request to the axisd daemon via IPC.
 /// Uses Unix sockets on Linux/macOS, TCP on Windows.
 async fn send_ipc(
     socket_override: &Option<PathBuf>,
@@ -783,15 +783,15 @@ async fn send_ipc(
 
         let socket_path = socket_override.clone().unwrap_or_else(|| {
             if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-                PathBuf::from(xdg).join("axis").join("axsd.sock")
+                PathBuf::from(xdg).join("axis").join("axisd.sock")
             } else {
-                PathBuf::from("/tmp/axis-axsd.sock")
+                PathBuf::from("/tmp/axis-axisd.sock")
             }
         });
 
         let stream = UnixStream::connect(&socket_path).await.map_err(|e| {
             anyhow::anyhow!(
-                "cannot connect to axsd at {}: {e}\nIs the daemon running? Start it with: axsd",
+                "cannot connect to axisd at {}: {e}\nIs the daemon running? Start it with: axisd",
                 socket_path.display()
             )
         })?;
@@ -809,7 +809,7 @@ async fn send_ipc(
     {
         use tokio::net::TcpStream;
 
-        // On Windows, axsd listens on a TCP port (default 18516).
+        // On Windows, axisd listens on a TCP port (default 18516).
         let addr = socket_override
             .as_ref()
             .and_then(|p| p.to_str())
@@ -817,7 +817,7 @@ async fn send_ipc(
 
         let stream = TcpStream::connect(addr).await.map_err(|e| {
             anyhow::anyhow!(
-                "cannot connect to axsd at {addr}: {e}\nIs the daemon running? Start it with: axsd"
+                "cannot connect to axisd at {addr}: {e}\nIs the daemon running? Start it with: axisd"
             )
         })?;
 
