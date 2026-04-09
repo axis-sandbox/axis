@@ -2,6 +2,10 @@
 
 A high-performance OS-native agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. No containers, no VMs, no admin privileges.
 
+<p align="center">
+  <img src="docs/architecture.svg" alt="AXIS Architecture" width="800">
+</p>
+
 ## What It Does
 
 AXIS isolates AI agent processes using OS-native primitives:

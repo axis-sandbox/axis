@@ -3,40 +3,49 @@
 ## Implementation Plan — v0.1 Draft
 
 **Owner:** AMD Client AI Software
-**Status:** Phase 0 + Phase 1 complete, Phase 2 in progress
+**Status:** All phases complete. v0.1.0 released.
 **Date:** April 2026
 **Inspired by:** [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell) (Apache 2.0)
-**Repository:** `/home/nod/github/axis/` (Rust workspace, 9 crates + 1 bench)
-**HIP Remote Source:** `~/github/TheRock-hip-remote/` worktree (branches `users/jam/add-hip-remote` + `users/jam/hip-remote`)
+**Repository:** https://github.com/axis-sandbox/axis (public, Apache 2.0)
+**HIP Remote Source:** `users/jam/hip-remote` branch of ROCm/rocm-systems
 
-### Current Implementation Status (2026-04-07)
+### Current Implementation Status (2026-04-09)
 
 | Component | Status | Notes |
 |---|---|---|
-| **axis-core** | Complete | Policy YAML parser (incl. `gpu:` section), OPA engine (regorus), OCSF audit, types |
-| **axis-safety** | Complete | Leak detector (Aho-Corasick + regex, 11 credential patterns), input validator |
-| **axis-sandbox (Linux)** | Complete | Real Landlock ABI V2+ syscalls, **seccomp default-deny whitelist** (142 allowed syscalls), netns + veth + iptables (ip netns strategy), bubblewrap fallback |
-| **axis-sandbox (Windows)** | Complete | Job Object (process/memory/CPU limits, KILL_ON_JOB_CLOSE), Restricted Token + Low IL, AppContainer (stubbed for cross-compile), NTFS ACLs, **ETW bypass detector** |
-| **axis-proxy** | Complete | HTTP CONNECT with per-connection OPA eval, TOFU identity (/proc/net/tcp → PID → exe → SHA256), leak detection on plaintext relay, **L7 TLS termination** (ephemeral CA, rustls, leak scan on decrypted traffic), **inference.local virtual host** routing, credential placeholder injection |
-| **axis-router** | Complete | Route resolution, model registry, deficit round-robin scheduler with priority lanes, per-sandbox token budgets |
-| **axis-gpu** | Complete | HIP Remote protocol types (~150 opcodes, API categories), per-sandbox API filter (allow/deny by category, IPC blocked by default), VRAM quota tracker (per-pointer accounting), TCP transport, worker lifecycle manager |
-| **hip-remote (C)** | **Integrated** | Client library: `libamdhip64.so` (538 HIP symbols, 188KB, pure C11). Worker: `hip-worker` binary (links real HIP runtime). Built from `users/jam/hip-remote` branch of rocm-systems. Symlinked at `axis/hip-remote/`. |
-| **axis-daemon** | Complete | Async sandbox manager (spawns proxy + GPU worker + sandbox per create), platform IPC (Unix socket / TCP), **policy hot-reload** (file watcher, atomic OPA engine swap), **exec_in_sandbox**, auto-discovers hip-worker binary and client lib |
-| **axis-cli** | Complete | create / **exec** / destroy / list / policy validate / model list,pull,remove / inference status — GPU policy display |
-| **Cross-platform** | Verified | Cross-compiles Linux + Windows (MinGW). Tested on host, Linux VM, Windows VM. |
-| **Tests** | **79 unit+integration** | Unit (core, safety, sandbox, proxy, router, gpu) + integration (6 proxy OPA e2e + inference.local) + 4 ETW bypass |
-| **E2E** | **21/21 PASS** | Sandbox isolation (6), daemon lifecycle (7), HIP Remote (8) |
-| **HIP Remote GPU** | **7/7 PASS** | Real GPU (RX 9070 XT) accessed from sandboxed VM: hipGetDeviceCount, hipSetDevice, hipGetDeviceProperties, hipMalloc, hipMemcpy H2D+D2H, hipFree, hipDeviceSynchronize |
-| **Benchmarks** | **5/5 PASS** | All success metrics validated on Linux VM, Windows VM, and bare metal |
+| **axis-core** | Complete | Policy YAML parser (gpu:, ssh: sections), OPA engine (regorus), OCSF audit |
+| **axis-safety** | Complete | Leak detector (11 patterns, Aho-Corasick + regex), input validator |
+| **axis-sandbox (Linux)** | Complete | Landlock ABI V2+, seccomp default-deny (142 whitelist), netns + veth + iptables with setns() in pre_exec |
+| **axis-sandbox (macOS)** | Complete | Seatbelt (sandbox-exec) with generated .sb profiles, localhost-only network for proxy mode |
+| **axis-sandbox (Windows)** | Complete | Job Object, Restricted Token + Low IL, AppContainer (userenv.dll FFI), ETW bypass detector (GetExtendedTcpTable) |
+| **axis-proxy** | Complete | OPA eval per CONNECT, TOFU identity, L7 TLS termination, inference.local routing, leak detection on encrypted traffic, credential injection |
+| **axis-router** | Complete | Route resolution, DRR scheduler, token budgets, model registry, HuggingFace pull, smart routing (8-dim scorer), embedded LLM (llama-cpp-2) |
+| **axis-gpu** | Complete | HIP Remote protocol (~150 opcodes), API filter, VRAM quota, TCP transport, worker lifecycle |
+| **hip-remote (C)** | Integrated | libamdhip64.so (538 symbols) + hip-worker. From `users/jam/hip-remote`. |
+| **axis-daemon** | Complete | Proxy + GPU worker + sandbox spawning, policy hot-reload, exec_in_sandbox, inference server auto-start, health endpoint (:18517), graceful SIGTERM shutdown |
+| **axis-cli** | Complete | run / create / exec / destroy / list / logs / install / policy / model / inference + git-style subcommand extension |
+| **Agent install** | Complete | `axis install claude-code aider codex` — contained installs at ~/.axis/tools/, wrappers as original binary names, PowerShell for Windows |
+| **Agent containment** | Complete | All state under ~/.axis/agents/<policy>/, SSH key scoping (per-key per-host) |
+| **CI/CD** | Complete | GitHub Actions: Linux + Windows native + clippy + format. Release + nightly workflows. |
+| **Tests** | **88 unit + 40 agent safety** | All passing on Linux, macOS, Windows |
 
-### Cross-Platform Test Matrix (2026-04-07)
+### Cross-Platform Test Matrix (2026-04-09)
 
-| Platform | Environment | Tests | Pass | Status |
+| Platform | Environment | Unit Tests | Agent Safety | Benchmarks | Status |
+|---|---|---|---|---|---|
+| Linux (host) | Ubuntu 24.04, kernel 6.17, 192 cores | 88 pass | 40/40 | 5/5 | ALL PASS |
+| macOS | macOS 15.7, Apple Silicon | 88 pass | 38/38 | — | ALL PASS |
+| Windows VM | Windows 11 Build 26200, 8 vCPUs | 88 pass | 8/8 | 4/4 | ALL PASS |
+
+### Performance (2026-04-09)
+
+| Metric | Linux | macOS | Windows | Target |
 |---|---|---|---|---|
-| Host (bare metal) | Ubuntu 24.04, kernel 6.17, 192 cores | 91 | 91 | ALL PASS |
-| Linux VM | Ubuntu 24.04, kernel 6.17, 16 vCPUs | 22 | 22 | ALL PASS |
-| Windows VM | Windows 11 Build 26200, 8 vCPUs | 8 | 8 | ALL PASS |
-| **Total** | | **121** | **121** | **ALL PASS** |
+| Sandbox startup | 0.6ms | ~1ms | 8.3ms | <200ms / <500ms |
+| OPA throughput | 59K/sec | — | 42K/sec | >10K/sec |
+| OPA per-request | 17µs | — | 24µs | <5ms |
+| Memory per sandbox | 1.6MB | — | — | <50MB |
+| Proxy cold-conn | 8.5ms | — | 0.09ms | <50ms |
 
 ### HIP Remote GPU Verification (2026-04-07)
 
