@@ -654,7 +654,8 @@ fn try_agent_subcommand() -> Option<i32> {
         .join(subcmd);
 
     if !wrapper.exists() || !wrapper.is_file() {
-        return None;
+        // Wrapper not found — check if this is a known agent and offer to install.
+        return try_prompt_install(subcmd);
     }
 
     // Found a wrapper — exec it with remaining args.
@@ -667,6 +668,79 @@ fn try_agent_subcommand() -> Option<i32> {
         .ok()?;
 
     Some(status.code().unwrap_or(1))
+}
+
+/// Known agent binary names → install names.
+fn known_agent(binary_name: &str) -> Option<&'static str> {
+    match binary_name {
+        "claude"   => Some("claude-code"),
+        "codex"    => Some("codex"),
+        "openclaw" => Some("openclaw"),
+        "ironclaw" => Some("ironclaw"),
+        "aider"    => Some("aider"),
+        "goose"    => Some("goose"),
+        _ => None,
+    }
+}
+
+/// Prompt to install a known but not-yet-installed agent.
+fn try_prompt_install(subcmd: &str) -> Option<i32> {
+    let install_name = known_agent(subcmd)?;
+
+    eprintln!("'{subcmd}' is not installed. Install it with AXIS sandbox protection?\n");
+    eprintln!("  This will:");
+    eprintln!("    - Install {subcmd} to ~/.axis/tools/{install_name}/");
+    eprintln!("    - Create a sandboxed wrapper at ~/.axis/bin/{subcmd}");
+    eprintln!("    - Apply default-deny network + filesystem policy");
+    eprintln!();
+    eprint!("Install {subcmd}? [Y/n] ");
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return Some(1);
+    }
+
+    let answer = input.trim().to_lowercase();
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        // Run axis install <agent>.
+        let axis_bin = std::env::current_exe().unwrap_or_else(|_| "axis".into());
+        let status = std::process::Command::new(&axis_bin)
+            .args(["install", install_name])
+            .status()
+            .ok()?;
+
+        if !status.success() {
+            return Some(status.code().unwrap_or(1));
+        }
+
+        // After install, retry the original command.
+        eprintln!("\nRunning: {subcmd} {}", std::env::args().skip(2).collect::<Vec<_>>().join(" "));
+        let args: Vec<String> = std::env::args().collect();
+        let agent_args: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
+
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()?;
+        let wrapper = std::path::PathBuf::from(&home)
+            .join(".axis")
+            .join("bin")
+            .join(subcmd);
+
+        if wrapper.exists() {
+            let status = std::process::Command::new(&wrapper)
+                .args(&agent_args)
+                .env("AXIS_BIN", &axis_bin)
+                .status()
+                .ok()?;
+            Some(status.code().unwrap_or(1))
+        } else {
+            eprintln!("Install succeeded but wrapper not found at {}", wrapper.display());
+            Some(1)
+        }
+    } else {
+        eprintln!("Not installing. To install manually: axis install {install_name}");
+        Some(0)
+    }
 }
 
 /// Send a JSON request to the axsd daemon via IPC.
