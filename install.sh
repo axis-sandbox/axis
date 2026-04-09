@@ -131,6 +131,7 @@ install() {
     echo "Extracting..."
     mkdir -p "${INSTALL_DIR}"
 
+    mkdir -p "${TMPDIR}/extracted"
     if [ "$OS" = "windows" ]; then
         unzip -q "${TMPDIR}/axis-archive" -d "${TMPDIR}/extracted"
     else
