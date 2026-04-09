@@ -1,0 +1,27 @@
+[package]
+name = "axis-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axis-core = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+llama-cpp-2 = { workspace = true, optional = true }
+encoding_rs = { version = "0.8", optional = true }
+indicatif = { workspace = true, optional = true }
+
+[features]
+default = []
+embedded-llm = ["llama-cpp-2", "encoding_rs"]
+model-pull = ["indicatif"]

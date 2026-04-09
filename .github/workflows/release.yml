@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+            platform: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+            platform: linux-aarch64
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            platform: macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            platform: macos-aarch64
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-24.04
+            archive: zip
+            platform: windows-x86_64
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+              echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+              ;;
+            x86_64-pc-windows-gnu)
+              sudo apt-get install -y gcc-mingw-w64-x86-64
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist/axis-${{ matrix.platform }}
+
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp target/${{ matrix.target }}/release/axis.exe dist/axis-${{ matrix.platform }}/
+            cp target/${{ matrix.target }}/release/axsd.exe dist/axis-${{ matrix.platform }}/
+          else
+            cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
+            cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
+          fi
+
+          cp policies/*.yaml dist/axis-${{ matrix.platform }}/
+          cp README.md dist/axis-${{ matrix.platform }}/
+
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            zip -r axis-${{ matrix.platform }}.zip axis-${{ matrix.platform }}/
+          else
+            tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axis-${{ matrix.platform }}
+          path: dist/axis-${{ matrix.platform }}.${{ matrix.archive }}
+
+  # Build native packages for Linux.
+  package-linux:
+    name: Linux packages
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb
+          cargo deb -p axis-daemon --no-build
+
+      - name: Build .rpm
+        run: |
+          cargo install cargo-generate-rpm
+          cargo generate-rpm -p crates/axis-daemon || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+
+  # Create GitHub release with all artifacts.
+  release:
+    name: Create Release
+    runs-on: ubuntu-24.04
+    needs: [build, package-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
+          generate_release_notes: true
+          draft: false

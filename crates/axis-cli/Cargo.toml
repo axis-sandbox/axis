@@ -1,0 +1,25 @@
+[package]
+name = "axis-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AXIS: Agent eXecution Isolation Substrate — CLI for sandboxed AI agent execution"
+repository.workspace = true
+
+[[bin]]
+name = "axis"
+path = "src/main.rs"
+
+[dependencies]
+axis-core = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+axis-router = { workspace = true }
+axis-sandbox = { workspace = true }
+tempfile = { workspace = true }

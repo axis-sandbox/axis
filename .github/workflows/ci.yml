@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "users/**"]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit & integration tests
+        run: cargo test
+
+      - name: Policy validation
+        run: |
+          ./target/release/axis policy validate policies/minimal.yaml
+          ./target/release/axis policy validate policies/coding-agent.yaml
+          ./target/release/axis policy validate policies/gpu-agent.yaml
+
+      - name: Success metrics
+        run: ./target/release/success-metrics
+
+      - name: Daemon e2e test
+        run: bash e2e/linux/test_e2e_daemon.sh
+
+  test-windows:
+    name: Test (Windows cross-compile)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install MinGW
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Cross-compile for Windows
+        run: cargo check --target x86_64-pc-windows-gnu
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -- -D warnings || true  # advisory, don't block
+
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check || true  # advisory

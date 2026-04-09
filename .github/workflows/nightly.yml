@@ -1,0 +1,104 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # 6 AM UTC daily
+  workflow_dispatch:      # manual trigger
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Nightly (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+            platform: linux-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            platform: macos-aarch64
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-24.04
+            archive: zip
+            platform: windows-x86_64
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross tools
+        if: matrix.cross
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Test
+        if: ${{ !matrix.cross }}
+        run: cargo test
+
+      - name: Package
+        run: |
+          mkdir -p dist/axis-${{ matrix.platform }}
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp target/${{ matrix.target }}/release/axis.exe dist/axis-${{ matrix.platform }}/
+            cp target/${{ matrix.target }}/release/axsd.exe dist/axis-${{ matrix.platform }}/
+          else
+            cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
+            cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
+          fi
+          cp policies/*.yaml dist/axis-${{ matrix.platform }}/
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            zip -r axis-${{ matrix.platform }}.zip axis-${{ matrix.platform }}/
+          else
+            tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ matrix.platform }}
+          path: dist/axis-${{ matrix.platform }}.${{ matrix.archive }}
+
+  publish:
+    name: Publish Nightly
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Update nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "Nightly Build"
+          body: |
+            Automated nightly build from `main` branch.
+            Built: ${{ github.event.head_commit.timestamp || 'manual' }}
+            Commit: ${{ github.sha }}
+
+            Install: `curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh -s -- --nightly`
+          prerelease: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip

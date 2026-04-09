@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# HIP Remote (symlinked from TheRock worktree, not committed)
+hip-remote/client
+hip-remote/worker
+hip-remote/build-client/
+hip-remote/build-worker/

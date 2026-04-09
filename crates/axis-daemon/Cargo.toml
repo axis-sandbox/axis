@@ -1,0 +1,52 @@
+[package]
+name = "axis-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AXIS daemon (axsd) — sandbox lifecycle manager"
+repository.workspace = true
+
+[package.metadata.deb]
+name = "axis"
+maintainer = "AMD <noreply@amd.com>"
+copyright = "2026 Advanced Micro Devices, Inc."
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/axis", "usr/bin/", "755"],
+    ["target/release/axsd", "usr/bin/", "755"],
+    ["../../dist/axis.service", "lib/systemd/system/", "644"],
+    ["../../policies/minimal.yaml", "etc/axis/policies/", "644"],
+    ["../../policies/coding-agent.yaml", "etc/axis/policies/", "644"],
+    ["../../policies/gpu-agent.yaml", "etc/axis/policies/", "644"],
+]
+conf-files = ["/etc/axis/policies/"]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/axis", dest = "/usr/bin/axis", mode = "755" },
+    { source = "target/release/axsd", dest = "/usr/bin/axsd", mode = "755" },
+    { source = "dist/axis.service", dest = "/lib/systemd/system/axis.service", mode = "644" },
+]
+
+[[bin]]
+name = "axsd"
+path = "src/main.rs"
+
+[dependencies]
+axis-core = { workspace = true }
+axis-safety = { workspace = true }
+axis-sandbox = { workspace = true }
+axis-proxy = { workspace = true }
+axis-router = { workspace = true }
+axis-gpu = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+notify = { workspace = true }

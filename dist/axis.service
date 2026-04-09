@@ -1,0 +1,20 @@
+[Unit]
+Description=AXIS Agent Sandbox Daemon
+Documentation=https://github.com/ROCm/axis
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/axsd
+Restart=on-failure
+RestartSec=5
+Environment=AXIS_LOG_LEVEL=axis=info
+Environment=AXIS_LOG_DIR=/var/log/axis
+
+# Security hardening for the daemon itself.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/axis /run/axis /tmp
+
+[Install]
+WantedBy=multi-user.target

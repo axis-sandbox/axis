@@ -1,0 +1,97 @@
+version: 1
+name: coding-agent-sandbox
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /etc/ssl/certs
+    - /etc/resolv.conf
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+  compatibility: best_effort
+
+process:
+  max_processes: 32
+  max_memory_mb: 8192
+  cpu_rate_percent: 80
+  blocked_syscalls:
+    - ptrace
+    - mount
+    - bpf
+    - io_uring_setup
+
+network:
+  mode: proxy
+  policies:
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+          access: read-write
+        - host: "github.com"
+          port: 443
+          access: read-only
+      binaries:
+        - path: "/usr/bin/git"
+        - path: "/usr/bin/curl"
+        - path: "*/python*"
+
+    - name: pypi
+      endpoints:
+        - host: "pypi.org"
+          port: 443
+          access: read-only
+        - host: "files.pythonhosted.org"
+          port: 443
+          access: read-only
+      binaries:
+        - path: "*/python*"
+        - path: "*/pip*"
+
+    - name: inference-local
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          protocol: rest
+          access: read-write
+          rules:
+            - allow:
+                method: POST
+                path: "/v1/chat/completions"
+            - allow:
+                method: POST
+                path: "/v1/messages"
+            - allow:
+                method: GET
+                path: "/v1/models"
+
+inference:
+  default_provider: local-rocm
+  routes:
+    - name: local-rocm
+      endpoint: "http://localhost:8080"
+      protocols: [openai_chat_completions, model_discovery]
+      model: "llama-4-scout-109b"
+    - name: cloud-fallback
+      provider: anthropic
+      model: "claude-sonnet-4-20250514"
+      api_key_env: ANTHROPIC_API_KEY
+  token_budget:
+    max_tokens_per_hour: 500000
+    max_tokens_per_request: 32768
+    action_on_exhaust: fallback_cloud
+    fallback_route: cloud-fallback
+
+amd:
+  gpu_passthrough: true
+  npu_policy_offload: false
+  apex_memory_policy:
+    allow_overcommit: true
+    max_vram_mb: 16384

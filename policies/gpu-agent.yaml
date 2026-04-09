@@ -1,0 +1,46 @@
+version: 1
+name: gpu-agent-sandbox
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /etc/ssl/certs
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+  deny:
+    - "~/.ssh"
+
+process:
+  max_processes: 64
+  max_memory_mb: 16384
+  cpu_rate_percent: 90
+
+network:
+  mode: proxy
+  policies:
+    - name: inference-local
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+
+gpu:
+  enabled: true
+  device: 0
+  transport: uds
+  vram_limit_mb: 8192
+  compute_timeout_sec: 300
+  denied_apis:
+    - ipc_handles
+    - device_reset
+    - peer_access
+
+inference:
+  default_provider: local-rocm
+  routes:
+    - name: local-rocm
+      endpoint: "http://localhost:8080"
+      model: "llama-4-scout-109b"
