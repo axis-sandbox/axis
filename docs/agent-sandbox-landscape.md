@@ -8,7 +8,7 @@
 
 Self-hosted AI agents combine two dangerous supply chains into a single execution loop: **untrusted code** (skills, extensions, plugins) and **untrusted instructions** (external content, prompt injection). Both execute with the user's credentials, filesystem access, and network connectivity.
 
-Microsoft's Defender Security Research team articulated this clearly in their February 2026 assessment of OpenClaw runtimes:
+The Microsoft Defender Security Research team articulated this clearly in their February 2026 assessment of OpenClaw runtimes:
 
 > *"OpenClaw should be treated as untrusted code execution with persistent credentials. It is not appropriate to run on a standard personal or enterprise workstation."*
 
@@ -74,13 +74,13 @@ This document surveys the current landscape of agent sandboxing technologies, as
 
 ## 4. How AXIS Addresses Each Concern
 
-The Microsoft article identifies six control domains for agent security. Here's how each is addressed:
+The Microsoft Defender Security Research article identifies six control domains for agent security. Here's how each is addressed:
 
 ### 4.1 Identity: Credential Protection
 
 | Approach | Mechanism | Strength |
 |---|---|---|
-| Microsoft | Entra ID least-privilege + manual token rotation | Cloud-only, doesn't protect local credential files |
+| Microsoft Defender Recommendation | Entra ID least-privilege + manual token rotation | Cloud-only, doesn't protect local credential files |
 | OpenClaw | Docker bind-mount hides host dirs | Can be bypassed via /proc/self/root ([Snyk, March 2026](https://labs.snyk.io/resources/bypass-openclaw-security-sandbox/)) |
 | Claude Code | Allowlist-only filesystem | Effective for tool execution, not full agent runtime |
 | **AXIS** | Landlock denies `~/.ssh`, `~/.aws`, `~/.gnupg` at kernel level + proxy-level credential injection | Agent never sees real credentials. Kernel-enforced, not bypassable. |
@@ -91,7 +91,7 @@ The Microsoft article identifies six control domains for agent security. Here's 
 
 | Approach | Mechanism | Syscall Coverage |
 |---|---|---|
-| Microsoft | VM (separate kernel) | Full isolation |
+| Microsoft Defender Recommendation | VM (separate kernel) | Full isolation |
 | OpenClaw | Docker container | ~300 syscalls (Docker default seccomp) |
 | Codex/Claude Code | bubblewrap + seccomp | Varies |
 | **AXIS** | seccomp default-deny whitelist | **142 syscalls allowed** of ~400. ptrace, mount, bpf, io_uring, memfd_create, reboot, kexec, chroot all blocked. |
@@ -102,7 +102,7 @@ The Microsoft article identifies six control domains for agent security. Here's 
 
 | Approach | Mechanism | Bypassable? |
 |---|---|---|
-| Microsoft | Defender URL filtering (user-mode) | Yes (raw sockets, DNS tunneling) |
+| Microsoft Defender Recommendation | Defender URL filtering (user-mode) | Yes (raw sockets, DNS tunneling) |
 | OpenClaw | Docker `network: none` | All-or-nothing, no proxy |
 | Claude Code | HTTP/SOCKS5 proxy | Application-level (agent could bypass) |
 | **AXIS** | Kernel network namespace + veth + iptables + OPA proxy | **No** (kernel-enforced, iptables LOG detects bypass attempts) |
@@ -113,7 +113,7 @@ The Microsoft article identifies six control domains for agent security. Here's 
 
 | Approach | Mechanism |
 |---|---|
-| Microsoft | "Review .openclaw/workspace/ regularly" (manual) |
+| Microsoft Defender Recommendation | "Review .openclaw/workspace/ regularly" (manual) |
 | OpenClaw | Container ephemeral filesystem |
 | **AXIS** | Landlock-enforced workspace-only writes + immutable policy |
 
@@ -123,7 +123,7 @@ The Microsoft article identifies six control domains for agent security. Here's 
 
 | Approach | Mechanism | Sharing | Quotas |
 |---|---|---|---|
-| Microsoft | Not addressed | N/A | N/A |
+| Microsoft Defender Recommendation | Not addressed | N/A | N/A |
 | Firecracker | No GPU support | N/A | N/A |
 | gVisor | nvproxy (NVIDIA only) | No | No |
 | Kata | VFIO (full device) | No | No |
@@ -136,7 +136,7 @@ The Microsoft article identifies six control domains for agent security. Here's 
 
 | Approach | Cost |
 |---|---|
-| Microsoft | Defender XDR + Sentinel + Purview ($50K+/yr) |
+| Microsoft Defender Recommendation | Defender XDR + Sentinel + Purview ($50K+/yr) |
 | **AXIS** | Built-in OCSF audit events + health endpoint ($0) |
 
 **AXIS advantage:** Every policy decision (allow/deny), credential leak detection, sandbox lifecycle event, and bypass attempt is logged as a structured OCSF audit event. The daemon exposes an HTTP `/health` endpoint with sandbox count, uptime, and version. `axis logs <id>` shows per-sandbox stdout/stderr + audit events. No external monitoring product required.
@@ -170,7 +170,7 @@ Based on this landscape assessment, the following capabilities would further dif
 | Feature | Rationale | Effort |
 |---|---|---|
 | **ClawHub skill scanner** | Automatically scan skills before installation for known malicious patterns, obfuscated code, suspicious API usage. | 2 weeks |
-| **Agent behavior profiling** | Build a baseline of normal agent behavior (syscalls, network destinations, file access patterns) and alert on deviations. Similar to Microsoft's hunting queries but automated and built-in. | 3 weeks |
+| **Agent behavior profiling** | Build a baseline of normal agent behavior (syscalls, network destinations, file access patterns) and alert on deviations. Similar to the Microsoft Defender hunting queries but automated and built-in. | 3 weeks |
 | **Supply chain attestation** | SLSA-style provenance attestation for agent skills and models. Verify the build chain from source to execution. | 2 weeks |
 
 ---
@@ -186,7 +186,7 @@ AXIS is unique in four ways:
 3. **Default-deny seccomp** — the strictest syscall policy of any agent sandbox (142 of ~400 allowed)
 4. **Cross-platform from day one** — Linux (Landlock + seccomp + netns), Windows (AppContainer + Job Object), macOS (Seatbelt) with no admin privileges on any platform
 
-Microsoft's VM-based approach provides strong isolation but at unacceptable cost (startup, memory, admin, licensing) for the agent use case where sandboxes are created and destroyed continuously. Firecracker offers a middle ground but cannot do GPU. gVisor handles NVIDIA GPUs but at 84 MiB per sandbox.
+The VM-based approach recommended by Microsoft Defender provides strong isolation but at unacceptable cost (startup, memory, admin, licensing) for the agent use case where sandboxes are created and destroyed continuously. Firecracker offers a middle ground but cannot do GPU. gVisor handles NVIDIA GPUs but at 84 MiB per sandbox.
 
 AXIS provides kernel-level isolation at process-level cost: 0.6ms startup, 1.6MB memory, zero admin, zero licensing. For the specific threat model of AI agents — untrusted code + untrusted instructions + credential access + GPU compute — it is the most complete solution available.
 
