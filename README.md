@@ -6,13 +6,13 @@ A high-performance OS-native agent sandbox runtime — secure, policy-governed e
 
 AXIS isolates AI agent processes using OS-native primitives:
 
-| Layer | Linux | Windows |
-|---|---|---|
-| Process | seccomp-BPF (142-syscall whitelist) | Restricted Token + Job Object |
-| Filesystem | Landlock LSM | NTFS ACLs + Low Integrity |
-| Network | netns + veth + iptables + HTTP proxy | AppContainer + loopback proxy |
-| GPU | HIP Remote (para-virtual GPU via TCP) | HIP Remote (TCP) |
-| Inference | Local LLM via llama.cpp or vLLM | Same |
+| Layer | Linux | Windows | macOS |
+|---|---|---|---|
+| Process | seccomp-BPF (142-syscall whitelist) | Restricted Token + Job Object | Seatbelt (sandbox-exec) |
+| Filesystem | Landlock LSM | NTFS ACLs + Low Integrity | Seatbelt profile (subpath rules) |
+| Network | netns + veth + iptables + HTTP proxy | AppContainer + loopback proxy | Seatbelt network deny + proxy |
+| GPU | HIP Remote (para-virtual GPU via TCP) | HIP Remote (TCP) | HIP Remote (TCP to Linux host) |
+| Inference | Local LLM via llama.cpp or vLLM | Same | Same |
 
 Every network request goes through a policy-evaluated proxy. The agent never touches the real GPU driver — HIP API calls are proxied to a worker process.
 
@@ -56,6 +56,34 @@ axis create --policy policies/coding-agent.yaml -- python my_agent.py
 axis list
 axis destroy <sandbox-id>
 ```
+
+## Platform Details
+
+### macOS (Seatbelt)
+
+On macOS, AXIS uses Apple's [Seatbelt](https://developer.apple.com/documentation/security) sandbox profiles via `sandbox-exec`. A `.sb` profile is generated dynamically from the AXIS policy YAML:
+
+- **Default deny** — `(deny default)` blocks all operations not explicitly allowed
+- **Filesystem** — read-only system paths (`/usr`, `/System`, `/Library`), read-write workspace only
+- **Network** — proxy mode allows only `localhost:*` (to reach the AXIS proxy), denies all other connections
+- **Security** — blocks writes to system paths, `process-info*` on other processes, `system-privilege`
+
+No admin or root required. Works on macOS 12+ (Monterey and later).
+
+### Linux (Landlock + seccomp + netns)
+
+Linux uses three independent kernel isolation layers applied in the child's `pre_exec`:
+1. `setns(CLONE_NEWNET)` — enters a network namespace with veth pair routing through the proxy
+2. Landlock ABI V2+ — filesystem allowlist enforced by the kernel
+3. seccomp default-deny — 142 of ~400 syscalls whitelisted; everything else returns EPERM
+
+### Windows (AppContainer + Job Object)
+
+Windows uses Win32 APIs available on Windows 11 Home (no Pro/Enterprise required):
+- **Restricted Token** with Low Integrity Level — strips all privileges
+- **Job Object** — process count, memory, CPU rate limits with `KILL_ON_JOB_CLOSE`
+- **AppContainer** with zero capabilities — kernel-level network deny
+- **ETW bypass detection** — monitors for non-proxy network connections
 
 ## GPU Sandbox
 
