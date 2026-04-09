@@ -177,25 +177,44 @@ async fn main() -> Result<()> {
                 let _ = std::fs::write(pol_dir.join(name), content);
             }
 
-            let install_script = include_str!("../../../e2e/agents/install_agents.sh");
-            let script_path = std::env::temp_dir().join("axis-install-agents.sh");
-            std::fs::write(&script_path, install_script)?;
+            #[cfg(unix)]
+            {
+                let install_script = include_str!("../../../e2e/agents/install_agents.sh");
+                let script_path = std::env::temp_dir().join("axis-install-agents.sh");
+                std::fs::write(&script_path, install_script)?;
 
-            let mut cmd = std::process::Command::new("bash");
-            cmd.arg(&script_path);
-            if list {
-                cmd.arg("--list");
-            } else if all {
-                cmd.arg("--all");
-            } else if agents.is_empty() {
-                cmd.arg("--help");
-            } else {
-                cmd.args(&agents);
+                let mut cmd = std::process::Command::new("bash");
+                cmd.arg(&script_path);
+                if list { cmd.arg("--list"); }
+                else if all { cmd.arg("--all"); }
+                else if agents.is_empty() { cmd.arg("--help"); }
+                else { cmd.args(&agents); }
+
+                let status = cmd.status()?;
+                let _ = std::fs::remove_file(&script_path);
+                std::process::exit(status.code().unwrap_or(1));
             }
 
-            let status = cmd.status()?;
-            let _ = std::fs::remove_file(&script_path);
-            std::process::exit(status.code().unwrap_or(1));
+            #[cfg(windows)]
+            {
+                let install_script = include_str!("../../../e2e/agents/install_agents.ps1");
+                let script_path = std::env::temp_dir().join("axis-install-agents.ps1");
+                std::fs::write(&script_path, install_script)?;
+
+                let mut cmd = std::process::Command::new("powershell");
+                cmd.args(["-ExecutionPolicy", "Bypass", "-File"]);
+                cmd.arg(&script_path);
+                if list { cmd.args(["-List"]); }
+                else if all { cmd.args(["-All"]); }
+                else if !agents.is_empty() {
+                    cmd.arg("-Agents");
+                    cmd.arg(agents.join(","));
+                }
+
+                let status = cmd.status()?;
+                let _ = std::fs::remove_file(&script_path);
+                std::process::exit(status.code().unwrap_or(1));
+            }
         }
 
         Commands::Create { policy, command } => {

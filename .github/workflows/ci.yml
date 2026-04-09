@@ -111,3 +111,7 @@ jobs:
             .\target\release\axis.exe policy validate $_.FullName
           }
         shell: pwsh
+
+      - name: Agent safety tests
+        run: powershell -ExecutionPolicy Bypass -File e2e\agents\test_agents.ps1 -AxisBin .\target\release\axis.exe
+        shell: pwsh
