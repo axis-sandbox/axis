@@ -15,6 +15,8 @@
 
 set -euo pipefail
 
+USE_SYSTEM=false   # --use-system: wrap existing system binaries instead of installing
+
 AXIS_ROOT="${HOME}/.axis"
 TOOLS_DIR="${AXIS_ROOT}/tools"
 BIN_DIR="${AXIS_ROOT}/bin"
@@ -74,24 +76,39 @@ agent_install_fn() {
     esac
 }
 
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+# Check if a system binary exists and use it if --use-system is set.
+# Returns the path if found, empty string otherwise.
+try_system_binary() {
+    local bin_name="$1"
+    local system_bin
+    system_bin=$(command -v "$bin_name" 2>/dev/null || true)
+
+    if [ -n "$system_bin" ]; then
+        if [ "$USE_SYSTEM" = true ]; then
+            echo "  Using system binary: $system_bin" >&2
+            echo "$system_bin"
+            return 0
+        else
+            echo "  Found system binary at $system_bin (use --use-system to wrap it instead)" >&2
+        fi
+    fi
+    return 1
+}
+
 # ── Install functions ────────────────────────────────────────────────────
 
 install_claude_code() {
+    # Check system binary first.
+    local sys_bin
+    sys_bin=$(try_system_binary "claude") && { echo "$sys_bin"; return 0; }
+
     local dir="$TOOLS_DIR/claude-code"
     mkdir -p "$dir"
     if [ "$OS" = "darwin" ] || [ "$OS" = "linux" ]; then
-        curl -fsSL https://claude.ai/install.sh | CLAUDE_INSTALL_DIR="$dir" bash 2>&1 || {
-            # Fallback: check if already installed globally
-            if command -v claude >/dev/null 2>&1; then
-                echo "Using system-installed claude"
-                ln -sf "$(which claude)" "$dir/claude"
-            else
-                echo "Install failed"
-                return 1
-            fi
-        }
+        curl -fsSL https://claude.ai/install.sh | CLAUDE_INSTALL_DIR="$dir" bash 2>&1 || true
     fi
-    # Find the binary
     local bin=$(find "$dir" -name "claude" -type f 2>/dev/null | head -1)
     if [ -z "$bin" ] && command -v claude >/dev/null 2>&1; then
         bin="$(which claude)"
@@ -100,9 +117,11 @@ install_claude_code() {
 }
 
 install_codex() {
+    local sys_bin
+    sys_bin=$(try_system_binary "codex") && { echo "$sys_bin"; return 0; }
+
     local dir="$TOOLS_DIR/codex"
     mkdir -p "$dir"
-    # Install via npm into contained directory
     if command -v npm >/dev/null 2>&1; then
         npm install --prefix "$dir" @openai/codex 2>&1 | tail -3
         echo "$dir/node_modules/.bin/codex"
@@ -115,6 +134,9 @@ install_codex() {
 }
 
 install_openclaw() {
+    local sys_bin
+    sys_bin=$(try_system_binary "openclaw") && { echo "$sys_bin"; return 0; }
+
     local dir="$TOOLS_DIR/openclaw"
     mkdir -p "$dir"
     if command -v npm >/dev/null 2>&1; then
@@ -129,9 +151,11 @@ install_openclaw() {
 }
 
 install_ironclaw() {
+    local sys_bin
+    sys_bin=$(try_system_binary "ironclaw") && { echo "$sys_bin"; return 0; }
+
     local dir="$TOOLS_DIR/ironclaw"
     mkdir -p "$dir"
-    # Download release binary
     local url="https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-${ARCH}-${OS}"
     if curl -fsSL -o "$dir/ironclaw" "$url" 2>/dev/null; then
         chmod +x "$dir/ironclaw"
@@ -145,6 +169,9 @@ install_ironclaw() {
 }
 
 install_aider() {
+    local sys_bin
+    sys_bin=$(try_system_binary "aider") && { echo "$sys_bin"; return 0; }
+
     local dir="$TOOLS_DIR/aider"
     mkdir -p "$dir"
     if command -v python3 >/dev/null 2>&1; then
@@ -160,6 +187,9 @@ install_aider() {
 }
 
 install_goose() {
+    local sys_bin
+    sys_bin=$(try_system_binary "goose") && { echo "$sys_bin"; return 0; }
+
     local dir="$TOOLS_DIR/goose"
     mkdir -p "$dir"
     if [ "$OS" = "darwin" ] && command -v brew >/dev/null 2>&1; then
@@ -221,6 +251,17 @@ WRAPPER
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
+# Parse flags first.
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --use-system) USE_SYSTEM=true; shift ;;
+        --list|--all|--help) POSITIONAL+=("$1"); shift ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
 if [ "${1:-}" = "--list" ]; then
     echo "Available agents:"
     for agent in $ALL_AGENTS; do
@@ -244,7 +285,13 @@ else
         echo "Usage:"
         echo "  $0 --all                    Install all agents"
         echo "  $0 --list                   List available agents"
+        echo "  $0 --use-system             Wrap system-installed binaries (don't download)"
         echo "  $0 claude-code codex aider  Install specific agents"
+        echo ""
+        echo "Options:"
+        echo "  --use-system   Use existing system binaries instead of installing"
+        echo "                 new copies. Creates AXIS wrappers around the binaries"
+        echo "                 already in your PATH."
         echo ""
         echo "Available: $ALL_AGENTS"
         echo ""

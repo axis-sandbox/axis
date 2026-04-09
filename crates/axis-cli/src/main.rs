@@ -77,6 +77,10 @@ enum Commands {
         /// List available agents.
         #[arg(long)]
         list: bool,
+
+        /// Wrap system-installed binaries instead of downloading new copies.
+        #[arg(long)]
+        use_system: bool,
     },
 
     /// View sandbox logs (stdout/stderr and audit events).
@@ -156,7 +160,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Install { agents, all, list } => {
+        Commands::Install { agents, all, list, use_system } => {
             // Install bundled policies.
             // On Windows: %LOCALAPPDATA%\axis (matches PS1 installer).
             // On Unix: ~/.axis
@@ -195,6 +199,7 @@ async fn main() -> Result<()> {
 
                 let mut cmd = std::process::Command::new("bash");
                 cmd.arg(&script_path);
+                if use_system { cmd.arg("--use-system"); }
                 if list { cmd.arg("--list"); }
                 else if all { cmd.arg("--all"); }
                 else if agents.is_empty() { cmd.arg("--help"); }
