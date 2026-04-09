@@ -1,0 +1,41 @@
+version: 1
+name: claude-code-macos
+
+# macOS policy for Claude Code.
+# Uses Seatbelt for filesystem isolation with open network access.
+#
+# Usage:
+#   # With API key:
+#   ANTHROPIC_API_KEY=sk-ant-... axis run --policy policies/claude-code-macos.yaml -- claude -p "hello"
+#
+#   # With OAuth (run `claude auth login` first outside the sandbox):
+#   axis run --policy policies/claude-code-macos.yaml -- claude -p "hello"
+
+filesystem:
+  read_only:
+    - /usr
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+    - /Applications
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+    - "~/.claude"
+    - "~/.local/share/claude"
+    - "~/.config"
+    - "~/Library"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+
+process:
+  max_processes: 128
+  max_memory_mb: 16384
+  cpu_rate_percent: 90
+
+network:
+  mode: allow

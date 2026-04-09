@@ -1,0 +1,76 @@
+version: 1
+name: claude-code-sandbox
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+    - /Applications
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+
+process:
+  max_processes: 128
+  max_memory_mb: 16384
+  cpu_rate_percent: 90
+
+network:
+  mode: proxy
+  policies:
+    - name: anthropic-api
+      endpoints:
+        - host: "api.anthropic.com"
+          port: 443
+          access: read-write
+        - host: "auth.anthropic.com"
+          port: 443
+          access: read-write
+
+    - name: sentry
+      endpoints:
+        - host: "o4509177054044160.ingest.us.sentry.io"
+          port: 443
+          access: read-write
+
+    - name: statsig
+      endpoints:
+        - host: "api.statsig.com"
+          port: 443
+          access: read-write
+        - host: "featureassets.org"
+          port: 443
+          access: read-only
+
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+          access: read-write
+        - host: "github.com"
+          port: 443
+          access: read-write
+
+    - name: npm-registry
+      endpoints:
+        - host: "registry.npmjs.org"
+          port: 443
+          access: read-only
+
+    - name: pypi
+      endpoints:
+        - host: "pypi.org"
+          port: 443
+          access: read-only
+        - host: "files.pythonhosted.org"
+          port: 443
+          access: read-only
