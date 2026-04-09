@@ -84,9 +84,11 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
             sb.push_str("(allow network*)\n");
         }
         axis_core::policy::NetworkMode::Proxy => {
-            // Allow only loopback (to reach the AXIS proxy).
-            sb.push_str("(allow network* (remote ip \"localhost:*\"))\n");
-            sb.push_str("(deny network* (remote ip \"*:*\"))\n");
+            // Allow outbound to localhost only (AXIS proxy runs on loopback).
+            // The (deny default) at the top blocks all non-localhost connections.
+            // All external traffic goes through HTTP_PROXY → AXIS proxy → OPA eval.
+            sb.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+            sb.push_str("(allow network* (local ip \"localhost:*\"))\n");
         }
     }
     sb.push('\n');

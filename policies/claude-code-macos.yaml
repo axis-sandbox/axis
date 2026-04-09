@@ -1,14 +1,15 @@
 version: 1
 name: claude-code-macos
 
-# macOS policy for Claude Code.
-# Uses Seatbelt for filesystem isolation with open network access.
+# macOS policy for Claude Code with HTTP proxy.
+# Seatbelt restricts network to localhost only.
+# All outbound traffic goes through the AXIS proxy which evaluates OPA policy.
 #
 # Usage:
 #   # With API key:
 #   ANTHROPIC_API_KEY=sk-ant-... axis run --policy policies/claude-code-macos.yaml -- claude -p "hello"
 #
-#   # With OAuth (run `claude auth login` first outside the sandbox):
+#   # With OAuth (run `claude auth login` first outside sandbox):
 #   axis run --policy policies/claude-code-macos.yaml -- claude -p "hello"
 
 filesystem:
@@ -38,4 +39,49 @@ process:
   cpu_rate_percent: 90
 
 network:
-  mode: allow
+  mode: proxy
+  policies:
+    - name: anthropic-api
+      endpoints:
+        - host: "api.anthropic.com"
+          port: 443
+          access: read-write
+        - host: "auth.anthropic.com"
+          port: 443
+          access: read-write
+
+    - name: sentry
+      endpoints:
+        - host: "o4509177054044160.ingest.us.sentry.io"
+          port: 443
+          access: read-write
+
+    - name: statsig
+      endpoints:
+        - host: "api.statsig.com"
+          port: 443
+          access: read-write
+        - host: "featureassets.org"
+          port: 443
+          access: read-only
+
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+          access: read-write
+        - host: "github.com"
+          port: 443
+          access: read-write
+
+    - name: npm-pypi
+      endpoints:
+        - host: "registry.npmjs.org"
+          port: 443
+          access: read-only
+        - host: "pypi.org"
+          port: 443
+          access: read-only
+        - host: "files.pythonhosted.org"
+          port: 443
+          access: read-only

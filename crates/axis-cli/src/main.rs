@@ -439,17 +439,50 @@ async fn main() -> Result<()> {
                     eprintln!("AXIS: daemon not running, using standalone mode");
 
                     let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
+                    let sandbox_id = axis_core::types::SandboxId::new();
                     let workspace = tempfile::tempdir()?;
+
+                    // Start an inline proxy if policy uses proxy mode.
+                    let proxy_port = match policy.network.mode {
+                        axis_core::policy::NetworkMode::Proxy => {
+                            let proxy_config = axis_proxy::proxy::ProxyConfig {
+                                sandbox_id,
+                                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                                policy: policy.clone(),
+                                enable_l7: false,
+                                enable_leak_detection: true,
+                                inference_endpoint: None,
+                            };
+                            let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
+                                .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
+                            let addr = proxy.bind().await
+                                .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
+                            eprintln!("AXIS: proxy on {addr}");
+                            tokio::spawn(async move { let _ = proxy.run().await; });
+                            addr.port()
+                        }
+                        _ => 0,
+                    };
+
+                    // Pass through env vars from parent (for API keys, etc).
+                    let mut env: Vec<(String, String)> = Vec::new();
+                    for key in &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "HOME", "USER",
+                                 "PATH", "LANG", "TERM", "SHELL"] {
+                        if let Ok(val) = std::env::var(key) {
+                            env.push((key.to_string(), val));
+                        }
+                    }
+
                     let config = axis_sandbox::SandboxConfig {
-                        id: axis_core::types::SandboxId::new(),
+                        id: sandbox_id,
                         policy,
                         command: cmd.to_string(),
                         args: args.to_vec(),
                         working_dir: None,
                         workspace_dir: workspace.path().to_path_buf(),
-                        env: vec![],
-                        proxy_port: 13128,
-                        capture_output: false, // standalone: inherit parent stdio
+                        env,
+                        proxy_port,
+                        capture_output: false,
                         timeout_sec: None,
                     };
 
