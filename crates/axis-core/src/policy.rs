@@ -44,6 +44,9 @@ pub struct Policy {
     pub gpu: GpuPolicy,
 
     #[serde(default)]
+    pub ssh: SshPolicy,
+
+    #[serde(default)]
     pub amd: Option<AmdPolicy>,
 }
 
@@ -428,6 +431,36 @@ pub enum GpuTransport {
     #[default]
     Uds,
     Tcp,
+}
+
+/// SSH key policy — controls which SSH keys and hosts agents can access.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SshPolicy {
+    /// SSH keys the agent is allowed to use.
+    #[serde(default)]
+    pub allowed_keys: Vec<SshKeySpec>,
+
+    /// Auto-generate a scoped known_hosts file for the sandbox.
+    #[serde(default)]
+    pub generate_known_hosts: bool,
+
+    /// Auto-generate a restrictive SSH config for the sandbox.
+    #[serde(default)]
+    pub generate_config: bool,
+}
+
+/// A specific SSH key with host restrictions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshKeySpec {
+    /// Display name for the key.
+    pub name: String,
+
+    /// Path to the private key file (expanded from ~/).
+    pub private_key: String,
+
+    /// Hosts this key is allowed to connect to. Empty = all hosts.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[cfg(test)]
