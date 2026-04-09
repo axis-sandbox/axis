@@ -44,11 +44,15 @@ sudo rpm -i axis-0.1.0-1.x86_64.rpm  # Fedora/RHEL
 ## Quick Start
 
 ```bash
-# Run a command in a sandbox (standalone, no daemon needed)
-axis run -- python my_agent.py
+# Run anything in a sandbox — one command, zero config
+axis run -- python -c "print('Hello from AXIS sandbox')"
+```
 
-# With a policy
-axis run --policy policies/coding-agent.yaml -- python my_agent.py
+That's it. The process runs with Landlock filesystem isolation, seccomp syscall filtering, and network policy enforcement — all in 0.6ms startup with no admin privileges.
+
+```bash
+# Run an agent with a policy
+axis run --policy coding-agent.yaml -- python my_agent.py
 
 # Or use the daemon for multi-sandbox management
 axsd &
