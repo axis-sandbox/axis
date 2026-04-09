@@ -316,7 +316,9 @@ mod tests {
     #[test]
     fn agent_state_root_is_under_home() {
         let root = agent_state_root("test-policy");
-        assert!(root.to_string_lossy().contains(".axis/agents/test-policy"));
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(root_str.contains(".axis/agents/test-policy"),
+            "expected .axis/agents/test-policy in {root_str}");
     }
 
     #[test]

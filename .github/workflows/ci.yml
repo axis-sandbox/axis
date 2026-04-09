@@ -81,7 +81,7 @@ jobs:
         run: bash e2e/linux/test_e2e_daemon.sh
 
       - name: Agent safety tests
-        run: bash e2e/agents/test_agents.sh --platform linux
+        run: AXIS_BIN=./target/release/axis bash e2e/agents/test_agents.sh --platform linux
 
   test-windows:
     name: Test (Windows native)
