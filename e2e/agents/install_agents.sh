@@ -34,37 +34,45 @@ ARCH=$(uname -m)
 
 mkdir -p "$TOOLS_DIR" "$BIN_DIR"
 
-# ── Agent definitions ────────────────────────────────────────────────────
-
-declare -A AGENT_BINARY
-declare -A AGENT_POLICY
-declare -A AGENT_INSTALL
-
-AGENT_BINARY[claude-code]="claude"
-AGENT_POLICY[claude-code]="claude-code.yaml"
-AGENT_INSTALL[claude-code]="install_claude_code"
-
-AGENT_BINARY[codex]="codex"
-AGENT_POLICY[codex]="codex.yaml"
-AGENT_INSTALL[codex]="install_codex"
-
-AGENT_BINARY[openclaw]="openclaw"
-AGENT_POLICY[openclaw]="openclaw.yaml"
-AGENT_INSTALL[openclaw]="install_openclaw"
-
-AGENT_BINARY[ironclaw]="ironclaw"
-AGENT_POLICY[ironclaw]="ironclaw.yaml"
-AGENT_INSTALL[ironclaw]="install_ironclaw"
-
-AGENT_BINARY[aider]="aider"
-AGENT_POLICY[aider]="hermes.yaml"  # aider uses similar permissions to hermes
-AGENT_INSTALL[aider]="install_aider"
-
-AGENT_BINARY[goose]="goose"
-AGENT_POLICY[goose]="hermes.yaml"
-AGENT_INSTALL[goose]="install_goose"
+# ── Agent definitions (bash 3 compatible — no associative arrays) ────────
 
 ALL_AGENTS="claude-code codex openclaw ironclaw aider goose"
+
+agent_binary() {
+    case "$1" in
+        claude-code) echo "claude" ;;
+        codex)       echo "codex" ;;
+        openclaw)    echo "openclaw" ;;
+        ironclaw)    echo "ironclaw" ;;
+        aider)       echo "aider" ;;
+        goose)       echo "goose" ;;
+        *)           echo "$1" ;;
+    esac
+}
+
+agent_policy() {
+    case "$1" in
+        claude-code) echo "claude-code.yaml" ;;
+        codex)       echo "codex.yaml" ;;
+        openclaw)    echo "openclaw.yaml" ;;
+        ironclaw)    echo "ironclaw.yaml" ;;
+        aider)       echo "hermes.yaml" ;;
+        goose)       echo "hermes.yaml" ;;
+        *)           echo "base-deny.yaml" ;;
+    esac
+}
+
+agent_install_fn() {
+    case "$1" in
+        claude-code) echo "install_claude_code" ;;
+        codex)       echo "install_codex" ;;
+        openclaw)    echo "install_openclaw" ;;
+        ironclaw)    echo "install_ironclaw" ;;
+        aider)       echo "install_aider" ;;
+        goose)       echo "install_goose" ;;
+        *)           echo "" ;;
+    esac
+}
 
 # ── Install functions ────────────────────────────────────────────────────
 
@@ -174,7 +182,8 @@ create_wrapper() {
     local agent_name="$1"
     local binary_path="$2"
     local policy_file="$3"
-    local binary_name="${AGENT_BINARY[$agent_name]}"
+    local binary_name
+    binary_name=$(agent_binary "$agent_name")
 
     # Find axis binary.
     local axis_bin
@@ -261,7 +270,7 @@ FAILED=0
 for agent in $AGENTS; do
     echo "--- Installing: $agent ---"
 
-    install_fn="${AGENT_INSTALL[$agent]:-}"
+    install_fn=$(agent_install_fn "$agent")
     if [ -z "$install_fn" ]; then
         echo "  Unknown agent: $agent"
         FAILED=$((FAILED+1))
@@ -273,7 +282,7 @@ for agent in $AGENTS; do
     if [ -n "$binary_path" ] && [ -x "$binary_path" ] 2>/dev/null; then
         echo "  Binary: $binary_path"
 
-        policy_file="${POLICY_DIR}/${AGENT_POLICY[$agent]}"
+        policy_file="${POLICY_DIR}/$(agent_policy "$agent")"
         if [ ! -f "$policy_file" ]; then
             echo "  Warning: policy not found at $policy_file, using base-deny"
             policy_file="${POLICY_DIR}/base-deny.yaml"
@@ -300,7 +309,7 @@ if [ $INSTALLED -gt 0 ]; then
     echo "Then run agents normally — they go through AXIS automatically:"
     echo ""
     for agent in $AGENTS; do
-        local_bin="${AGENT_BINARY[$agent]:-$agent}"
+        local_bin=$(agent_binary "$agent")
         if [ -x "$BIN_DIR/$local_bin" ]; then
             echo "  $local_bin --version        # runs through AXIS sandbox"
             echo "  axis $local_bin --version   # same thing, explicit"
