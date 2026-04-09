@@ -16,6 +16,9 @@ $PolicyDir = "$PSScriptRoot\..\..\policies\agents"
 if (-not (Test-Path $PolicyDir)) {
     $PolicyDir = "$env:LOCALAPPDATA\axis\policies\agents"
 }
+if (-not (Test-Path $PolicyDir)) {
+    $PolicyDir = "$env:USERPROFILE\.axis\policies\agents"
+}
 
 Write-Host ""
 Write-Host "  AXIS Agent Safety Test Suite (Windows)" -ForegroundColor Cyan

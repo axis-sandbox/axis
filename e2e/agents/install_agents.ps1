@@ -70,7 +70,8 @@ function Install-Codex {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
     if (Get-Command npm -ErrorAction SilentlyContinue) {
-        & npm install --prefix $dir @openai/codex 2>&1 | Select-Object -Last 3
+        Write-Host "  Installing via npm..."
+        & npm install --prefix $dir @openai/codex 2>&1 | Out-Null
         $bin = "$dir\node_modules\.bin\codex.cmd"
         if (Test-Path $bin) { return $bin }
     }
@@ -86,7 +87,8 @@ function Install-OpenClaw {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
     if (Get-Command npm -ErrorAction SilentlyContinue) {
-        & npm install --prefix $dir openclaw@latest 2>&1 | Select-Object -Last 3
+        Write-Host "  Installing via npm..."
+        & npm install --prefix $dir openclaw@latest 2>&1 | Out-Null
         $bin = "$dir\node_modules\.bin\openclaw.cmd"
         if (Test-Path $bin) { return $bin }
     }
@@ -117,16 +119,15 @@ function Install-Aider {
     $dir = "$ToolsDir\aider"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        & python -m venv "$dir\venv" 2>&1 | Out-Null
-        & "$dir\venv\Scripts\pip.exe" install -q aider-chat 2>&1 | Select-Object -Last 3
-        $bin = "$dir\venv\Scripts\aider.exe"
-        if (Test-Path $bin) { return $bin }
-    }
+    $pythonCmd = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+                 elseif (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" }
+                 else { $null }
 
-    if (Get-Command python3 -ErrorAction SilentlyContinue) {
-        & python3 -m venv "$dir\venv" 2>&1 | Out-Null
-        & "$dir\venv\Scripts\pip.exe" install -q aider-chat 2>&1 | Select-Object -Last 3
+    if ($pythonCmd) {
+        Write-Host "  Creating venv..."
+        & $pythonCmd -m venv "$dir\venv" 2>&1 | Out-Null
+        Write-Host "  Installing aider-chat..."
+        & "$dir\venv\Scripts\pip.exe" install -q aider-chat 2>&1 | Out-Null
         $bin = "$dir\venv\Scripts\aider.exe"
         if (Test-Path $bin) { return $bin }
     }

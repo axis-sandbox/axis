@@ -157,10 +157,20 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Install { agents, all, list } => {
-            // Install bundled policies to ~/.axis/policies/agents/.
-            let axis_root = PathBuf::from(
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-            ).join(".axis");
+            // Install bundled policies.
+            // On Windows: %LOCALAPPDATA%\axis (matches PS1 installer).
+            // On Unix: ~/.axis
+            let axis_root = if cfg!(windows) {
+                PathBuf::from(
+                    std::env::var("LOCALAPPDATA").unwrap_or_else(|_|
+                        std::env::var("USERPROFILE").unwrap_or("C:\\Users\\Public".into())
+                    )
+                ).join("axis")
+            } else {
+                PathBuf::from(
+                    std::env::var("HOME").unwrap_or("/tmp".into())
+                ).join(".axis")
+            };
             let pol_dir = axis_root.join("policies").join("agents");
             std::fs::create_dir_all(&pol_dir)?;
             for (name, content) in [
