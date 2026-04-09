@@ -19,13 +19,20 @@ Every network request goes through a policy-evaluated proxy. The agent never tou
 ## Install
 
 ```bash
-# One-line installer (Linux, macOS, Windows via WSL)
-curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh
+# Linux / macOS
+curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh
+```
 
-# Or install nightly
-curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh -s -- --nightly
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1 | iex
+```
 
-# Or build from source
+```bash
+# Nightly builds
+curl -sSf .../install.sh | sh -s -- --nightly    # Linux/macOS
+
+# Build from source
 cargo install --path crates/axis-cli
 cargo install --path crates/axis-daemon
 

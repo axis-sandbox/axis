@@ -12,7 +12,7 @@
 
 set -e
 
-REPO="ROCm/axis"
+REPO="axis-sandbox/axis"
 INSTALL_DIR="${HOME}/.local/bin"
 CHANNEL="release"
 VERSION=""

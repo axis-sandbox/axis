@@ -26,21 +26,16 @@ jobs:
             os: macos-14
             archive: tar.gz
             platform: macos-aarch64
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-24.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
             archive: zip
             platform: windows-x86_64
-            cross: true
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install cross tools
-        if: matrix.cross
-        run: sudo apt-get install -y gcc-mingw-w64-x86-64
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -53,23 +48,27 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo test
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist/axis-${{ matrix.platform }}
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp target/${{ matrix.target }}/release/axis.exe dist/axis-${{ matrix.platform }}/
-            cp target/${{ matrix.target }}/release/axsd.exe dist/axis-${{ matrix.platform }}/
-          else
-            cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
-            cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
-          fi
+          cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
+          cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
           cp policies/*.yaml dist/axis-${{ matrix.platform }}/
-          cd dist
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            zip -r axis-${{ matrix.platform }}.zip axis-${{ matrix.platform }}/
-          else
-            tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
-          fi
+          cp LICENSE dist/axis-${{ matrix.platform }}/
+          cd dist && tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist\axis-${{ matrix.platform }} -Force
+          Copy-Item target\${{ matrix.target }}\release\axis.exe dist\axis-${{ matrix.platform }}\
+          Copy-Item target\${{ matrix.target }}\release\axsd.exe dist\axis-${{ matrix.platform }}\
+          Copy-Item policies\*.yaml dist\axis-${{ matrix.platform }}\
+          Copy-Item LICENSE dist\axis-${{ matrix.platform }}\
+          Copy-Item install.ps1 dist\axis-${{ matrix.platform }}\
+          Compress-Archive -Path dist\axis-${{ matrix.platform }} -DestinationPath dist\axis-${{ matrix.platform }}.zip
 
       - uses: actions/upload-artifact@v4
         with:

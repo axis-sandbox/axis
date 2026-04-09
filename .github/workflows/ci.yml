@@ -37,20 +37,24 @@ jobs:
         run: bash e2e/linux/test_e2e_daemon.sh
 
   test-windows:
-    name: Test (Windows cross-compile)
-    runs-on: ubuntu-24.04
+    name: Test (Windows native)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install MinGW
-        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Build
+        run: cargo build --release
 
-      - name: Cross-compile for Windows
-        run: cargo check --target x86_64-pc-windows-gnu
+      - name: Unit tests
+        run: cargo test
+
+      - name: Policy validation
+        run: |
+          .\target\release\axis.exe policy validate policies\minimal.yaml
+          .\target\release\axis.exe policy validate policies\coding-agent.yaml
+          .\target\release\axis.exe policy validate policies\gpu-agent.yaml
 
   clippy:
     name: Clippy

@@ -34,11 +34,10 @@ jobs:
             os: macos-14
             archive: tar.gz
             platform: macos-aarch64
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-24.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
             archive: zip
             platform: windows-x86_64
-            cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -46,19 +45,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.cross
+      - name: Install cross-compilation tools (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu)
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-              echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
-              ;;
-            x86_64-pc-windows-gnu)
-              sudo apt-get install -y gcc-mingw-w64-x86-64
-              ;;
-          esac
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -67,27 +59,29 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist/axis-${{ matrix.platform }}
-
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp target/${{ matrix.target }}/release/axis.exe dist/axis-${{ matrix.platform }}/
-            cp target/${{ matrix.target }}/release/axsd.exe dist/axis-${{ matrix.platform }}/
-          else
-            cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
-            cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
-          fi
-
+          cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
+          cp target/${{ matrix.target }}/release/axsd dist/axis-${{ matrix.platform }}/
           cp policies/*.yaml dist/axis-${{ matrix.platform }}/
-          cp README.md dist/axis-${{ matrix.platform }}/
-
+          cp README.md LICENSE dist/axis-${{ matrix.platform }}/
           cd dist
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            zip -r axis-${{ matrix.platform }}.zip axis-${{ matrix.platform }}/
-          else
-            tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
-          fi
+          tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist\axis-${{ matrix.platform }} -Force
+          Copy-Item target\${{ matrix.target }}\release\axis.exe dist\axis-${{ matrix.platform }}\
+          Copy-Item target\${{ matrix.target }}\release\axsd.exe dist\axis-${{ matrix.platform }}\
+          Copy-Item policies\*.yaml dist\axis-${{ matrix.platform }}\
+          Copy-Item README.md dist\axis-${{ matrix.platform }}\
+          Copy-Item LICENSE dist\axis-${{ matrix.platform }}\
+          Copy-Item install.ps1 dist\axis-${{ matrix.platform }}\
+          Compress-Archive -Path dist\axis-${{ matrix.platform }} -DestinationPath dist\axis-${{ matrix.platform }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
