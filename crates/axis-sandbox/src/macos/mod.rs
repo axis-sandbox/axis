@@ -63,12 +63,17 @@ impl SandboxImpl for MacosSandbox {
             cmd.env(k, v);
         }
 
-        // Proxy env vars.
-        let proxy_url = format!("http://127.0.0.1:{}", self.config.proxy_port);
-        cmd.env("HTTP_PROXY", &proxy_url);
-        cmd.env("HTTPS_PROXY", &proxy_url);
-        cmd.env("http_proxy", &proxy_url);
-        cmd.env("https_proxy", &proxy_url);
+        // Proxy env vars (only when proxy is active).
+        if self.config.proxy_port > 0 {
+            let proxy_url = format!("http://127.0.0.1:{}", self.config.proxy_port);
+            cmd.env("HTTP_PROXY", &proxy_url);
+            cmd.env("HTTPS_PROXY", &proxy_url);
+            cmd.env("http_proxy", &proxy_url);
+            cmd.env("https_proxy", &proxy_url);
+            // NO_PROXY for localhost to avoid proxy loop.
+            cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+            cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+        }
 
         // Capture output in daemon mode.
         if self.config.capture_output {

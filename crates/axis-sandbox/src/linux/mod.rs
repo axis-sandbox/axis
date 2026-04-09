@@ -94,13 +94,17 @@ impl SandboxImpl for LinuxSandbox {
             cmd.env(k, v);
         }
 
-        // Inject proxy env vars. Use loopback if no netns, veth IP if netns.
-        let proxy_host = if netns_fd.is_some() { "10.200.0.1" } else { "127.0.0.1" };
-        let proxy_url = format!("http://{proxy_host}:{proxy_port}");
-        cmd.env("HTTP_PROXY", &proxy_url);
-        cmd.env("HTTPS_PROXY", &proxy_url);
-        cmd.env("http_proxy", &proxy_url);
-        cmd.env("https_proxy", &proxy_url);
+        // Inject proxy env vars (only when proxy is active).
+        if proxy_port > 0 {
+            let proxy_host = if netns_fd.is_some() { "10.200.0.1" } else { "127.0.0.1" };
+            let proxy_url = format!("http://{proxy_host}:{proxy_port}");
+            cmd.env("HTTP_PROXY", &proxy_url);
+            cmd.env("HTTPS_PROXY", &proxy_url);
+            cmd.env("http_proxy", &proxy_url);
+            cmd.env("https_proxy", &proxy_url);
+            cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
+            cmd.env("no_proxy", "localhost,127.0.0.1,::1");
+        }
 
         // Safety: pre_exec runs after fork, before exec in the child process.
         unsafe {

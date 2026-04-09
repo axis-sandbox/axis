@@ -464,12 +464,17 @@ async fn main() -> Result<()> {
                         _ => 0,
                     };
 
-                    // Pass through env vars from parent (for API keys, etc).
+                    // Pass through env vars from parent.
+                    // All ANTHROPIC_* vars (API key, base URL, etc.) and essential system vars.
                     let mut env: Vec<(String, String)> = Vec::new();
-                    for key in &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "HOME", "USER",
-                                 "PATH", "LANG", "TERM", "SHELL"] {
-                        if let Ok(val) = std::env::var(key) {
-                            env.push((key.to_string(), val));
+                    for (key, val) in std::env::vars() {
+                        if key.starts_with("ANTHROPIC_")
+                            || key.starts_with("OPENAI_")
+                            || matches!(key.as_str(), "HOME" | "USER" | "PATH" | "LANG"
+                                | "TERM" | "SHELL" | "TMPDIR" | "XDG_RUNTIME_DIR"
+                                | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME")
+                        {
+                            env.push((key, val));
                         }
                     }
 
