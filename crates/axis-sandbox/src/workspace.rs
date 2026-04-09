@@ -52,6 +52,11 @@ pub fn prepare_agent_workspace(
             continue;
         }
 
+        // Never symlink ~/.axis itself (that's the containment root).
+        if expanded.ends_with("/.axis") || expanded.contains("/.axis/") {
+            continue;
+        }
+
         // Find the relative path from home.
         let relative = match PathBuf::from(&expanded).strip_prefix(&home) {
             Ok(r) => r.to_path_buf(),

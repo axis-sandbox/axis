@@ -64,6 +64,21 @@ enum Commands {
         action: ModelAction,
     },
 
+    /// Install agent runtimes into contained ~/.axis/tools/ directory.
+    Install {
+        /// Agents to install (or --all).
+        #[arg(trailing_var_arg = true)]
+        agents: Vec<String>,
+
+        /// Install all supported agents.
+        #[arg(long)]
+        all: bool,
+
+        /// List available agents.
+        #[arg(long)]
+        list: bool,
+    },
+
     /// View sandbox logs (stdout/stderr and audit events).
     Logs {
         /// Sandbox ID.
@@ -134,6 +149,48 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Install { agents, all, list } => {
+            // Install bundled policies to ~/.axis/policies/agents/.
+            let axis_root = PathBuf::from(
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+            ).join(".axis");
+            let pol_dir = axis_root.join("policies").join("agents");
+            std::fs::create_dir_all(&pol_dir)?;
+            for (name, content) in [
+                ("base-deny.yaml", include_str!("../../../policies/agents/base-deny.yaml")),
+                ("claude-code.yaml", include_str!("../../../policies/agents/claude-code.yaml")),
+                ("claude-code-ssh.yaml", include_str!("../../../policies/agents/claude-code-ssh.yaml")),
+                ("codex.yaml", include_str!("../../../policies/agents/codex.yaml")),
+                ("openclaw.yaml", include_str!("../../../policies/agents/openclaw.yaml")),
+                ("ironclaw.yaml", include_str!("../../../policies/agents/ironclaw.yaml")),
+                ("nanoclaw.yaml", include_str!("../../../policies/agents/nanoclaw.yaml")),
+                ("zeroclaw.yaml", include_str!("../../../policies/agents/zeroclaw.yaml")),
+                ("hermes.yaml", include_str!("../../../policies/agents/hermes.yaml")),
+            ] {
+                let _ = std::fs::write(pol_dir.join(name), content);
+            }
+
+            let install_script = include_str!("../../../e2e/agents/install_agents.sh");
+            let script_path = std::env::temp_dir().join("axis-install-agents.sh");
+            std::fs::write(&script_path, install_script)?;
+
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(&script_path);
+            if list {
+                cmd.arg("--list");
+            } else if all {
+                cmd.arg("--all");
+            } else if agents.is_empty() {
+                cmd.arg("--help");
+            } else {
+                cmd.args(&agents);
+            }
+
+            let status = cmd.status()?;
+            let _ = std::fs::remove_file(&script_path);
+            std::process::exit(status.code().unwrap_or(1));
+        }
+
         Commands::Create { policy, command } => {
             let policy_yaml = std::fs::read_to_string(&policy)?;
 
