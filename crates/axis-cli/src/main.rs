@@ -150,12 +150,26 @@ async fn main() -> Result<()> {
         std::process::exit(result);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("axis=info".parse()?),
-        )
-        .init();
+    // Suppress logging when stdin is a TTY and we're running an agent
+    // (the TUI agent would be confused by JSON log lines on stderr).
+    let is_interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let is_run_cmd = std::env::args().nth(1).as_deref() == Some("run");
+    let quiet = is_interactive && is_run_cmd && std::env::var("AXIS_LOG").is_err();
+
+    if quiet {
+        // Minimal logging — only errors.
+        tracing_subscriber::fmt()
+            .with_env_filter("axis=error")
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("axis=info".parse()?),
+            )
+            .init();
+    }
 
     let cli = Cli::parse();
 
@@ -496,7 +510,9 @@ async fn main() -> Result<()> {
 
             // Validate.
             let parsed = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
-            eprintln!("AXIS: sandbox '{}' starting...", parsed.name);
+            if !is_interactive {
+                eprintln!("AXIS: sandbox '{}' starting...", parsed.name);
+            }
 
             // Try to connect to existing daemon, or start one inline.
             let (cmd, args) = command.split_first().expect("command required");
@@ -534,7 +550,8 @@ async fn main() -> Result<()> {
                 }
                 Err(_) => {
                     // Daemon not running — run sandbox directly (standalone mode).
-                    eprintln!("AXIS: daemon not running, using standalone mode");
+                    let quiet = std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    if !quiet { eprintln!("AXIS: daemon not running, using standalone mode"); }
 
                     let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
                     let sandbox_id = axis_core::types::SandboxId::new();
@@ -555,7 +572,7 @@ async fn main() -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
                             let addr = proxy.bind().await
                                 .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
-                            eprintln!("AXIS: proxy on {addr}");
+                            if !quiet { eprintln!("AXIS: proxy on {addr}"); }
                             tokio::spawn(async move { let _ = proxy.run().await; });
                             addr.port()
                         }
@@ -593,8 +610,10 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                    eprintln!("AXIS: sandbox running (pid={}), Ctrl+C to stop",
-                        sandbox.pid.unwrap_or(0));
+                    if !quiet {
+                        eprintln!("AXIS: sandbox running (pid={}), Ctrl+C to stop",
+                            sandbox.pid.unwrap_or(0));
+                    }
 
                     // Wait for process or Ctrl+C.
                     tokio::select! {
@@ -603,7 +622,6 @@ async fn main() -> Result<()> {
                             std::process::exit(code);
                         }
                         _ = tokio::signal::ctrl_c() => {
-                            eprintln!("\nAXIS: stopping...");
                             sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
                         }
                     }
