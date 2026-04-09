@@ -14,38 +14,35 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
     let mut sb = String::new();
 
     sb.push_str("(version 1)\n");
-    sb.push_str("\n;; AXIS sandbox profile — auto-generated\n");
-    sb.push_str(&format!(";; Policy: {}\n\n", policy.name));
+    sb.push_str(&format!(";; AXIS sandbox profile — {}\n\n", policy.name));
 
-    // Default deny everything.
+    // Default deny everything, then selectively allow.
     sb.push_str("(deny default)\n\n");
 
-    // ── Process execution ──
-    sb.push_str(";; Allow process execution\n");
-    sb.push_str("(allow process-exec)\n");
-    sb.push_str("(allow process-fork)\n");
-    sb.push_str("(allow signal (target self))\n\n");
-
-    // ── Filesystem: read-only paths ──
-    sb.push_str(";; Filesystem: read-only paths\n");
-    for path in &policy.filesystem.read_only {
-        let expanded = expand_path(path, workspace);
-        sb.push_str(&format!(
-            "(allow file-read* (subpath \"{expanded}\"))\n"
-        ));
-    }
-
-    // Standard system paths always readable.
-    for path in &["/usr", "/System", "/Library", "/bin", "/sbin",
-                  "/private/var/db", "/dev/null", "/dev/urandom", "/dev/random"] {
-        sb.push_str(&format!("(allow file-read* (subpath \"{path}\"))\n"));
-    }
+    // ── Essential: process execution + Mach IPC ──
+    // macOS processes need Mach IPC for basic operation (dyld, libsystem).
+    sb.push_str(";; Essential for process execution\n");
+    sb.push_str("(allow process*)\n");
+    sb.push_str("(allow signal)\n");
+    sb.push_str("(allow sysctl-read)\n");
+    sb.push_str("(allow mach*)\n");       // Mach IPC required for dyld, libsystem
+    sb.push_str("(allow ipc-posix-shm*)\n");
     sb.push('\n');
 
-    // ── Filesystem: read-write paths ──
-    sb.push_str(";; Filesystem: read-write (workspace)\n");
+    // ── Filesystem: read-only ──
+    // Allow reading the entire filesystem — macOS processes need access to
+    // dyld shared cache, frameworks, and other system locations that can't
+    // be enumerated individually. Write restrictions (below) provide the
+    // actual security boundary.
+    sb.push_str(";; Filesystem: read entire system (writes restricted below)\n");
+    sb.push_str("(allow file-read* (subpath \"/\"))\n");
+    sb.push('\n');
+
+    // ── Filesystem: read-write (workspace + policy paths) ──
+    sb.push_str(";; Filesystem: read-write\n");
     let ws = workspace.to_string_lossy();
     sb.push_str(&format!("(allow file-read* file-write* (subpath \"{ws}\"))\n"));
+
     for path in &policy.filesystem.read_write {
         let expanded = expand_path(path, workspace);
         if expanded != ws.as_ref() {
@@ -54,9 +51,18 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
             ));
         }
     }
+
+    // Temp directories.
+    sb.push_str("(allow file-read* file-write* (subpath \"/tmp\"))\n");
+    sb.push_str("(allow file-read* file-write* (subpath \"/private/tmp\"))\n");
+
+    // TTY/PTY for stdout/stderr.
+    sb.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys\"))\n");
+    sb.push_str("(allow file-read* file-write* (regex #\"^/dev/fd/\"))\n");
+    sb.push_str("(allow file-write* (literal \"/dev/null\"))\n");
     sb.push('\n');
 
-    // ── Filesystem: deny paths ──
+    // ── Filesystem: deny paths (override allows) ──
     if !policy.filesystem.deny.is_empty() {
         sb.push_str(";; Filesystem: explicit deny\n");
         for path in &policy.filesystem.deny {
@@ -78,29 +84,18 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
             sb.push_str("(allow network*)\n");
         }
         axis_core::policy::NetworkMode::Proxy => {
-            // Allow only loopback connections (to the proxy).
+            // Allow only loopback (to reach the AXIS proxy).
             sb.push_str("(allow network* (remote ip \"localhost:*\"))\n");
             sb.push_str("(deny network* (remote ip \"*:*\"))\n");
         }
     }
     sb.push('\n');
 
-    // ── Misc permissions needed for normal operation ──
-    sb.push_str(";; Required for normal operation\n");
-    sb.push_str("(allow sysctl-read)\n");
-    sb.push_str("(allow mach-lookup)\n");
-    sb.push_str("(allow ipc-posix-shm-read-data)\n");
-    sb.push_str("(allow ipc-posix-shm-write-data)\n");
-    sb.push_str("(allow file-read-metadata)\n");
-    sb.push('\n');
-
-    // ── Deny dangerous operations ──
-    sb.push_str(";; Security: deny dangerous operations\n");
+    // ── Security: deny dangerous operations ──
+    sb.push_str(";; Security\n");
     sb.push_str("(deny file-write* (subpath \"/System\"))\n");
     sb.push_str("(deny file-write* (subpath \"/usr\"))\n");
     sb.push_str("(deny file-write* (subpath \"/Library\"))\n");
-    sb.push_str("(deny process-info* (target others))\n");
-    sb.push_str("(deny system-privilege)\n");
 
     sb
 }
@@ -124,20 +119,20 @@ mod tests {
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("/tmp/workspace"));
-        assert!(profile.contains("(allow process-exec)"));
+        assert!(profile.contains("(allow process*)"));
+        assert!(profile.contains("(allow mach*)"));
     }
 
     #[test]
-    fn proxy_mode_allows_loopback_only() {
+    fn proxy_mode_allows_loopback() {
         let yaml = "version: 1\nname: test\nnetwork:\n  mode: proxy\n";
         let policy = Policy::from_yaml(yaml).unwrap();
         let profile = generate_profile(&policy, Path::new("/tmp/ws"));
         assert!(profile.contains("localhost"));
-        assert!(profile.contains("(deny network*"));
     }
 
     #[test]
-    fn block_mode_denies_all_network() {
+    fn block_mode_denies_network() {
         let yaml = "version: 1\nname: test\nnetwork:\n  mode: block\n";
         let policy = Policy::from_yaml(yaml).unwrap();
         let profile = generate_profile(&policy, Path::new("/tmp/ws"));

@@ -40,12 +40,11 @@ impl SandboxImpl for MacosSandbox {
             &self.config.workspace_dir,
         );
 
-        // Write profile to temp file in workspace.
+        // Write profile to a temp file and use sandbox-exec -f.
         let profile_path = self.config.workspace_dir.join(".axis-sandbox.sb");
         std::fs::write(&profile_path, &seatbelt_profile)
             .map_err(|e| SandboxError::IsolationFailed(format!("write profile: {e}")))?;
 
-        // Use sandbox-exec to run the command with the profile.
         let mut cmd = Command::new("sandbox-exec");
         cmd.arg("-f").arg(&profile_path);
         cmd.arg("--");
