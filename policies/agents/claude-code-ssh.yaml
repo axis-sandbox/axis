@@ -22,7 +22,6 @@ filesystem:
     - "~/.claude"
     - "~/.local/share/claude"
     - "~/.config"
-    - "~/Library"
     - "~/.axis"
   deny:
     - "~/.ssh"

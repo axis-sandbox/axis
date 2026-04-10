@@ -27,7 +27,6 @@ filesystem:
     - "~/.claude"
     - "~/.local/share/claude"
     - "~/.config"
-    - "~/Library"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

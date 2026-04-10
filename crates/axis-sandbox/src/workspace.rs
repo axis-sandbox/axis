@@ -20,7 +20,16 @@ const AGENT_DIR_MAPPINGS: &[(&str, &str)] = &[
     (".ironclaw", "ironclaw"),
     (".hermes", "hermes"),
     (".config", "config"),
-    ("Library", "library"),
+];
+
+/// Paths that should NEVER be symlinked — too large or contain circular links.
+const NEVER_SYMLINK: &[&str] = &[
+    "Library",          // macOS ~/Library is huge and has circular revlinks
+    ".local",           // Too broad — contains many unrelated things
+    "AppData",          // Windows equivalent of ~/Library
+    "Documents",
+    "Desktop",
+    "Downloads",
 ];
 
 /// Prepare the agent workspace: create ~/.axis/agents/<name>/ and symlink
@@ -54,6 +63,13 @@ pub fn prepare_agent_workspace(
 
         // Never symlink ~/.axis itself (that's the containment root).
         if expanded.ends_with("/.axis") || expanded.contains("/.axis/") {
+            continue;
+        }
+
+        // Never symlink large/dangerous directories.
+        let rel_check = expanded.trim_start_matches(&*home.to_string_lossy())
+            .trim_start_matches('/');
+        if NEVER_SYMLINK.iter().any(|&blocked| rel_check == blocked || rel_check.starts_with(&format!("{blocked}/"))) {
             continue;
         }
 
