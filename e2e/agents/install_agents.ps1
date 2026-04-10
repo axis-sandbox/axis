@@ -156,6 +156,15 @@ function Install-Goose {
 
 # ── Wrapper generator ────────────────────────────────────────────────────
 
+function Get-AgentDefaultFlags {
+    param([string]$AgentName)
+    switch ($AgentName) {
+        "claude-code" { return "--dangerously-skip-permissions" }
+        "codex"       { return "--full-auto" }
+        default       { return "" }
+    }
+}
+
 function New-AgentWrapper {
     param(
         [string]$AgentName,
@@ -163,6 +172,8 @@ function New-AgentWrapper {
         [string]$BinaryPath,
         [string]$PolicyFile
     )
+
+    $defaultFlags = Get-AgentDefaultFlags $AgentName
 
     # Find axis binary.
     $axisBin = Get-Command axis -ErrorAction SilentlyContinue
@@ -179,17 +190,21 @@ REM Policy:      $PolicyFile
 REM Real binary: $BinaryPath
 set "AXIS_BIN=%AXIS_BIN%"
 if "%AXIS_BIN%"=="" set "AXIS_BIN=$axisPath"
-"%AXIS_BIN%" run --policy "$PolicyFile" -- "$BinaryPath" %*
+if defined AXIS_NO_DEFAULT_FLAGS ("%AXIS_BIN%" run --policy "$PolicyFile" -- "$BinaryPath" %*) else ("%AXIS_BIN%" run --policy "$PolicyFile" -- "$BinaryPath" $defaultFlags %*)
 "@ | Set-Content -Path $cmdWrapper -Encoding ASCII
 
     # Create .ps1 wrapper for PowerShell.
     $ps1Wrapper = "$BinDir\$BinaryName.ps1"
     @"
 # AXIS-sandboxed $BinaryName
-# Usage: $BinaryName [args...]       (when $BinDir is in PATH)
-#    or: axis $BinaryName [args...]  (via axis subcommand extension)
+# Default flags: $defaultFlags
+# Override: `$env:AXIS_NO_DEFAULT_FLAGS=1; $BinaryName [args...]
 `$axisBin = if (`$env:AXIS_BIN) { `$env:AXIS_BIN } else { "$axisPath" }
-& `$axisBin run --policy "$PolicyFile" -- "$BinaryPath" @args
+if (`$env:AXIS_NO_DEFAULT_FLAGS) {
+    & `$axisBin run --policy "$PolicyFile" -- "$BinaryPath" @args
+} else {
+    & `$axisBin run --policy "$PolicyFile" -- "$BinaryPath" $defaultFlags @args
+}
 "@ | Set-Content -Path $ps1Wrapper -Encoding UTF8
 
     Write-Host "  Wrapper: $cmdWrapper"

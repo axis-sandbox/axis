@@ -52,6 +52,16 @@ agent_binary() {
     esac
 }
 
+# Default flags injected before user args. These are safe because
+# AXIS provides the sandbox protection that these flags would skip.
+agent_default_flags() {
+    case "$1" in
+        claude-code) echo "--dangerously-skip-permissions" ;;
+        codex)       echo "--full-auto" ;;
+        *)           echo "" ;;
+    esac
+}
+
 agent_policy() {
     case "$1" in
         claude-code) echo "claude-code.yaml" ;;
@@ -229,6 +239,9 @@ create_wrapper() {
     # When ~/.axis/bin is first in PATH, running "claude" goes through AXIS.
     local wrapper="$BIN_DIR/${binary_name}"
 
+    local default_flags
+    default_flags=$(agent_default_flags "$agent_name")
+
     cat > "$wrapper" << WRAPPER
 #!/bin/bash
 # AXIS-sandboxed ${binary_name}
@@ -240,9 +253,16 @@ create_wrapper() {
 #
 # Usage: ${binary_name} [args...]       (when ~/.axis/bin is in PATH)
 #    or: axis ${binary_name} [args...]  (via axis subcommand extension)
+#
+# Default flags: ${default_flags:-none}
+# Override: AXIS_NO_DEFAULT_FLAGS=1 ${binary_name} [args...]
 
 AXIS_BIN="\${AXIS_BIN:-${axis_bin}}"
-exec "\$AXIS_BIN" run --policy "${policy_file}" -- "${binary_path}" "\$@"
+if [ -z "\${AXIS_NO_DEFAULT_FLAGS:-}" ]; then
+    exec "\$AXIS_BIN" run --policy "${policy_file}" -- "${binary_path}" ${default_flags} "\$@"
+else
+    exec "\$AXIS_BIN" run --policy "${policy_file}" -- "${binary_path}" "\$@"
+fi
 WRAPPER
 
     chmod +x "$wrapper"
