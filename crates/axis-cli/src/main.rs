@@ -83,6 +83,17 @@ enum Commands {
         use_system: bool,
     },
 
+    /// Uninstall agents and clean up AXIS data.
+    Uninstall {
+        /// Agents to uninstall (or --all).
+        #[arg(trailing_var_arg = true)]
+        agents: Vec<String>,
+
+        /// Remove all agents, tools, policies, and state.
+        #[arg(long)]
+        all: bool,
+    },
+
     /// View sandbox logs (stdout/stderr and audit events).
     Logs {
         /// Sandbox ID.
@@ -174,6 +185,121 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Uninstall { agents, all } => {
+            let bin_dir = axis_bin_dir();
+            let axis_root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
+
+            if all {
+                eprintln!("Removing all AXIS agent data...");
+
+                // Remove symlinks pointing into .axis first.
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default();
+                if !home.is_empty() {
+                    for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
+                        let path = entry.path();
+                        if path.is_symlink() {
+                            if let Ok(target) = std::fs::read_link(&path) {
+                                if target.to_string_lossy().contains(".axis") {
+                                    eprintln!("  Removing symlink: {}", path.display());
+                                    let _ = std::fs::remove_file(&path);
+                                    // Restore backup.
+                                    let backup = PathBuf::from(format!("{}.axis-backup", path.display()));
+                                    if backup.exists() {
+                                        let _ = std::fs::rename(&backup, &path);
+                                        eprintln!("  Restored: {}", path.display());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Remove all AXIS directories.
+                for dir in &["tools", "bin", "agents", "policies"] {
+                    let p = axis_root.join(dir);
+                    if p.exists() {
+                        eprintln!("  Removing: {}", p.display());
+                        let _ = std::fs::remove_dir_all(&p);
+                    }
+                }
+
+                eprintln!("Done. AXIS agent data removed.");
+                eprintln!("Note: the axis binary itself is not removed.");
+            } else if agents.is_empty() {
+                eprintln!("Usage:");
+                eprintln!("  axis uninstall claude-code aider   Remove specific agents");
+                eprintln!("  axis uninstall --all               Remove all agents and AXIS data");
+                eprintln!();
+
+                // List installed agents.
+                if bin_dir.exists() {
+                    eprintln!("Installed agents:");
+                    for entry in std::fs::read_dir(&bin_dir).into_iter().flatten().flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let name = name.strip_suffix(".cmd").or(name.strip_suffix(".ps1")).unwrap_or(&name);
+                        eprintln!("  {name}");
+                    }
+                }
+            } else {
+                for agent in &agents {
+                    let install_name = known_agent(agent).unwrap_or(agent.as_str());
+                    let binary_name = agent;
+
+                    eprintln!("Removing {agent}...");
+
+                    // Remove wrapper(s).
+                    for ext in &["", ".cmd", ".ps1"] {
+                        let wrapper = bin_dir.join(format!("{binary_name}{ext}"));
+                        if wrapper.exists() {
+                            let _ = std::fs::remove_file(&wrapper);
+                            eprintln!("  Removed: {}", wrapper.display());
+                        }
+                    }
+
+                    // Remove tool directory.
+                    let tool_dir = axis_root.join("tools").join(install_name);
+                    if tool_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&tool_dir);
+                        eprintln!("  Removed: {}", tool_dir.display());
+                    }
+
+                    // Remove agent state.
+                    let state_dir = axis_root.join("agents").join(format!("agent-{install_name}"));
+                    if state_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&state_dir);
+                        eprintln!("  Removed: {}", state_dir.display());
+                    }
+
+                    // Remove symlinks for this agent.
+                    let home = std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .unwrap_or_default();
+                    if !home.is_empty() {
+                        let agent_state = axis_root.join("agents").join(format!("agent-{install_name}"));
+                        for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
+                            let path = entry.path();
+                            if path.is_symlink() {
+                                if let Ok(target) = std::fs::read_link(&path) {
+                                    if target.starts_with(&agent_state) {
+                                        let _ = std::fs::remove_file(&path);
+                                        eprintln!("  Removed symlink: {}", path.display());
+                                        let backup = PathBuf::from(format!("{}.axis-backup", path.display()));
+                                        if backup.exists() {
+                                            let _ = std::fs::rename(&backup, &path);
+                                            eprintln!("  Restored: {}", path.display());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!("Done.");
+            }
+        }
+
         Commands::Install { agents, all, list, use_system } => {
             // Install bundled policies.
             // On Windows: %LOCALAPPDATA%\axis (matches PS1 installer).
