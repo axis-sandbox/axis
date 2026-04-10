@@ -115,3 +115,18 @@ jobs:
       - name: Agent safety tests
         run: powershell -ExecutionPolicy Bypass -File e2e\agents\test_agents.ps1 -AxisBin .\target\release\axis.exe
         shell: pwsh
+
+      - name: Test agent install (PowerShell)
+        run: |
+          # Test that axis install --list works
+          .\target\release\axis.exe install --list
+
+          # Test install script syntax by running with -List
+          powershell -ExecutionPolicy Bypass -Command "& {
+            `$script = Get-Content e2e\agents\install_agents.ps1 -Raw
+            `$tempFile = [System.IO.Path]::GetTempFileName() + '.ps1'
+            Set-Content -Path `$tempFile -Value `$script
+            & `$tempFile -List
+            Remove-Item `$tempFile
+          }"
+        shell: pwsh
