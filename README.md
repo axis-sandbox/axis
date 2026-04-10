@@ -29,7 +29,7 @@ curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | 
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1 | iex
+irm 'https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1' | iex
 ```
 
 ```bash

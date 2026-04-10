@@ -1,11 +1,11 @@
 # AXIS installer for Windows PowerShell
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1 | iex
+#   powershell -c "irm 'https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1' | iex"
 #
 #   # Or with options:
 #   $env:AXIS_CHANNEL = "nightly"
-#   irm https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1 | iex
+#   powershell -c "irm 'https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1' | iex"
 #
 # Options (set as env vars before running):
 #   AXIS_CHANNEL   "release" (default) or "nightly"
@@ -39,12 +39,12 @@ function Get-DownloadUrl {
         # Get latest release tag.
         $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -ErrorAction SilentlyContinue
         if (-not $release) {
-            throw "Cannot determine latest release. Try setting `$env:AXIS_VERSION`"
+            throw 'Cannot determine latest release. Try setting $env:AXIS_VERSION'
         }
         $tag = $release.tag_name
     }
 
-    return "https://github.com/$Repo/releases/download/$tag/axis-$Platform.zip"
+    return "https://github.com/$Repo/releases/download/$tag/axis-${Platform}.zip"
 }
 
 function Install-AXIS {
@@ -78,7 +78,7 @@ function Install-AXIS {
             Write-Host "  URL: $url"
             Write-Host ""
             Write-Host "If this is a new release, binaries may not be uploaded yet."
-            Write-Host "Try: `$env:AXIS_CHANNEL = 'nightly'"
+            Write-Host "Try: `$env:AXIS_CHANNEL = `"nightly`""
             throw
         }
 
@@ -100,7 +100,7 @@ function Install-AXIS {
         # Copy policy files.
         $yamls = Get-ChildItem -Path $extractDir -Recurse -Filter "*.yaml"
         if ($yamls.Count -gt 0) {
-            $policyDir = Join-Path $InstallDir ".." "policies"
+            $policyDir = Join-Path (Join-Path $InstallDir "..") "policies"
             New-Item -ItemType Directory -Path $policyDir -Force | Out-Null
             foreach ($yaml in $yamls) {
                 Copy-Item $yaml.FullName (Join-Path $policyDir $yaml.Name) -Force
@@ -114,11 +114,7 @@ function Install-AXIS {
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
         if ($userPath -notlike "*$InstallDir*") {
             Write-Host "Adding to PATH..." -ForegroundColor Yellow
-            [Environment]::SetEnvironmentVariable(
-                "Path",
-                "$InstallDir;$userPath",
-                "User"
-            )
+            [Environment]::SetEnvironmentVariable("Path", "$InstallDir;$userPath", "User")
             $env:Path = "$InstallDir;$env:Path"
             Write-Host "  Added $InstallDir to user PATH" -ForegroundColor Green
             Write-Host ""
@@ -129,7 +125,7 @@ function Install-AXIS {
         Write-Host "AXIS installed successfully!" -ForegroundColor Green
         Write-Host ""
         Write-Host "  axis --version"
-        Write-Host "  axis run -- echo 'Hello from sandbox'"
+        Write-Host "  axis run -- echo Hello-from-sandbox"
         Write-Host ""
 
     } finally {
