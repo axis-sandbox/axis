@@ -680,16 +680,18 @@ fn try_agent_subcommand() -> Option<i32> {
         return None;
     }
 
-    // Look for wrapper in ~/.axis/bin/<subcmd>.
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let wrapper = std::path::PathBuf::from(&home)
-        .join(".axis")
-        .join("bin")
-        .join(subcmd);
+    // Look for wrapper in the AXIS bin directory.
+    let bin_dir = axis_bin_dir();
 
-    if !wrapper.exists() || !wrapper.is_file() {
+    // On Unix: ~/.axis/bin/claude (shell script)
+    // On Windows: %LOCALAPPDATA%\axis\bin\claude.cmd
+    let wrapper = if cfg!(windows) {
+        bin_dir.join(format!("{subcmd}.cmd"))
+    } else {
+        bin_dir.join(subcmd)
+    };
+
+    if !wrapper.exists() {
         // Wrapper not found — check if this is a known agent and offer to install.
         return try_prompt_install(subcmd);
     }
@@ -697,13 +699,40 @@ fn try_agent_subcommand() -> Option<i32> {
     // Found a wrapper — exec it with remaining args.
     let agent_args: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
 
-    let status = std::process::Command::new(&wrapper)
-        .args(&agent_args)
-        .env("AXIS_BIN", std::env::current_exe().unwrap_or_default())
-        .status()
-        .ok()?;
+    let status = if cfg!(windows) {
+        // On Windows, run .cmd via cmd.exe
+        std::process::Command::new("cmd")
+            .args(["/C", &wrapper.to_string_lossy()])
+            .args(&agent_args)
+            .env("AXIS_BIN", std::env::current_exe().unwrap_or_default())
+            .status()
+            .ok()?
+    } else {
+        std::process::Command::new(&wrapper)
+            .args(&agent_args)
+            .env("AXIS_BIN", std::env::current_exe().unwrap_or_default())
+            .status()
+            .ok()?
+    };
 
     Some(status.code().unwrap_or(1))
+}
+
+/// Get the AXIS bin directory (platform-specific).
+fn axis_bin_dir() -> std::path::PathBuf {
+    if cfg!(windows) {
+        // Windows: %LOCALAPPDATA%\axis\bin
+        std::path::PathBuf::from(
+            std::env::var("LOCALAPPDATA").unwrap_or_else(|_|
+                std::env::var("USERPROFILE").unwrap_or("C:\\Users\\Public".into())
+            )
+        ).join("axis").join("bin")
+    } else {
+        // Unix: ~/.axis/bin
+        std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or("/tmp".into())
+        ).join(".axis").join("bin")
+    }
 }
 
 /// Known agent binary names → install names.
@@ -754,20 +783,28 @@ fn try_prompt_install(subcmd: &str) -> Option<i32> {
         let args: Vec<String> = std::env::args().collect();
         let agent_args: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
 
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()?;
-        let wrapper = std::path::PathBuf::from(&home)
-            .join(".axis")
-            .join("bin")
-            .join(subcmd);
+        let bin_dir = axis_bin_dir();
+        let wrapper = if cfg!(windows) {
+            bin_dir.join(format!("{subcmd}.cmd"))
+        } else {
+            bin_dir.join(subcmd)
+        };
 
         if wrapper.exists() {
-            let status = std::process::Command::new(&wrapper)
-                .args(&agent_args)
-                .env("AXIS_BIN", &axis_bin)
-                .status()
-                .ok()?;
+            let status = if cfg!(windows) {
+                std::process::Command::new("cmd")
+                    .args(["/C", &wrapper.to_string_lossy()])
+                    .args(&agent_args)
+                    .env("AXIS_BIN", &axis_bin)
+                    .status()
+                    .ok()?
+            } else {
+                std::process::Command::new(&wrapper)
+                    .args(&agent_args)
+                    .env("AXIS_BIN", &axis_bin)
+                    .status()
+                    .ok()?
+            };
             Some(status.code().unwrap_or(1))
         } else {
             eprintln!("Install succeeded but wrapper not found at {}", wrapper.display());
