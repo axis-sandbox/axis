@@ -118,15 +118,24 @@ jobs:
 
       - name: Test agent install (PowerShell)
         run: |
-          # Test that axis install --list works
+          # Test axis install --list
           .\target\release\axis.exe install --list
 
-          # Test install script syntax by running with -List
-          powershell -ExecutionPolicy Bypass -Command "& {
-            `$script = Get-Content e2e\agents\install_agents.ps1 -Raw
-            `$tempFile = [System.IO.Path]::GetTempFileName() + '.ps1'
-            Set-Content -Path `$tempFile -Value `$script
-            & `$tempFile -List
-            Remove-Item `$tempFile
-          }"
+          # Test install.ps1 syntax (parse check)
+          $null = [System.Management.Automation.PSParser]::Tokenize(
+            (Get-Content e2e\agents\install_agents.ps1 -Raw), [ref]$null
+          )
+          Write-Host "install_agents.ps1 syntax: OK"
+
+          # Test install.ps1 runs with -List
+          powershell -ExecutionPolicy Bypass -File e2e\agents\install_agents.ps1 -List
+
+          # Test install aider (python available on GH runners)
+          .\target\release\axis.exe install aider
+          if (Test-Path "$env:LOCALAPPDATA\axis\bin\aider.cmd") {
+            Write-Host "PASS: aider wrapper created"
+          } else {
+            Write-Host "FAIL: aider wrapper not found"
+            exit 1
+          }
         shell: pwsh

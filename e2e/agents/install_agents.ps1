@@ -47,22 +47,48 @@ function Install-ClaudeCode {
     $dir = "$ToolsDir\claude-code"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-    # Try official installer
-    try {
-        $installer = "$env:TEMP\claude-install.ps1"
-        Invoke-WebRequest -Uri "https://claude.ai/install.ps1" -OutFile $installer -UseBasicParsing
-        & powershell -File $installer
-        Remove-Item $installer -Force -ErrorAction SilentlyContinue
-    } catch {}
-
-    # Find the binary
+    # Check if already installed
     $bin = Get-Command claude -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
-    $localBin = "$env:LOCALAPPDATA\Programs\claude\claude.exe"
-    if (Test-Path $localBin) { return $localBin }
+    # Check common install locations
+    foreach ($candidate in @(
+        "$env:LOCALAPPDATA\Programs\claude\claude.exe",
+        "$env:LOCALAPPDATA\.claude\bin\claude.exe",
+        "$env:USERPROFILE\.local\bin\claude.exe",
+        "$env:USERPROFILE\.local\bin\claude",
+        "$env:USERPROFILE\.local\share\claude\claude.exe"
+    )) {
+        if ($candidate -and (Test-Path $candidate -ErrorAction SilentlyContinue)) {
+            return $candidate
+        }
+    }
 
-    return $null
+    # Try official installer
+    try {
+        Write-Host "  Downloading Claude Code installer..."
+        $installer = "$env:TEMP\claude-install.ps1"
+        Invoke-WebRequest -Uri "https://claude.ai/install.ps1" -OutFile $installer -UseBasicParsing
+        & powershell -ExecutionPolicy Bypass -File $installer
+        Remove-Item $installer -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "  Installer failed: $_" -ForegroundColor Yellow
+    }
+
+    # Check again after install
+    $bin = Get-Command claude -ErrorAction SilentlyContinue
+    if ($bin) { return $bin.Source }
+
+    foreach ($candidate in @(
+        "$env:LOCALAPPDATA\Programs\claude\claude.exe",
+        "$env:LOCALAPPDATA\.claude\bin\claude.exe"
+    )) {
+        if ($candidate -and (Test-Path $candidate -ErrorAction SilentlyContinue)) {
+            return $candidate
+        }
+    }
+
+    return ""
 }
 
 function Install-Codex {
@@ -79,7 +105,7 @@ function Install-Codex {
     $bin = Get-Command codex -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
-    return $null
+    return ""
 }
 
 function Install-OpenClaw {
@@ -96,7 +122,7 @@ function Install-OpenClaw {
     $bin = Get-Command openclaw -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
-    return $null
+    return ""
 }
 
 function Install-Ironclaw {
@@ -112,7 +138,7 @@ function Install-Ironclaw {
     $bin = Get-Command ironclaw -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
-    return $null
+    return ""
 }
 
 function Install-Aider {
@@ -135,7 +161,7 @@ function Install-Aider {
     $bin = Get-Command aider -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
-    return $null
+    return ""
 }
 
 function Install-Goose {
@@ -151,7 +177,7 @@ function Install-Goose {
     $bin = Get-Command goose -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
-    return $null
+    return ""
 }
 
 # ── Wrapper generator ────────────────────────────────────────────────────
@@ -258,9 +284,9 @@ foreach ($agent in $targetAgents) {
         continue
     }
 
-    $binaryPath = & $def.Install
+    $binaryPath = & $def.Install 2>&1 | Select-Object -Last 1
 
-    if ($binaryPath -and (Test-Path $binaryPath)) {
+    if ($binaryPath -and ("$binaryPath" -ne "") -and (Test-Path "$binaryPath" -ErrorAction SilentlyContinue)) {
         Write-Host "  Binary: $binaryPath" -ForegroundColor Green
 
         $policyFile = "$PoliciesDir\$($def.Policy)"

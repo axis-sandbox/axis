@@ -231,14 +231,16 @@ async fn main() -> Result<()> {
                 std::fs::write(&script_path, install_script)?;
 
                 let mut cmd = std::process::Command::new("powershell");
-                cmd.args(["-ExecutionPolicy", "Bypass", "-File"]);
-                cmd.arg(&script_path);
-                if list { cmd.args(["-List"]); }
-                else if all { cmd.args(["-All"]); }
+                cmd.args(["-ExecutionPolicy", "Bypass", "-Command"]);
+
+                // Build the PowerShell command string.
+                let mut ps_cmd = format!("& '{}'", script_path.display());
+                if list { ps_cmd.push_str(" -List"); }
+                else if all { ps_cmd.push_str(" -All"); }
                 else if !agents.is_empty() {
-                    cmd.arg("-Agents");
-                    cmd.arg(agents.join(","));
+                    ps_cmd.push_str(&format!(" -Agents @('{}')", agents.join("','")));
                 }
+                cmd.arg(&ps_cmd);
 
                 let status = cmd.status()?;
                 let _ = std::fs::remove_file(&script_path);
