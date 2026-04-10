@@ -27,6 +27,7 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
     sb.push_str("(allow sysctl-read)\n");
     sb.push_str("(allow mach*)\n");       // Mach IPC required for dyld, libsystem
     sb.push_str("(allow ipc-posix-shm*)\n");
+    sb.push_str("(allow file-ioctl)\n");   // TTY ioctls (setraw, tcsetattr) for TUI apps
     sb.push('\n');
 
     // ── Filesystem: read-only ──

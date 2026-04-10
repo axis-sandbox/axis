@@ -615,14 +615,25 @@ async fn main() -> Result<()> {
                             sandbox.pid.unwrap_or(0));
                     }
 
-                    // Wait for process or Ctrl+C.
-                    tokio::select! {
-                        code = sandbox.wait() => {
-                            let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
-                            std::process::exit(code);
-                        }
-                        _ = tokio::signal::ctrl_c() => {
-                            sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if quiet {
+                        // Interactive mode: just wait for the child to exit.
+                        // Don't install tokio signal handlers — they steal the
+                        // TTY from the child process and break TUI apps like
+                        // Claude Code (setRawMode fails).
+                        let code = sandbox.wait().await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        sandbox.destroy().ok();
+                        std::process::exit(code);
+                    } else {
+                        // Non-interactive: wait for process or Ctrl+C.
+                        tokio::select! {
+                            code = sandbox.wait() => {
+                                let code = code.map_err(|e| anyhow::anyhow!("{e}"))?;
+                                std::process::exit(code);
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
                         }
                     }
                 }
