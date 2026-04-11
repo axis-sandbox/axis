@@ -251,11 +251,19 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
     None
 }
 
-/// Default CLI args for each agent (matches wrapper scripts).
+/// Default CLI args for each agent when launched from the GUI.
+/// Uses non-interactive / streaming modes where available since
+/// the gateway captures stdout (no real TTY for TUI rendering).
 fn agent_default_args(name: &str) -> Vec<String> {
     match name {
         "claude-code" => vec![
             "--dangerously-skip-permissions".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "-p".to_string(),
+            "You are running inside the AXIS sandbox GUI. The user will interact with you through the AXIS interface. Say hello and ask what they'd like to work on.".to_string(),
         ],
         "codex" => vec![
             "--full-auto".to_string(),

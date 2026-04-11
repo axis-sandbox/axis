@@ -90,12 +90,12 @@ export function Terminal(props: TerminalProps) {
       if (msg.data instanceof ArrayBuffer) {
         const view = new Uint8Array(msg.data);
         if (view[0] === 0x00) {
-          // Data frame — write to terminal.
+          // Data frame — may be raw text or stream-json lines.
           const text = new TextDecoder().decode(view.slice(1));
-          term!.write(text);
+          renderOutput(term!, text);
         }
       } else if (typeof msg.data === "string") {
-        term!.write(msg.data);
+        renderOutput(term!, msg.data);
       }
     };
 
@@ -114,4 +114,51 @@ export function Terminal(props: TerminalProps) {
   return (
     <div class="terminal-container" ref={containerRef} />
   );
+}
+
+/** Render output to the terminal, handling both raw text and Claude stream-json. */
+function renderOutput(term: XTerm, text: string) {
+  // Try to parse each line as JSON (Claude stream-json format).
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    try {
+      const msg = JSON.parse(trimmed);
+      if (msg.type === "assistant" && msg.message?.content) {
+        // Claude assistant message — render the text content.
+        for (const block of msg.message.content) {
+          if (block.type === "text") {
+            term.write(block.text.replace(/\n/g, "\r\n"));
+            term.write("\r\n");
+          } else if (block.type === "tool_use") {
+            term.write(`\x1b[36m[Tool: ${block.name}]\x1b[0m\r\n`);
+          }
+        }
+      } else if (msg.type === "result") {
+        // Final result.
+        if (msg.result) {
+          term.write(msg.result.replace(/\n/g, "\r\n"));
+          term.write("\r\n");
+        }
+        term.write("\r\n\x1b[32m[Done]\x1b[0m\r\n");
+      } else if (msg.type === "content_block_delta" && msg.delta?.text) {
+        // Streaming text delta.
+        term.write(msg.delta.text);
+      } else if (msg.type === "error") {
+        term.write(`\x1b[31m[Error: ${msg.error?.message || JSON.stringify(msg)}]\x1b[0m\r\n`);
+      } else {
+        // Unknown JSON type — show raw.
+        term.write(trimmed + "\r\n");
+      }
+    } catch {
+      // Not JSON — render as raw text.
+      term.write(line);
+      if (!text.endsWith("\n")) {
+        // Don't add extra newlines for partial output.
+      } else {
+        term.write("\r\n");
+      }
+    }
+  }
 }
