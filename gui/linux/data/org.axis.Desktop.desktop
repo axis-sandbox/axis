@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=AXIS
+Comment=Agent eXecution Isolation Substrate
+Exec=axis-desktop
+Icon=org.axis.Desktop
+Terminal=false
+Type=Application
+Categories=Development;System;Security;
+Keywords=sandbox;agent;ai;security;
+StartupNotify=true

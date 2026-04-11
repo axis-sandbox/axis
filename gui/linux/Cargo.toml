@@ -1,0 +1,17 @@
+[package]
+name = "axis-desktop"
+version = "0.3.5"
+edition = "2024"
+license = "Apache-2.0"
+description = "AXIS Desktop — Linux native app with GTK4 and WebKitGTK"
+
+[[bin]]
+name = "axis-desktop"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_4"] }
+webkit6 = { version = "0.4", package = "webkit6" }
+gio = "0.20"
+glib = "0.20"
