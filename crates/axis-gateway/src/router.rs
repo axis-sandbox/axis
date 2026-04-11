@@ -18,6 +18,19 @@ pub async fn route(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
+    // Handle CORS preflight (OPTIONS) for all paths.
+    if method == hyper::Method::OPTIONS {
+        let response = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS")
+            .header("access-control-allow-headers", "content-type, authorization")
+            .header("access-control-max-age", "86400")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        return Ok(response);
+    }
+
     let response = match (method.as_str(), path.as_str()) {
         // Health check
         ("GET", "/api/v1/health") => {
@@ -57,13 +70,15 @@ pub async fn route(
     Ok(response)
 }
 
-/// Helper to create a JSON HTTP response.
+/// Helper to create a JSON HTTP response with CORS headers.
 pub fn json_response(status: StatusCode, body: serde_json::Value) -> Response<BoxBody> {
     let json = serde_json::to_string(&body).unwrap_or_default();
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS")
+        .header("access-control-allow-headers", "content-type, authorization")
         .body(Full::new(Bytes::from(json)))
         .unwrap()
 }
