@@ -39,10 +39,9 @@ $AgentDefs = @{
     "goose"        = @{ Binary = "goose";         Policy = "hermes.yaml";       Install = "Install-Goose" }
     "gemini-cli"   = @{ Binary = "gemini";        Policy = "gemini-cli.yaml";   Install = "Install-GeminiCli" }
     "opencode"     = @{ Binary = "opencode";      Policy = "opencode.yaml";     Install = "Install-OpenCode" }
-    "cursor-agent" = @{ Binary = "cursor-agent";  Policy = "cursor-agent.yaml"; Install = "Install-CursorAgent" }
 }
 
-$AllAgents = @("claude-code", "codex", "openclaw", "ironclaw", "aider", "goose", "gemini-cli", "opencode", "cursor-agent")
+$AllAgents = @("claude-code", "codex", "openclaw", "ironclaw", "aider", "goose", "gemini-cli", "opencode")
 
 # ── Install functions ────────────────────────────────────────────────────
 
@@ -239,35 +238,6 @@ function Install-OpenCode {
     }
 
     $bin = Get-Command opencode -ErrorAction SilentlyContinue
-    if ($bin) { return $bin.Source }
-
-    return ""
-}
-
-function Install-CursorAgent {
-    $dir = "$ToolsDir\cursor-agent"
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-
-    # Check if Cursor IDE is installed and has cursor-agent
-    foreach ($candidate in @(
-        "$env:LOCALAPPDATA\Programs\cursor\resources\app\bin\cursor-agent.exe",
-        "$env:LOCALAPPDATA\cursor\cursor-agent.exe",
-        "$env:LOCALAPPDATA\Programs\Cursor\cursor-agent.exe"
-    )) {
-        if ($candidate -and (Test-Path $candidate -ErrorAction SilentlyContinue)) {
-            return $candidate
-        }
-    }
-
-    # Install via npm (community SDK that downloads the official binary)
-    if (Get-Command npm -ErrorAction SilentlyContinue) {
-        Write-Host "  Installing via npm..."
-        & npm install --prefix $dir @nothumanwork/cursor-agents-sdk@latest 2>&1 | Out-Null
-        $bin = "$dir\node_modules\.bin\cursor-agent.cmd"
-        if (Test-Path $bin) { return $bin }
-    }
-
-    $bin = Get-Command cursor-agent -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
     return ""

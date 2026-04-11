@@ -329,7 +329,6 @@ async fn main() -> Result<()> {
                 ("hermes.yaml", include_str!("../../../policies/agents/hermes.yaml")),
                 ("gemini-cli.yaml", include_str!("../../../policies/agents/gemini-cli.yaml")),
                 ("opencode.yaml", include_str!("../../../policies/agents/opencode.yaml")),
-                ("cursor-agent.yaml", include_str!("../../../policies/agents/cursor-agent.yaml")),
             ] {
                 let _ = std::fs::write(pol_dir.join(name), content);
             }
