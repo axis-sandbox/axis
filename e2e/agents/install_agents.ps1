@@ -129,11 +129,13 @@ function Install-Ironclaw {
     $dir = "$ToolsDir\ironclaw"
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-    try {
-        $url = "https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-x86_64-windows.exe"
-        Invoke-WebRequest -Uri $url -OutFile "$dir\ironclaw.exe" -UseBasicParsing
-        return "$dir\ironclaw.exe"
-    } catch {}
+    # ironclaw is distributed via npm; --ignore-scripts avoids native opus build
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        Write-Host "  Installing via npm..."
+        & npm install --prefix $dir ironclaw@latest --ignore-scripts 2>&1 | Out-Null
+        $bin = "$dir\node_modules\.bin\ironclaw.cmd"
+        if (Test-Path $bin) { return $bin }
+    }
 
     $bin = Get-Command ironclaw -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
@@ -152,10 +154,19 @@ function Install-Aider {
     if ($pythonCmd) {
         Write-Host "  Creating venv..."
         & $pythonCmd -m venv "$dir\venv" 2>&1 | Out-Null
+        # Upgrade pip and install setuptools first — required for building native deps
+        Write-Host "  Upgrading pip and installing build deps..."
+        & "$dir\venv\Scripts\python.exe" -m pip install --upgrade pip setuptools wheel 2>&1 | Out-Null
         Write-Host "  Installing aider-chat..."
-        & "$dir\venv\Scripts\pip.exe" install -q aider-chat 2>&1 | Out-Null
+        & "$dir\venv\Scripts\pip.exe" install aider-chat 2>&1 | Out-Null
         $bin = "$dir\venv\Scripts\aider.exe"
         if (Test-Path $bin) { return $bin }
+    }
+
+    # Try pipx as fallback
+    if (Get-Command pipx -ErrorAction SilentlyContinue) {
+        Write-Host "  Trying pipx..."
+        & pipx install aider-chat 2>&1 | Out-Null
     }
 
     $bin = Get-Command aider -ErrorAction SilentlyContinue
@@ -169,10 +180,20 @@ function Install-Goose {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
     try {
-        $url = "https://github.com/block/goose/releases/download/stable/goose-x86_64-windows.exe"
-        Invoke-WebRequest -Uri $url -OutFile "$dir\goose.exe" -UseBasicParsing
-        return "$dir\goose.exe"
-    } catch {}
+        # Goose distributes a zip on Windows, not a standalone exe
+        $zipUrl = "https://github.com/block/goose/releases/latest/download/goose-x86_64-pc-windows-msvc.zip"
+        $zipPath = "$dir\goose.zip"
+        Write-Host "  Downloading goose..."
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+        Write-Host "  Extracting..."
+        Expand-Archive -Path $zipPath -DestinationPath $dir -Force
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        # The zip contains goose.exe at the top level or in a subdirectory
+        $bin = Get-ChildItem -Path $dir -Filter "goose.exe" -Recurse | Select-Object -First 1
+        if ($bin) { return $bin.FullName }
+    } catch {
+        Write-Host "  Download failed: $_" -ForegroundColor Yellow
+    }
 
     $bin = Get-Command goose -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
