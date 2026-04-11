@@ -31,34 +31,49 @@ pub async fn route(
         return Ok(response);
     }
 
-    let response = match (method.as_str(), path.as_str()) {
-        // Health check
-        ("GET", "/api/v1/health") => {
+    // Parse path segments for dynamic routing.
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    let response = match (method.as_str(), segments.as_slice()) {
+        // GET /api/v1/health
+        ("GET", ["api", "v1", "health"]) => {
             json_response(StatusCode::OK, serde_json::json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
             }))
         }
 
-        // Sandbox management
-        ("GET", "/api/v1/sandboxes") => {
+        // GET /api/v1/sandboxes
+        ("GET", ["api", "v1", "sandboxes"]) => {
             super::handlers::list_sandboxes(state).await
         }
-        ("POST", "/api/v1/sandboxes") => {
+
+        // POST /api/v1/sandboxes
+        ("POST", ["api", "v1", "sandboxes"]) => {
             super::handlers::create_sandbox(req, state).await
         }
 
-        // Agent management
-        ("GET", "/api/v1/agents") => {
+        // DELETE /api/v1/sandboxes/:id
+        ("DELETE", ["api", "v1", "sandboxes", id]) => {
+            super::handlers::destroy_sandbox(id, state).await
+        }
+
+        // GET /api/v1/agents
+        ("GET", ["api", "v1", "agents"]) => {
             super::handlers::list_agents(state).await
         }
 
-        // WebSocket upgrade for event streaming
-        ("GET", "/ws/v1/events") => {
+        // POST /api/v1/agents/:name/run
+        ("POST", ["api", "v1", "agents", name, "run"]) => {
+            super::handlers::run_agent(name, state).await
+        }
+
+        // WebSocket: GET /ws/v1/events
+        ("GET", ["ws", "v1", "events"]) => {
             return super::events::handle_ws_upgrade(req, state).await;
         }
 
-        // 404 for everything else
+        // 404
         _ => {
             json_response(StatusCode::NOT_FOUND, serde_json::json!({
                 "error": "not found",
