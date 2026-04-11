@@ -43,7 +43,7 @@ impl Drop for UnixPtyMaster {
 
 /// Create a PTY pair on Unix using openpty(2).
 pub fn create_pty_unix(size: WinSize) -> Result<PtySession, PtyError> {
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_col: size.cols,
         ws_row: size.rows,
         ws_xpixel: 0,
@@ -59,7 +59,7 @@ pub fn create_pty_unix(size: WinSize) -> Result<PtySession, PtyError> {
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &ws,
+            &mut ws,
         )
     };
 
