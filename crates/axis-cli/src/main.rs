@@ -743,6 +743,23 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    // Auto-discover runtime directories (Node.js, Python) and
+                    // append them to PATH so npm-installed agents and Python
+                    // venvs work without users needing to configure PATH.
+                    if cfg!(windows) {
+                        let extra_dirs = discover_runtime_dirs();
+                        if !extra_dirs.is_empty() {
+                            if let Some(path_entry) = env.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PATH")) {
+                                for dir in &extra_dirs {
+                                    if !path_entry.1.to_lowercase().contains(&dir.to_lowercase()) {
+                                        path_entry.1.push(';');
+                                        path_entry.1.push_str(dir);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let config = axis_sandbox::SandboxConfig {
                         id: sandbox_id,
                         policy,
@@ -1027,4 +1044,61 @@ async fn send_ipc(
         reader.read_line(&mut response).await?;
         Ok(serde_json::from_str(&response)?)
     }
+}
+
+/// Discover common runtime directories (Node.js, Python) that may not be
+/// in PATH. Returns directories that exist and contain expected binaries.
+/// This lets npm-installed agents and Python venvs work out-of-the-box
+/// without users needing to configure PATH manually.
+#[cfg(windows)]
+fn discover_runtime_dirs() -> Vec<String> {
+    let mut dirs = Vec::new();
+
+    // Node.js — standard MSI install location
+    let node_dir = r"C:\Program Files\nodejs";
+    if std::path::Path::new(node_dir).join("node.exe").exists() {
+        dirs.push(node_dir.to_string());
+    }
+
+    // Node.js — nvm-windows
+    if let Ok(nvm_home) = std::env::var("NVM_HOME") {
+        if let Ok(nvm_symlink) = std::env::var("NVM_SYMLINK") {
+            if std::path::Path::new(&nvm_symlink).join("node.exe").exists() {
+                dirs.push(nvm_symlink);
+            }
+        } else if std::path::Path::new(&nvm_home).join("node.exe").exists() {
+            dirs.push(nvm_home);
+        }
+    }
+
+    // Node.js — Volta
+    if let Ok(home) = std::env::var("LOCALAPPDATA") {
+        let volta_bin = format!(r"{home}\Volta\bin");
+        if std::path::Path::new(&volta_bin).join("node.exe").exists() {
+            dirs.push(volta_bin);
+        }
+    }
+
+    // Python — Windows Store / standard install
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let ms_store = format!(r"{local}\Microsoft\WindowsApps");
+        if std::path::Path::new(&ms_store).join("python.exe").exists()
+            || std::path::Path::new(&ms_store).join("python3.exe").exists()
+        {
+            dirs.push(ms_store);
+        }
+    }
+
+    // Git for Windows (often needed for git operations inside agents)
+    let git_dir = r"C:\Program Files\Git\bin";
+    if std::path::Path::new(git_dir).join("git.exe").exists() {
+        dirs.push(git_dir.to_string());
+    }
+
+    dirs
+}
+
+#[cfg(not(windows))]
+fn discover_runtime_dirs() -> Vec<String> {
+    Vec::new()
 }
