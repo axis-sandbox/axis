@@ -41,6 +41,8 @@ struct ManagedSandbox {
     policy_name: String,
     /// Broadcast channel for streaming sandbox stdout to WebSocket clients.
     output_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    /// Buffered output for replay to late-connecting WebSocket clients.
+    output_buffer: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     /// Channel for writing input to the sandbox's stdin.
     input_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
@@ -201,6 +203,10 @@ impl SandboxManager {
         // Spawn background task to read output and broadcast to WebSocket clients.
         // Prefer ConPTY read handle (real terminal output with ANSI) over piped stdout.
         let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+        let output_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        tracing::info!("sandbox {id}: stdout={}, stderr={}, stdin={}, pty_read={}",
+            sandbox.stdout.is_some(), sandbox.stderr.is_some(),
+            sandbox.stdin.is_some(), sandbox.pty_read.is_some());
         if let Some(pty_read) = sandbox.pty_read.take() {
             // ConPTY pipe: use a blocking thread since Windows pipe handles
             // can't be used with tokio's async file I/O.
@@ -221,14 +227,24 @@ impl SandboxManager {
             // Fallback: piped stdout/stderr (non-TTY).
             if let Some(stdout) = sandbox.stdout.take() {
                 let tx = output_tx.clone();
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut stdout = tokio::process::ChildStdout::from_std(stdout).unwrap();
+                let buf_clone = output_buffer.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let mut stdout = stdout;
                     let mut buf = [0u8; 4096];
                     loop {
-                        match stdout.read(&mut buf).await {
+                        match stdout.read(&mut buf) {
                             Ok(0) => break,
-                            Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
+                            Ok(n) => {
+                                let data = buf[..n].to_vec();
+                                // Buffer for late-connecting clients.
+                                if let Ok(mut b) = buf_clone.lock() {
+                                    b.push(data.clone());
+                                    // Cap buffer at 1000 chunks (~4MB).
+                                    if b.len() > 1000 { b.drain(..500); }
+                                }
+                                let _ = tx.send(data);
+                            }
                             Err(_) => break,
                         }
                     }
@@ -236,14 +252,22 @@ impl SandboxManager {
             }
             if let Some(stderr) = sandbox.stderr.take() {
                 let tx = output_tx.clone();
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
+                let buf_clone = output_buffer.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let mut stderr = stderr;
                     let mut buf = [0u8; 4096];
                     loop {
-                        match stderr.read(&mut buf).await {
+                        match stderr.read(&mut buf) {
                             Ok(0) => break,
-                            Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
+                            Ok(n) => {
+                                let data = buf[..n].to_vec();
+                                if let Ok(mut b) = buf_clone.lock() {
+                                    b.push(data.clone());
+                                    if b.len() > 1000 { b.drain(..500); }
+                                }
+                                let _ = tx.send(data);
+                            }
                             Err(_) => break,
                         }
                     }
@@ -271,6 +295,7 @@ impl SandboxManager {
             gpu_enabled,
             policy_name: policy_name.clone(),
             output_tx: Some(output_tx),
+            output_buffer,
             input_tx: Some(input_tx),
         });
 
@@ -431,11 +456,14 @@ impl SandboxManager {
     }
 
     /// Subscribe to a sandbox's stdout/stderr output stream.
-    pub fn subscribe_output(&self, id: &SandboxId) -> Option<tokio::sync::broadcast::Receiver<Vec<u8>>> {
-        self.sandboxes
-            .get(id)
-            .and_then(|m| m.output_tx.as_ref())
-            .map(|tx| tx.subscribe())
+    /// Returns (buffered_output, live_receiver) — caller should send the buffer first,
+    /// then stream from the receiver for new data.
+    pub fn subscribe_output(&self, id: &SandboxId) -> Option<(Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
+        self.sandboxes.get(id).and_then(|m| {
+            let rx = m.output_tx.as_ref()?.subscribe();
+            let buffer = m.output_buffer.lock().ok()?.clone();
+            Some((buffer, rx))
+        })
     }
 }
 
@@ -456,6 +484,17 @@ fn collect_sandbox_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
     for (key, val) in std::env::vars() {
         let key_cmp = if cfg!(windows) { key.to_uppercase() } else { key.clone() };
+        // Skip vars that bind to the host Claude Desktop session.
+        // The sandbox runs its own Claude instance with direct API auth.
+        if matches!(key_cmp.as_str(),
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
+            | "CLAUDE_CODE_ENTRYPOINT"
+            | "CLAUDECODE"
+            | "CLAUDE_AGENT_SDK_VERSION"
+        ) {
+            continue;
+        }
+
         if key_cmp.starts_with("ANTHROPIC_")
             || key_cmp.starts_with("OPENAI_")
             || key_cmp.starts_with("CLAUDE_")
@@ -473,6 +512,18 @@ fn collect_sandbox_env() -> Vec<(String, String)> {
             env.push((key, val));
         }
     }
+    // If ANTHROPIC_API_KEY is empty but we have an OAuth token, use it.
+    let has_api_key = env.iter().any(|(k, v)| k.eq_ignore_ascii_case("ANTHROPIC_API_KEY") && !v.is_empty());
+    if !has_api_key {
+        if let Some(token) = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("CLAUDE_CODE_OAUTH_TOKEN")).map(|(_, v)| v.clone()) {
+            if !token.is_empty() {
+                // Remove empty ANTHROPIC_API_KEY and set it to the OAuth token.
+                env.retain(|(k, _)| !k.eq_ignore_ascii_case("ANTHROPIC_API_KEY"));
+                env.push(("ANTHROPIC_API_KEY".to_string(), token));
+            }
+        }
+    }
+
     env
 }
 
@@ -558,6 +609,8 @@ impl SandboxBackend for SandboxManagerBackend {
         let policy_yaml = policy_yaml.to_string();
         // Collect essential env vars for the sandbox (same logic as axis-cli).
         let env = collect_sandbox_env();
+        let claude_vars: Vec<_> = env.iter().filter(|(k,_)| k.to_uppercase().contains("CLAUDE") || k.to_uppercase().contains("ANTHROPIC")).map(|(k,v)| format!("{}={}...", k, &v[..v.len().min(20)])).collect();
+        tracing::info!("gateway create_sandbox: {} env vars, auth: {:?}", env.len(), claude_vars);
         Box::pin(async move {
             let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)
                 .map_err(|e| format!("invalid policy: {e}"))?;
@@ -606,7 +659,7 @@ impl SandboxBackend for SandboxManagerBackend {
     fn subscribe_output(
         &self,
         id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<tokio::sync::broadcast::Receiver<Vec<u8>>>> + Send + '_>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>)>> + Send + '_>>
     {
         let id = id.to_string();
         Box::pin(async move {

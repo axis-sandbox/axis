@@ -200,13 +200,17 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
             if path.exists() {
                 // Resolve symlinks to get the real binary.
                 if let Ok(resolved) = std::fs::canonicalize(path) {
-                    let resolved_str = resolved.to_string_lossy().to_string();
+                    let mut resolved_str = resolved.to_string_lossy().to_string();
+                    // Strip \\?\ prefix that canonicalize adds on Windows —
+                    // CreateProcess doesn't accept extended-length paths.
+                    if resolved_str.starts_with(r"\\?\") {
+                        resolved_str = resolved_str[4..].to_string();
+                    }
                     // Skip if it points back to our own wrappers.
                     if !resolved_str.contains(&axis_bin_dir.to_string_lossy().to_string()) {
                         return Some(resolved_str);
                     }
                 }
-                // If canonicalize fails, use the original path.
                 return Some(candidate.clone());
             }
         }
@@ -222,9 +226,10 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
                 if !line.is_empty()
                     && !line.contains(&axis_bin_dir.to_string_lossy().to_string())
                 {
-                    // Resolve symlinks.
                     if let Ok(resolved) = std::fs::canonicalize(line) {
-                        return Some(resolved.to_string_lossy().to_string());
+                        let mut s = resolved.to_string_lossy().to_string();
+                        if s.starts_with(r"\\?\") { s = s[4..].to_string(); }
+                        return Some(s);
                     }
                     return Some(line.to_string());
                 }
@@ -261,10 +266,8 @@ fn agent_default_args(name: &str) -> Vec<String> {
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
-            "--input-format".to_string(),
-            "stream-json".to_string(),
             "-p".to_string(),
-            "".to_string(), // Empty prompt — waits for input via stream-json stdin.
+            "Hello! You are running inside AXIS sandbox. Introduce yourself and list what you can help with.".to_string(),
         ],
         "codex" => vec![
             "--full-auto".to_string(),

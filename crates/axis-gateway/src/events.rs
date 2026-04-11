@@ -102,8 +102,8 @@ pub async fn handle_pty_upgrade(
         }
     };
 
-    // Get output subscription before upgrading.
-    let output_rx = if let Some(ref backend) = state.sandbox_backend {
+    // Get buffered output + live subscription before upgrading.
+    let output_sub = if let Some(ref backend) = state.sandbox_backend {
         backend.subscribe_output(sandbox_id).await
     } else {
         None
@@ -123,8 +123,20 @@ pub async fn handle_pty_upgrade(
         ).await;
         let (mut ws_tx, mut ws_rx) = ws.split();
 
-        if let Some(mut output_rx) = output_rx {
-            tracing::info!("pty ws connected for sandbox {sandbox_id}");
+        if let Some((buffer, mut output_rx)) = output_sub {
+            tracing::info!("pty ws connected for sandbox {sandbox_id}, replaying {} buffered chunks", buffer.len());
+
+            // Replay buffered output first.
+            for chunk in &buffer {
+                let mut frame = Vec::with_capacity(1 + chunk.len());
+                frame.push(0x00);
+                frame.extend_from_slice(chunk);
+                if ws_tx.send(Message::Binary(frame)).await.is_err() {
+                    return;
+                }
+            }
+
+            // Then stream live.
             loop {
                 tokio::select! {
                     data = output_rx.recv() => {

@@ -56,10 +56,11 @@ pub trait SandboxBackend: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + '_>>;
 
     /// Subscribe to a sandbox's stdout/stderr output stream.
+    /// Returns (buffered_past_output, live_receiver).
     fn subscribe_output(
         &self,
         id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<tokio::sync::broadcast::Receiver<Vec<u8>>>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>)>> + Send + '_>>;
 
     /// Send input data to a sandbox's stdin.
     fn send_input(

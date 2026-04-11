@@ -80,15 +80,22 @@ impl SandboxImpl for WindowsSandbox {
         for (k, v) in &self.config.env {
             cmd.env(k, v);
         }
-        cmd.env("HTTP_PROXY", &proxy_url);
-        cmd.env("HTTPS_PROXY", &proxy_url);
+        // TODO: Re-enable proxy once TLS tunnel issues are resolved.
+        // The AXIS proxy's CONNECT tunnel drops TLS connections on Windows,
+        // causing Claude API calls to time out.
+        // if self.config.proxy_port > 0 {
+        //     cmd.env("HTTP_PROXY", &proxy_url);
+        //     cmd.env("HTTPS_PROXY", &proxy_url);
+        // }
 
         // Capture stdout/stderr for daemon/gateway streaming.
         // NOTE: ConPTY requires CreateProcess with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
         // which std::process::Command doesn't support. Use piped stdout for now —
         // agents should be launched in non-interactive mode (e.g., claude -p ...).
         if self.config.capture_output {
-            cmd.stdin(std::process::Stdio::piped());
+            // Use null stdin — piped stdin causes some Node.js agents (Claude Code)
+            // to exit immediately. Input is sent via stream-json on stdin when needed.
+            cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
         }
