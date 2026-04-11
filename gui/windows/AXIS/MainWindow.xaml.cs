@@ -8,7 +8,7 @@ namespace AXIS;
 
 public partial class MainWindow : Window
 {
-    private const string GATEWAY_URL = "http://127.0.0.1:18519";
+    private const string GATEWAY_URL = "http://127.0.0.1:18520";
 
     public MainWindow()
     {

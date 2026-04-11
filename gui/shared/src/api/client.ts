@@ -1,7 +1,7 @@
 // REST + WebSocket client for the AXIS gateway.
 
 const GATEWAY_BASE =
-  (window as any).AXIS_CONFIG?.gateway_url ?? "http://127.0.0.1:18519";
+  (window as any).AXIS_CONFIG?.gateway_url ?? "http://127.0.0.1:18520";
 const WS_BASE = GATEWAY_BASE.replace(/^http/, "ws");
 
 // ── REST API ────────────────────────────────────────────────────────────

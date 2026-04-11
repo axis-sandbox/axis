@@ -523,14 +523,9 @@ fn collect_sandbox_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
     for (key, val) in std::env::vars() {
         let key_cmp = if cfg!(windows) { key.to_uppercase() } else { key.clone() };
-        // Skip vars that bind to the host Claude Desktop session.
-        // The sandbox runs its own Claude instance with direct API auth.
-        if matches!(key_cmp.as_str(),
-            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
-            | "CLAUDE_CODE_ENTRYPOINT"
-            | "CLAUDECODE"
-            | "CLAUDE_AGENT_SDK_VERSION"
-        ) {
+        // Skip internal session tracking vars but keep all auth vars
+        // (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_ENTRYPOINT, etc.)
+        if matches!(key_cmp.as_str(), "CLAUDECODE" | "CLAUDE_AGENT_SDK_VERSION") {
             continue;
         }
 
@@ -551,17 +546,8 @@ fn collect_sandbox_env() -> Vec<(String, String)> {
             env.push((key, val));
         }
     }
-    // If ANTHROPIC_API_KEY is empty but we have an OAuth token, use it.
-    let has_api_key = env.iter().any(|(k, v)| k.eq_ignore_ascii_case("ANTHROPIC_API_KEY") && !v.is_empty());
-    if !has_api_key {
-        if let Some(token) = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("CLAUDE_CODE_OAUTH_TOKEN")).map(|(_, v)| v.clone()) {
-            if !token.is_empty() {
-                // Remove empty ANTHROPIC_API_KEY and set it to the OAuth token.
-                env.retain(|(k, _)| !k.eq_ignore_ascii_case("ANTHROPIC_API_KEY"));
-                env.push(("ANTHROPIC_API_KEY".to_string(), token));
-            }
-        }
-    }
+    // Remove empty ANTHROPIC_API_KEY — it overrides valid OAuth auth.
+    env.retain(|(k, v)| !(k.eq_ignore_ascii_case("ANTHROPIC_API_KEY") && v.is_empty()));
 
     env
 }
