@@ -118,16 +118,40 @@ install_claude_code() {
     local sys_bin
     sys_bin=$(try_system_binary "claude") && { echo "$sys_bin"; return 0; }
 
-    local dir="$TOOLS_DIR/claude-code"
-    mkdir -p "$dir"
+    # Check common install locations (skip broken symlinks).
+    for candidate in \
+        "$HOME/.local/bin/claude" \
+        "$HOME/.local/share/claude/claude" \
+        "/usr/local/bin/claude"; do
+        if [ -x "$candidate" ]; then
+            echo "  Found at $candidate" >&2
+            echo "$candidate"
+            return 0
+        elif [ -L "$candidate" ]; then
+            echo "  Removing broken symlink at $candidate" >&2
+            rm -f "$candidate"
+        fi
+    done
+
+    # Try the official installer.
     if [ "$OS" = "darwin" ] || [ "$OS" = "linux" ]; then
-        curl -fsSL https://claude.ai/install.sh | CLAUDE_INSTALL_DIR="$dir" bash 2>&1 || true
+        echo "  Running Claude Code installer..." >&2
+        curl -fsSL https://claude.ai/install.sh | bash 2>&1 || true
     fi
-    local bin=$(find "$dir" -name "claude" -type f 2>/dev/null | head -1)
-    if [ -z "$bin" ] && command -v claude >/dev/null 2>&1; then
-        bin="$(which claude)"
-    fi
-    echo "$bin"
+
+    # Check again after install.
+    for candidate in \
+        "$HOME/.local/bin/claude" \
+        "$HOME/.local/share/claude/claude" \
+        "/usr/local/bin/claude"; do
+        if [ -x "$candidate" ] || [ -L "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    command -v claude >/dev/null 2>&1 && { which claude; return 0; }
+    echo ""
 }
 
 install_codex() {
@@ -380,9 +404,14 @@ for agent in $AGENTS; do
         continue
     fi
 
-    binary_path=$($install_fn 2>&1 | tail -1)
+    binary_path=$($install_fn | tail -1)
 
-    if [ -n "$binary_path" ] && [ -x "$binary_path" ] 2>/dev/null; then
+    # Check binary exists and is executable (resolve symlinks).
+    resolved=""
+    if [ -n "$binary_path" ]; then
+        resolved=$(readlink -f "$binary_path" 2>/dev/null || echo "$binary_path")
+    fi
+    if [ -n "$resolved" ] && [ -x "$resolved" ]; then
         echo "  Binary: $binary_path"
 
         policy_file="${POLICY_DIR}/$(agent_policy "$agent")"
