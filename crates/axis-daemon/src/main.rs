@@ -81,10 +81,17 @@ async fn main() -> Result<()> {
     });
 
     // Run IPC server with graceful shutdown on SIGTERM/SIGINT.
+    // If IPC bind fails (port taken), keep running for the gateway.
     tokio::select! {
         result = ipc::serve(&socket_path, &mut mgr) => {
-            if let Err(e) = result {
-                tracing::error!("IPC server error: {e}");
+            match result {
+                Err(e) => {
+                    tracing::warn!("IPC server unavailable: {e}");
+                    tracing::info!("gateway still running on :18519 — waiting for shutdown signal");
+                    shutdown_signal().await;
+                    tracing::info!("shutdown signal received");
+                }
+                Ok(()) => {}
             }
         }
         _ = shutdown_signal() => {
