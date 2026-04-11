@@ -261,8 +261,10 @@ fn agent_default_args(name: &str) -> Vec<String> {
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
             "-p".to_string(),
-            "You are running inside the AXIS sandbox GUI. Say hello and ask what the user would like to work on.".to_string(),
+            "".to_string(), // Empty prompt — waits for input via stream-json stdin.
         ],
         "codex" => vec![
             "--full-auto".to_string(),

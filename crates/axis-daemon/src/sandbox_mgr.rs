@@ -41,6 +41,8 @@ struct ManagedSandbox {
     policy_name: String,
     /// Broadcast channel for streaming sandbox stdout to WebSocket clients.
     output_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    /// Channel for writing input to the sandbox's stdin.
+    input_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 pub struct SandboxManager {
@@ -249,6 +251,19 @@ impl SandboxManager {
             }
         }
 
+        // Set up stdin writer — spawn task that reads from channel and writes to child stdin.
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        if let Some(stdin) = sandbox.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = tokio::process::ChildStdin::from_std(stdin).unwrap();
+                while let Some(data) = input_rx.recv().await {
+                    if stdin.write_all(&data).await.is_err() { break; }
+                    if stdin.flush().await.is_err() { break; }
+                }
+            });
+        }
+
         self.sandboxes.insert(id, ManagedSandbox {
             sandbox,
             proxy_addr,
@@ -256,6 +271,7 @@ impl SandboxManager {
             gpu_enabled,
             policy_name: policy_name.clone(),
             output_tx: Some(output_tx),
+            input_tx: Some(input_tx),
         });
 
         Ok(id)
@@ -407,6 +423,11 @@ impl SandboxManager {
                 }
             })
             .collect()
+    }
+
+    /// Get a sender for writing to a sandbox's stdin.
+    pub fn get_input_sender(&self, id: &SandboxId) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        self.sandboxes.get(id).and_then(|m| m.input_tx.clone())
     }
 
     /// Subscribe to a sandbox's stdout/stderr output stream.
@@ -592,6 +613,23 @@ impl SandboxBackend for SandboxManagerBackend {
             let sandbox_id: axis_core::types::SandboxId = id.parse().ok()?;
             let mgr = self.mgr.lock().await;
             mgr.subscribe_output(&sandbox_id)
+        })
+    }
+
+    fn send_input(
+        &self,
+        id: &str,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>
+    {
+        let id = id.to_string();
+        Box::pin(async move {
+            let sandbox_id: axis_core::types::SandboxId = id.parse()
+                .map_err(|_| format!("invalid sandbox id: {id}"))?;
+            let mgr = self.mgr.lock().await;
+            let tx = mgr.get_input_sender(&sandbox_id)
+                .ok_or_else(|| "sandbox not found or stdin not available".to_string())?;
+            tx.send(data).await.map_err(|e| format!("stdin send: {e}"))
         })
     }
 }

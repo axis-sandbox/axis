@@ -60,6 +60,13 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<tokio::sync::broadcast::Receiver<Vec<u8>>>> + Send + '_>>;
+
+    /// Send input data to a sandbox's stdin.
+    fn send_input(
+        &self,
+        id: &str,
+        data: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 /// Shared gateway state passed to all handlers.

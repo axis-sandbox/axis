@@ -110,6 +110,7 @@ pub async fn handle_pty_upgrade(
     };
 
     let sandbox_id = sandbox_id.to_string();
+    let state2 = state.clone();
 
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(&mut req).await {
@@ -149,6 +150,12 @@ pub async fn handle_pty_upgrade(
                         match msg {
                             Some(Ok(Message::Close(_))) | None => break,
                             Some(Ok(Message::Ping(d))) => { let _ = ws_tx.send(Message::Pong(d)).await; }
+                            Some(Ok(Message::Binary(data))) if !data.is_empty() && data[0] == 0x00 => {
+                                // Input frame: forward to sandbox stdin.
+                                if let Some(ref backend) = state2.sandbox_backend {
+                                    let _ = backend.send_input(&sandbox_id, data[1..].to_vec()).await;
+                                }
+                            }
                             _ => {}
                         }
                     }

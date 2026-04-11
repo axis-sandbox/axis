@@ -88,6 +88,7 @@ impl SandboxImpl for WindowsSandbox {
         // which std::process::Command doesn't support. Use piped stdout for now —
         // agents should be launched in non-interactive mode (e.g., claude -p ...).
         if self.config.capture_output {
+            cmd.stdin(std::process::Stdio::piped());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
         }
@@ -107,6 +108,10 @@ impl SandboxImpl for WindowsSandbox {
 
         tracing::info!("sandbox {sandbox_id} started on Windows, pid={pid}");
         Ok(pid)
+    }
+
+    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut().and_then(|c| c.stdin.take())
     }
 
     fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {

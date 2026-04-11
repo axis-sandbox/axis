@@ -103,9 +103,37 @@ export function Terminal(props: TerminalProps) {
       term!.write("\r\n\r\n  [Connection closed]\r\n");
     };
 
-    // Forward keystrokes to PTY.
+    // Input handling: collect keystrokes into a line buffer.
+    // On Enter, send as stream-json user message to Claude's stdin.
+    let inputBuffer = "";
+    term.write("\r\n\x1b[33m> \x1b[0m"); // Show prompt
+
     const disposable = term.onData((data) => {
-      ptyConn?.send(data);
+      if (data === "\r" || data === "\n") {
+        // Enter pressed — send the message.
+        term!.write("\r\n");
+        if (inputBuffer.trim()) {
+          // Send as Claude stream-json format.
+          const msg = JSON.stringify({
+            type: "user",
+            message: { role: "user", content: inputBuffer.trim() },
+          }) + "\n";
+          ptyConn?.send(msg);
+          term!.write(`\x1b[2m(sent)\x1b[0m\r\n`);
+        }
+        inputBuffer = "";
+        term!.write("\x1b[33m> \x1b[0m");
+      } else if (data === "\x7f" || data === "\b") {
+        // Backspace
+        if (inputBuffer.length > 0) {
+          inputBuffer = inputBuffer.slice(0, -1);
+          term!.write("\b \b");
+        }
+      } else if (data >= " ") {
+        // Regular character
+        inputBuffer += data;
+        term!.write(data);
+      }
     });
 
     onCleanup(() => disposable.dispose());
