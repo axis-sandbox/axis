@@ -58,6 +58,10 @@ pub struct Sandbox {
     inner: Box<dyn SandboxImpl>,
     /// Symlinks created for agent state containment (cleaned up on destroy).
     agent_symlinks: Vec<(PathBuf, PathBuf)>,
+    /// Captured stdout from the child process (when capture_output=true).
+    pub stdout: Option<std::process::ChildStdout>,
+    /// Captured stderr from the child process (when capture_output=true).
+    pub stderr: Option<std::process::ChildStderr>,
 }
 
 impl Sandbox {
@@ -106,6 +110,8 @@ impl Sandbox {
             workspace_dir: config.workspace_dir,
             inner,
             agent_symlinks,
+            stdout: None,
+            stderr: None,
         })
     }
 
@@ -113,6 +119,9 @@ impl Sandbox {
     pub fn start(&mut self) -> Result<(), SandboxError> {
         let pid = self.inner.start()?;
         self.pid = Some(pid);
+        // Take captured stdio handles from the platform impl.
+        self.stdout = self.inner.take_stdout();
+        self.stderr = self.inner.take_stderr();
         self.status = SandboxStatus::Running;
         Ok(())
     }
@@ -141,6 +150,12 @@ pub(crate) trait SandboxImpl: Send {
 
     /// Wait for the process to exit.
     fn wait(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>;
+
+    /// Take captured stdout handle (if capture_output was enabled).
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> { None }
+
+    /// Take captured stderr handle (if capture_output was enabled).
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> { None }
 
     /// Kill the process and clean up isolation resources.
     fn destroy(&mut self) -> Result<(), SandboxError>;

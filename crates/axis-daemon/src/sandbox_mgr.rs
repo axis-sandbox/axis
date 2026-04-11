@@ -38,6 +38,9 @@ struct ManagedSandbox {
     proxy_addr: SocketAddr,
     proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     gpu_enabled: bool,
+    policy_name: String,
+    /// Broadcast channel for streaming sandbox stdout to WebSocket clients.
+    output_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 }
 
 pub struct SandboxManager {
@@ -193,11 +196,46 @@ impl SandboxManager {
         );
         self.audit.sandbox_created(id, &policy_name);
 
+        // Spawn background task to read stdout and broadcast to WebSocket clients.
+        let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+        if let Some(stdout) = sandbox.stdout.take() {
+            let tx = output_tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut stdout = tokio::process::ChildStdout::from_std(stdout).unwrap();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = sandbox.stderr.take() {
+            let tx = output_tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
         self.sandboxes.insert(id, ManagedSandbox {
             sandbox,
             proxy_addr,
             proxy_shutdown: Some(shutdown_tx),
             gpu_enabled,
+            policy_name: policy_name.clone(),
+            output_tx: Some(output_tx),
         });
 
         Ok(id)
@@ -341,6 +379,7 @@ impl SandboxManager {
                 SandboxInfo {
                     id: m.sandbox.id,
                     status: m.sandbox.status,
+                    policy_name: m.policy_name.clone(),
                     pid: m.sandbox.pid,
                     workspace: m.sandbox.workspace_dir.clone(),
                     proxy_addr: m.proxy_addr.to_string(),
@@ -349,12 +388,21 @@ impl SandboxManager {
             })
             .collect()
     }
+
+    /// Subscribe to a sandbox's stdout/stderr output stream.
+    pub fn subscribe_output(&self, id: &SandboxId) -> Option<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+        self.sandboxes
+            .get(id)
+            .and_then(|m| m.output_tx.as_ref())
+            .map(|tx| tx.subscribe())
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct SandboxInfo {
     pub id: SandboxId,
     pub status: SandboxStatus,
+    pub policy_name: String,
     pub pid: Option<u32>,
     pub workspace: PathBuf,
     pub proxy_addr: String,
@@ -476,12 +524,26 @@ impl SandboxBackend for SandboxManagerBackend {
                     serde_json::json!({
                         "id": s.id.to_string(),
                         "status": format!("{:?}", s.status),
+                        "policy_name": s.policy_name,
                         "pid": s.pid,
                         "proxy_addr": s.proxy_addr,
                         "gpu_worker": s.gpu_worker,
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn subscribe_output(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<tokio::sync::broadcast::Receiver<Vec<u8>>>> + Send + '_>>
+    {
+        let id = id.to_string();
+        Box::pin(async move {
+            let sandbox_id: axis_core::types::SandboxId = id.parse().ok()?;
+            let mgr = self.mgr.lock().await;
+            mgr.subscribe_output(&sandbox_id)
         })
     }
 }

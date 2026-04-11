@@ -87,6 +87,12 @@ impl SandboxImpl for WindowsSandbox {
         // restricted token + AppContainer launch requires Win32 FFI
         // which will be completed when testing on the Windows VM.
 
+        // Capture output for daemon/gateway streaming, or inherit for CLI mode.
+        if self.config.capture_output {
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+        }
+
         let child = cmd
             .spawn()
             .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
@@ -102,6 +108,14 @@ impl SandboxImpl for WindowsSandbox {
 
         tracing::info!("sandbox {sandbox_id} started on Windows, pid={pid}");
         Ok(pid)
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut().and_then(|c| c.stdout.take())
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut().and_then(|c| c.stderr.take())
     }
 
     fn wait(

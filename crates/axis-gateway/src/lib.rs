@@ -54,6 +54,12 @@ pub trait SandboxBackend: Send + Sync {
     fn list_sandboxes(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + '_>>;
+
+    /// Subscribe to a sandbox's stdout/stderr output stream.
+    fn subscribe_output(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<tokio::sync::broadcast::Receiver<Vec<u8>>>> + Send + '_>>;
 }
 
 /// Shared gateway state passed to all handlers.

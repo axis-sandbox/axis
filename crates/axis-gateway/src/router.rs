@@ -73,6 +73,11 @@ pub async fn route(
             return super::events::handle_ws_upgrade(req, state).await;
         }
 
+        // WebSocket: GET /ws/v1/sandboxes/:id/pty
+        ("GET", ["ws", "v1", "sandboxes", id, "pty"]) => {
+            return super::events::handle_pty_upgrade(req, id, state).await;
+        }
+
         // 404
         _ => {
             json_response(StatusCode::NOT_FOUND, serde_json::json!({
