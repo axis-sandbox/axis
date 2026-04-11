@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["gui/linux"]
 members = [
     "crates/axis-core",
     "crates/axis-safety",
