@@ -7,6 +7,8 @@ members = [
     "crates/axis-proxy",
     "crates/axis-router",
     "crates/axis-gpu",
+    "crates/axis-pty",
+    "crates/axis-gateway",
     "crates/axis-daemon",
     "crates/axis-cli",
     "benches",
@@ -27,6 +29,8 @@ axis-proxy = { path = "crates/axis-proxy" }
 axis-router = { path = "crates/axis-router" }
 axis-gpu = { path = "crates/axis-gpu" }
 axis-daemon = { path = "crates/axis-daemon" }
+axis-pty = { path = "crates/axis-pty" }
+axis-gateway = { path = "crates/axis-gateway" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -85,6 +89,13 @@ libc = "0.2"
 
 # Temp directories
 tempfile = "3"
+
+# WebSocket
+tokio-tungstenite = "0.24"
+
+# Crypto (for WebSocket handshake)
+sha1 = "0.10"
+base64 = "0.22"
 
 # LLM inference (llama.cpp via Rust bindings)
 llama-cpp-2 = "0.1"
