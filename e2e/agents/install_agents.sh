@@ -38,7 +38,7 @@ mkdir -p "$TOOLS_DIR" "$BIN_DIR"
 
 # ── Agent definitions (bash 3 compatible — no associative arrays) ────────
 
-ALL_AGENTS="claude-code codex openclaw ironclaw aider goose"
+ALL_AGENTS="claude-code codex openclaw ironclaw aider goose gemini-cli opencode"
 
 agent_binary() {
     case "$1" in
@@ -48,12 +48,12 @@ agent_binary() {
         ironclaw)    echo "ironclaw" ;;
         aider)       echo "aider" ;;
         goose)       echo "goose" ;;
+        gemini-cli)  echo "gemini" ;;
+        opencode)    echo "opencode" ;;
         *)           echo "$1" ;;
     esac
 }
 
-# Default flags injected before user args. These are safe because
-# AXIS provides the sandbox protection that these flags would skip.
 agent_default_flags() {
     case "$1" in
         claude-code) echo "--dangerously-skip-permissions" ;;
@@ -70,6 +70,8 @@ agent_policy() {
         ironclaw)    echo "ironclaw.yaml" ;;
         aider)       echo "hermes.yaml" ;;
         goose)       echo "hermes.yaml" ;;
+        gemini-cli)  echo "gemini-cli.yaml" ;;
+        opencode)    echo "opencode.yaml" ;;
         *)           echo "base-deny.yaml" ;;
     esac
 }
@@ -82,6 +84,8 @@ agent_install_fn() {
         ironclaw)    echo "install_ironclaw" ;;
         aider)       echo "install_aider" ;;
         goose)       echo "install_goose" ;;
+        gemini-cli)  echo "install_gemini_cli" ;;
+        opencode)    echo "install_opencode" ;;
         *)           echo "" ;;
     esac
 }
@@ -213,6 +217,38 @@ install_goose() {
             bin="$(which goose)"
         fi
         echo "$bin"
+    fi
+}
+
+install_gemini_cli() {
+    local sys_bin
+    sys_bin=$(try_system_binary "gemini") && { echo "$sys_bin"; return 0; }
+
+    local dir="$TOOLS_DIR/gemini-cli"
+    mkdir -p "$dir"
+    if command -v npm >/dev/null 2>&1; then
+        npm install --prefix "$dir" @google/gemini-cli@latest 2>&1 | tail -3
+        local bin="$dir/node_modules/.bin/gemini"
+        if [ -x "$bin" ]; then echo "$bin"; return 0; fi
+    fi
+    if command -v gemini >/dev/null 2>&1; then
+        echo "$(which gemini)"
+    fi
+}
+
+install_opencode() {
+    local sys_bin
+    sys_bin=$(try_system_binary "opencode") && { echo "$sys_bin"; return 0; }
+
+    local dir="$TOOLS_DIR/opencode"
+    mkdir -p "$dir"
+    if command -v npm >/dev/null 2>&1; then
+        npm install --prefix "$dir" opencode-ai@latest 2>&1 | tail -3
+        local bin="$dir/node_modules/.bin/opencode"
+        if [ -x "$bin" ]; then echo "$bin"; return 0; fi
+    fi
+    if command -v opencode >/dev/null 2>&1; then
+        echo "$(which opencode)"
     fi
 }
 

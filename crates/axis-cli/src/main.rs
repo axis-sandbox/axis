@@ -329,6 +329,8 @@ async fn main() -> Result<()> {
                 ("hermes.yaml", include_str!("../../../policies/agents/hermes.yaml")),
                 ("gemini-cli.yaml", include_str!("../../../policies/agents/gemini-cli.yaml")),
                 ("opencode.yaml", include_str!("../../../policies/agents/opencode.yaml")),
+                ("gemini-cli.yaml", include_str!("../../../policies/agents/gemini-cli.yaml")),
+                ("opencode.yaml", include_str!("../../../policies/agents/opencode.yaml")),
             ] {
                 let _ = std::fs::write(pol_dir.join(name), content);
             }
@@ -909,6 +911,8 @@ fn known_agent(binary_name: &str) -> Option<&'static str> {
         "ironclaw" => Some("ironclaw"),
         "aider"    => Some("aider"),
         "goose"    => Some("goose"),
+        "gemini"   => Some("gemini-cli"),
+        "opencode" => Some("opencode"),
         _ => None,
     }
 }
