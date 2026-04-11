@@ -25,15 +25,28 @@ export interface HealthResponse {
 }
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(`${GATEWAY_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`${resp.status}: ${body}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+
+  try {
+    const resp = await fetch(`${GATEWAY_BASE}${path}`, {
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      ...init,
+    });
+    clearTimeout(timeout);
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`${resp.status}: ${body}`);
+    }
+    return resp.json();
+  } catch (e: any) {
+    clearTimeout(timeout);
+    if (e.name === "AbortError") {
+      throw new Error("Cannot connect to AXIS daemon. Start axisd first.");
+    }
+    throw new Error(`Connection failed: ${e.message}`);
   }
-  return resp.json();
 }
 
 export async function getHealth(): Promise<HealthResponse> {

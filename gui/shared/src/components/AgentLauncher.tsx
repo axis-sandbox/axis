@@ -49,7 +49,11 @@ export function AgentLauncher(props: AgentLauncherProps) {
       <div style={{ display: "grid", "grid-template-columns": "repeat(auto-fill, minmax(280px, 1fr))", gap: "12px" }}>
         <For each={agents()} fallback={
           <div style={{ color: "var(--text-secondary)", "font-size": "13px" }}>
-            {agents.loading ? "Loading agents..." : "No agents installed. Run `axis install --all` to install."}
+            {agents.loading
+              ? "Connecting to AXIS daemon..."
+              : agents.error
+              ? `Error: ${agents.error.message}`
+              : "No agents installed. Run `axis install --all` to install."}
           </div>
         }>
           {(agent) => (
