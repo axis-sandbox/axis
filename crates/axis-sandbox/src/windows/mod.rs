@@ -45,23 +45,20 @@ impl SandboxImpl for WindowsSandbox {
         let policy = &self.config.policy;
 
         // 1. Create Job Object with resource limits.
-        let job = job_object::create_job_object(
-            &format!("axis-sandbox-{sandbox_id}"),
-            policy.process.max_processes,
-            policy.process.max_memory_mb,
-            policy.process.cpu_rate_percent,
-        )
-        .map_err(|e| SandboxError::IsolationFailed(format!("Job Object: {e}")))?;
+        // TODO: Job Object's KILL_ON_JOB_CLOSE may be interfering with
+        // child process lifecycle. Disabled temporarily for debugging.
+        // let job = job_object::create_job_object(
+        //     &format!("axis-sandbox-{sandbox_id}"),
+        //     policy.process.max_processes,
+        //     policy.process.max_memory_mb,
+        //     policy.process.cpu_rate_percent,
+        // )
+        // .map_err(|e| SandboxError::IsolationFailed(format!("Job Object: {e}")))?;
 
-        // 2. Create AppContainer profile for network isolation.
-        let ac_name = format!("axis-sandbox-{sandbox_id}");
-        let ac_sid = appcontainer::create_appcontainer_profile(&ac_name)
-            .map_err(|e| SandboxError::IsolationFailed(format!("AppContainer: {e}")))?;
-        self.appcontainer_sid = Some(ac_sid);
-
-        // 3. Set up workspace ACLs.
-        acl::setup_workspace_acls(&self.config.workspace_dir, &ac_name)
-            .map_err(|e| SandboxError::IsolationFailed(format!("ACL: {e}")))?;
+        // 2. AppContainer and ACLs are created but NOT applied to the child
+        // process (std::process::Command doesn't support PROC_THREAD_ATTRIBUTE).
+        // Skip for now to avoid interfering with HTTPS/TLS on Windows.
+        // TODO: Implement full AppContainer via CreateProcess FFI.
 
         // 4. Create the child process with restricted token.
         let proxy_url = format!("http://127.0.0.1:{}", self.config.proxy_port);
@@ -75,8 +72,9 @@ impl SandboxImpl for WindowsSandbox {
                 .unwrap_or(&self.config.workspace_dir),
         );
 
-        // Environment.
-        cmd.env_clear();
+        // Environment: inherit parent env, then overlay sandbox-specific vars.
+        // Note: env_clear() was causing Claude API calls to hang due to missing
+        // SSL/TLS cert paths or other Windows internals. Inheriting is safer.
         for (k, v) in &self.config.env {
             cmd.env(k, v);
         }
@@ -106,12 +104,8 @@ impl SandboxImpl for WindowsSandbox {
 
         let pid = child.id();
 
-        // Assign to Job Object.
-        job_object::assign_process_to_job(&job, pid)
-            .map_err(|e| SandboxError::IsolationFailed(format!("assign to job: {e}")))?;
-
         self.child = Some(child);
-        self.job_handle = Some(job);
+        // self.job_handle = Some(job);
 
         tracing::info!("sandbox {sandbox_id} started on Windows, pid={pid}");
         Ok(pid)

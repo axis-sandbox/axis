@@ -177,6 +177,7 @@ impl SandboxManager {
         all_env.extend(extra_env);
 
         let timeout_sec = policy.process.timeout_sec;
+        tracing::info!("sandbox {id}: spawning: {command} {}", args.join(" "));
         let config = SandboxConfig {
             id,
             policy,
