@@ -82,9 +82,12 @@ export function Terminal(props: TerminalProps) {
 
     ptyConn.ws.onopen = () => {
       term!.clear();
-      // Send initial resize.
-      ptyConn!.resize(term!.cols, term!.rows);
+      term!.write("\x1b[32mConnected to sandbox.\x1b[0m\r\n");
+      term!.write("Waiting for agent to start...\r\n\r\n");
     };
+
+    // Wire up the result callback to show prompt.
+    onResultCallback = showPrompt;
 
     ptyConn.ws.onmessage = (msg) => {
       if (msg.data instanceof ArrayBuffer) {
@@ -106,31 +109,36 @@ export function Terminal(props: TerminalProps) {
     // Input handling: collect keystrokes into a line buffer.
     // On Enter, send as stream-json user message to Claude's stdin.
     let inputBuffer = "";
-    term.write("\r\n\x1b[33m> \x1b[0m"); // Show prompt
+    let inputReady = false;
+
+    // Show prompt once we receive the first output (agent is ready).
+    function showPrompt() {
+      if (!inputReady) {
+        inputReady = true;
+      }
+      term!.write("\r\n\x1b[33m> \x1b[0m");
+    }
 
     const disposable = term.onData((data) => {
+      if (!inputReady) return; // Ignore input until agent is ready.
+
       if (data === "\r" || data === "\n") {
-        // Enter pressed — send the message.
         term!.write("\r\n");
         if (inputBuffer.trim()) {
-          // Send as Claude stream-json format.
           const msg = JSON.stringify({
             type: "user",
             message: { role: "user", content: inputBuffer.trim() },
           }) + "\n";
           ptyConn?.send(msg);
-          term!.write(`\x1b[2m(sent)\x1b[0m\r\n`);
+          term!.write(`\x1b[2mSending to agent...\x1b[0m\r\n`);
         }
         inputBuffer = "";
-        term!.write("\x1b[33m> \x1b[0m");
       } else if (data === "\x7f" || data === "\b") {
-        // Backspace
         if (inputBuffer.length > 0) {
           inputBuffer = inputBuffer.slice(0, -1);
           term!.write("\b \b");
         }
       } else if (data >= " ") {
-        // Regular character
         inputBuffer += data;
         term!.write(data);
       }
@@ -144,7 +152,10 @@ export function Terminal(props: TerminalProps) {
   );
 }
 
-/** Render output to the terminal, handling both raw text and Claude stream-json. */
+/** Render output to the terminal, handling both raw text and Claude stream-json.
+ *  Returns true if a "result" message was received (agent finished responding). */
+let onResultCallback: (() => void) | null = null;
+
 function renderOutput(term: XTerm, text: string) {
   // Try to parse each line as JSON (Claude stream-json format).
   for (const line of text.split("\n")) {
@@ -164,12 +175,13 @@ function renderOutput(term: XTerm, text: string) {
           }
         }
       } else if (msg.type === "result") {
-        // Final result.
+        // Final result — agent finished this turn.
         if (msg.result) {
           term.write(msg.result.replace(/\n/g, "\r\n"));
           term.write("\r\n");
         }
-        term.write("\r\n\x1b[32m[Done]\x1b[0m\r\n");
+        // Show prompt for next input.
+        if (onResultCallback) onResultCallback();
       } else if (msg.type === "content_block_delta" && msg.delta?.text) {
         // Streaming text delta.
         term.write(msg.delta.text);
