@@ -709,13 +709,33 @@ async fn main() -> Result<()> {
 
                     // Pass through env vars from parent.
                     // All ANTHROPIC_* vars (API key, base URL, etc.) and essential system vars.
+                    // NOTE: Windows env var names are case-insensitive but stored with
+                    // arbitrary casing (e.g., SYSTEMROOT vs SystemRoot). We normalize
+                    // to uppercase for comparison on Windows.
                     let mut env: Vec<(String, String)> = Vec::new();
                     for (key, val) in std::env::vars() {
-                        if key.starts_with("ANTHROPIC_")
-                            || key.starts_with("OPENAI_")
-                            || matches!(key.as_str(), "HOME" | "USER" | "PATH" | "LANG"
+                        let key_cmp = if cfg!(windows) {
+                            key.to_uppercase()
+                        } else {
+                            key.clone()
+                        };
+                        if key_cmp.starts_with("ANTHROPIC_")
+                            || key_cmp.starts_with("OPENAI_")
+                            || matches!(key_cmp.as_str(),
+                                // Unix
+                                "HOME" | "USER" | "PATH" | "LANG"
                                 | "TERM" | "SHELL" | "TMPDIR" | "XDG_RUNTIME_DIR"
-                                | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME")
+                                | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
+                                // Windows — required for DLL loading, temp files, and basic APIs
+                                | "SYSTEMROOT" | "SYSTEMDRIVE" | "WINDIR"
+                                | "TEMP" | "TMP"
+                                | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA"
+                                | "PROGRAMDATA" | "PROGRAMFILES" | "PROGRAMFILES(X86)"
+                                | "COMPUTERNAME" | "USERNAME"
+                                | "NUMBER_OF_PROCESSORS" | "PROCESSOR_ARCHITECTURE"
+                                | "PATHEXT" | "COMSPEC" | "OS"
+                                | "HOMEDRIVE" | "HOMEPATH"
+                            )
                         {
                             env.push((key, val));
                         }

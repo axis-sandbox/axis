@@ -48,7 +48,9 @@ pub fn create_job_object(
     ext_info.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        // NOTE: DIE_ON_UNHANDLED_EXCEPTION removed — V8/Node.js uses SEH for
+        // stack guards and GC, so this flag kills Node-based agents immediately.
+        // | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
         | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
     ext_info.ProcessMemoryLimit = (max_memory_mb * 1024 * 1024) as usize;
 
