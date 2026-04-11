@@ -31,15 +31,18 @@ New-Item -ItemType Directory -Path $PoliciesDir -Force | Out-Null
 # ── Agent definitions ────────────────────────────────────────────────────
 
 $AgentDefs = @{
-    "claude-code" = @{ Binary = "claude"; Policy = "claude-code.yaml"; Install = "Install-ClaudeCode" }
-    "codex"       = @{ Binary = "codex";  Policy = "codex.yaml";       Install = "Install-Codex" }
-    "openclaw"    = @{ Binary = "openclaw"; Policy = "openclaw.yaml";   Install = "Install-OpenClaw" }
-    "ironclaw"    = @{ Binary = "ironclaw"; Policy = "ironclaw.yaml";   Install = "Install-Ironclaw" }
-    "aider"       = @{ Binary = "aider";  Policy = "hermes.yaml";      Install = "Install-Aider" }
-    "goose"       = @{ Binary = "goose";  Policy = "hermes.yaml";      Install = "Install-Goose" }
+    "claude-code"  = @{ Binary = "claude";        Policy = "claude-code.yaml";  Install = "Install-ClaudeCode" }
+    "codex"        = @{ Binary = "codex";         Policy = "codex.yaml";        Install = "Install-Codex" }
+    "openclaw"     = @{ Binary = "openclaw";      Policy = "openclaw.yaml";     Install = "Install-OpenClaw" }
+    "ironclaw"     = @{ Binary = "ironclaw";      Policy = "ironclaw.yaml";     Install = "Install-Ironclaw" }
+    "aider"        = @{ Binary = "aider";         Policy = "hermes.yaml";       Install = "Install-Aider" }
+    "goose"        = @{ Binary = "goose";         Policy = "hermes.yaml";       Install = "Install-Goose" }
+    "gemini-cli"   = @{ Binary = "gemini";        Policy = "gemini-cli.yaml";   Install = "Install-GeminiCli" }
+    "opencode"     = @{ Binary = "opencode";      Policy = "opencode.yaml";     Install = "Install-OpenCode" }
+    "cursor-agent" = @{ Binary = "cursor-agent";  Policy = "cursor-agent.yaml"; Install = "Install-CursorAgent" }
 }
 
-$AllAgents = @("claude-code", "codex", "openclaw", "ironclaw", "aider", "goose")
+$AllAgents = @("claude-code", "codex", "openclaw", "ironclaw", "aider", "goose", "gemini-cli", "opencode", "cursor-agent")
 
 # ── Install functions ────────────────────────────────────────────────────
 
@@ -196,6 +199,75 @@ function Install-Goose {
     }
 
     $bin = Get-Command goose -ErrorAction SilentlyContinue
+    if ($bin) { return $bin.Source }
+
+    return ""
+}
+
+function Install-GeminiCli {
+    $dir = "$ToolsDir\gemini-cli"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        Write-Host "  Installing via npm..."
+        & npm install --prefix $dir @google/gemini-cli@latest 2>&1 | Out-Null
+        $bin = "$dir\node_modules\.bin\gemini.cmd"
+        if (Test-Path $bin) { return $bin }
+    }
+
+    $bin = Get-Command gemini -ErrorAction SilentlyContinue
+    if ($bin) { return $bin.Source }
+
+    return ""
+}
+
+function Install-OpenCode {
+    $dir = "$ToolsDir\opencode"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        Write-Host "  Installing via npm..."
+        & npm install --prefix $dir opencode-ai@latest 2>&1 | Out-Null
+        $bin = "$dir\node_modules\.bin\opencode.cmd"
+        if (Test-Path $bin) { return $bin }
+    }
+
+    # Try scoop as fallback
+    if (Get-Command scoop -ErrorAction SilentlyContinue) {
+        Write-Host "  Installing via scoop..."
+        & scoop install opencode 2>&1 | Out-Null
+    }
+
+    $bin = Get-Command opencode -ErrorAction SilentlyContinue
+    if ($bin) { return $bin.Source }
+
+    return ""
+}
+
+function Install-CursorAgent {
+    $dir = "$ToolsDir\cursor-agent"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+    # Check if Cursor IDE is installed and has cursor-agent
+    foreach ($candidate in @(
+        "$env:LOCALAPPDATA\Programs\cursor\resources\app\bin\cursor-agent.exe",
+        "$env:LOCALAPPDATA\cursor\cursor-agent.exe",
+        "$env:LOCALAPPDATA\Programs\Cursor\cursor-agent.exe"
+    )) {
+        if ($candidate -and (Test-Path $candidate -ErrorAction SilentlyContinue)) {
+            return $candidate
+        }
+    }
+
+    # Install via npm (community SDK that downloads the official binary)
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        Write-Host "  Installing via npm..."
+        & npm install --prefix $dir @nothumanwork/cursor-agents-sdk@latest 2>&1 | Out-Null
+        $bin = "$dir\node_modules\.bin\cursor-agent.cmd"
+        if (Test-Path $bin) { return $bin }
+    }
+
+    $bin = Get-Command cursor-agent -ErrorAction SilentlyContinue
     if ($bin) { return $bin.Source }
 
     return ""

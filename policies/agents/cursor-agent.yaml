@@ -1,0 +1,60 @@
+version: 1
+name: agent-cursor-agent
+
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /System
+    - /Library
+    - /Applications
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+    - "~/.axis"
+    - "~/.cursor"
+    - "~/.config"
+  deny:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.kube"
+    - "~/.docker"
+
+process:
+  max_processes: 128
+  max_memory_mb: 16384
+  cpu_rate_percent: 90
+  timeout_sec: 600
+
+network:
+  mode: proxy
+  policies:
+    - name: cursor
+      endpoints:
+        - host: "api2.cursor.sh"
+          port: 443
+        - host: "downloads.cursor.com"
+          port: 443
+        - host: "repo.cursor.sh"
+          port: 443
+        - host: "api.cursor.com"
+          port: 443
+    - name: github
+      endpoints:
+        - host: "api.github.com"
+          port: 443
+        - host: "github.com"
+          port: 443
+    - name: packages
+      endpoints:
+        - host: "registry.npmjs.org"
+          port: 443
+        - host: "pypi.org"
+          port: 443
+        - host: "files.pythonhosted.org"
+          port: 443
