@@ -2,8 +2,10 @@
 // Provides desktop integration, system tray, and hosts the shared frontend.
 
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow};
+use gtk4::Application;
 use libadwaita as adw;
+use adw::prelude::*;
+use webkit6::prelude::*;
 
 const APP_ID: &str = "org.axis.Desktop";
 const GATEWAY_URL: &str = "http://127.0.0.1:18519";
