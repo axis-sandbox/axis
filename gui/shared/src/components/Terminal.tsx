@@ -1,0 +1,117 @@
+import { onMount, onCleanup, createEffect } from "solid-js";
+import { Terminal as XTerm } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { connectPty, type PtyConnection } from "../api/client";
+import "@xterm/xterm/css/xterm.css";
+
+interface TerminalProps {
+  sandboxId: string | null;
+}
+
+export function Terminal(props: TerminalProps) {
+  let containerRef!: HTMLDivElement;
+  let term: XTerm | null = null;
+  let fitAddon: FitAddon | null = null;
+  let ptyConn: PtyConnection | null = null;
+
+  onMount(() => {
+    term = new XTerm({
+      theme: {
+        background: "#0d1117",
+        foreground: "#e6edf3",
+        cursor: "#58a6ff",
+        selectionBackground: "#264f78",
+      },
+      fontFamily: '"Cascadia Code", "SF Mono", "Fira Code", monospace',
+      fontSize: 13,
+      cursorBlink: true,
+    });
+
+    fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(containerRef);
+
+    // Try WebGL renderer for performance.
+    try {
+      term.loadAddon(new WebglAddon());
+    } catch {
+      // WebGL not available, fallback to canvas.
+    }
+
+    fitAddon.fit();
+
+    // Handle window resize.
+    const resizeObserver = new ResizeObserver(() => {
+      fitAddon?.fit();
+      if (ptyConn && term) {
+        ptyConn.resize(term.cols, term.rows);
+      }
+    });
+    resizeObserver.observe(containerRef);
+
+    onCleanup(() => {
+      resizeObserver.disconnect();
+      ptyConn?.close();
+      term?.dispose();
+    });
+  });
+
+  // Connect/reconnect when sandboxId changes.
+  createEffect(() => {
+    const sandboxId = props.sandboxId;
+
+    // Disconnect previous.
+    if (ptyConn) {
+      ptyConn.close();
+      ptyConn = null;
+    }
+
+    if (!sandboxId || !term) {
+      if (term) {
+        term.clear();
+        term.write("\r\n  No sandbox selected. Launch an agent to connect.\r\n");
+      }
+      return;
+    }
+
+    term.clear();
+    term.write(`\r\n  Connecting to sandbox ${sandboxId}...\r\n`);
+
+    ptyConn = connectPty(sandboxId);
+
+    ptyConn.ws.onopen = () => {
+      term!.clear();
+      // Send initial resize.
+      ptyConn!.resize(term!.cols, term!.rows);
+    };
+
+    ptyConn.ws.onmessage = (msg) => {
+      if (msg.data instanceof ArrayBuffer) {
+        const view = new Uint8Array(msg.data);
+        if (view[0] === 0x00) {
+          // Data frame — write to terminal.
+          const text = new TextDecoder().decode(view.slice(1));
+          term!.write(text);
+        }
+      } else if (typeof msg.data === "string") {
+        term!.write(msg.data);
+      }
+    };
+
+    ptyConn.ws.onclose = () => {
+      term!.write("\r\n\r\n  [Connection closed]\r\n");
+    };
+
+    // Forward keystrokes to PTY.
+    const disposable = term.onData((data) => {
+      ptyConn?.send(data);
+    });
+
+    onCleanup(() => disposable.dispose());
+  });
+
+  return (
+    <div class="terminal-container" ref={containerRef} />
+  );
+}
