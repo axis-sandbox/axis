@@ -83,27 +83,13 @@ impl SandboxImpl for WindowsSandbox {
         cmd.env("HTTP_PROXY", &proxy_url);
         cmd.env("HTTPS_PROXY", &proxy_url);
 
-        // When capturing output (daemon mode), use ConPTY so interactive
-        // TUI agents (Claude Code, etc.) get a real terminal.
+        // Capture stdout/stderr for daemon/gateway streaming.
+        // NOTE: ConPTY requires CreateProcess with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+        // which std::process::Command doesn't support. Use piped stdout for now —
+        // agents should be launched in non-interactive mode (e.g., claude -p ...).
         if self.config.capture_output {
-            match create_conpty_child(&mut cmd) {
-                Ok((child, read_handle)) => {
-                    // Store the ConPTY read pipe as stdout for the daemon to read.
-                    self.conpty_read = Some(read_handle);
-                    let pid = child.id();
-                    job_object::assign_process_to_job(&job, pid)
-                        .map_err(|e| SandboxError::IsolationFailed(format!("assign to job: {e}")))?;
-                    self.child = Some(child);
-                    self.job_handle = Some(job);
-                    tracing::info!("sandbox {sandbox_id} started on Windows with ConPTY, pid={pid}");
-                    return Ok(pid);
-                }
-                Err(e) => {
-                    tracing::warn!("ConPTY failed ({e}), falling back to piped stdout");
-                    cmd.stdout(std::process::Stdio::piped());
-                    cmd.stderr(std::process::Stdio::piped());
-                }
-            }
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
         }
 
         let child = cmd

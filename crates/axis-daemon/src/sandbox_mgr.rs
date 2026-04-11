@@ -200,17 +200,15 @@ impl SandboxManager {
         // Prefer ConPTY read handle (real terminal output with ANSI) over piped stdout.
         let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
         if let Some(pty_read) = sandbox.pty_read.take() {
-            // ConPTY: single merged stream with full terminal output.
+            // ConPTY pipe: use a blocking thread since Windows pipe handles
+            // can't be used with tokio's async file I/O.
             let tx = output_tx.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                // Wrap the blocking File in a tokio thread-backed reader.
-                let mut reader = tokio::io::BufReader::new(
-                    tokio::fs::File::from_std(pty_read)
-                );
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut reader = pty_read;
                 let mut buf = [0u8; 4096];
                 loop {
-                    match reader.read(&mut buf).await {
+                    match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
                         Err(_) => break,
@@ -431,6 +429,32 @@ pub struct SandboxInfo {
     pub gpu_worker: Option<String>,
 }
 
+/// Collect essential environment variables for sandbox child processes.
+/// Mirrors the logic from axis-cli's env passthrough.
+fn collect_sandbox_env() -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for (key, val) in std::env::vars() {
+        let key_cmp = if cfg!(windows) { key.to_uppercase() } else { key.clone() };
+        if key_cmp.starts_with("ANTHROPIC_")
+            || key_cmp.starts_with("OPENAI_")
+            || key_cmp.starts_with("CLAUDE_")
+            || matches!(key_cmp.as_str(),
+                "HOME" | "USER" | "PATH" | "LANG" | "TERM" | "SHELL" | "TMPDIR"
+                | "XDG_RUNTIME_DIR" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
+                | "SYSTEMROOT" | "SYSTEMDRIVE" | "WINDIR" | "TEMP" | "TMP"
+                | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA"
+                | "PROGRAMDATA" | "PROGRAMFILES" | "PROGRAMFILES(X86)"
+                | "COMPUTERNAME" | "USERNAME"
+                | "NUMBER_OF_PROCESSORS" | "PROCESSOR_ARCHITECTURE"
+                | "PATHEXT" | "COMSPEC" | "OS" | "HOMEDRIVE" | "HOMEPATH"
+            )
+        {
+            env.push((key, val));
+        }
+    }
+    env
+}
+
 fn allocate_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::Relaxed)
 }
@@ -511,11 +535,13 @@ impl SandboxBackend for SandboxManagerBackend {
         args: Vec<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>> {
         let policy_yaml = policy_yaml.to_string();
+        // Collect essential env vars for the sandbox (same logic as axis-cli).
+        let env = collect_sandbox_env();
         Box::pin(async move {
             let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)
                 .map_err(|e| format!("invalid policy: {e}"))?;
             let mut mgr = self.mgr.lock().await;
-            let id = mgr.create(policy, command, args, vec![]).await?;
+            let id = mgr.create(policy, command, args, env).await?;
             Ok(id.to_string())
         })
     }

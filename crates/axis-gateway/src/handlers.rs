@@ -258,12 +258,11 @@ fn agent_default_args(name: &str) -> Vec<String> {
     match name {
         "claude-code" => vec![
             "--dangerously-skip-permissions".to_string(),
+            "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
-            "--input-format".to_string(),
-            "stream-json".to_string(),
             "-p".to_string(),
-            "You are running inside the AXIS sandbox GUI. The user will interact with you through the AXIS interface. Say hello and ask what they'd like to work on.".to_string(),
+            "You are running inside the AXIS sandbox GUI. Say hello and ask what the user would like to work on.".to_string(),
         ],
         "codex" => vec![
             "--full-auto".to_string(),
