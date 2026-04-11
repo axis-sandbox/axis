@@ -12,7 +12,8 @@
 //! The proxy enforces OPA network policy and leak detection.
 //! The sandbox process has HTTP_PROXY/HTTPS_PROXY pointing to its proxy.
 
-use axis_core::audit::{AuditLog, AuditEvent, BroadcastSink, TracingSink};
+use axis_core::audit::{AuditEvent, AuditLog, BroadcastSink, TracingSink};
+use axis_gateway::SandboxBackend;
 use axis_core::policy::Policy;
 use axis_core::types::{SandboxId, SandboxStatus};
 use axis_gpu::api_filter::GpuPolicy as GpuFilterPolicy;
@@ -415,5 +416,72 @@ fn dirs_base() -> PathBuf {
             .join("sandboxes")
     } else {
         PathBuf::from("/tmp/axis/sandboxes")
+    }
+}
+
+// ── Gateway Backend ─────────────────────────────────────────────────────
+
+/// Wraps `SandboxManager` behind `Arc<Mutex<>>` to implement `SandboxBackend`
+/// for the gateway. All methods acquire the mutex for each operation.
+pub struct SandboxManagerBackend {
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+}
+
+impl SandboxManagerBackend {
+    pub fn new(mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>) -> Self {
+        Self { mgr }
+    }
+}
+
+impl SandboxBackend for SandboxManagerBackend {
+    fn create_sandbox(
+        &self,
+        policy_yaml: &str,
+        command: String,
+        args: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>> {
+        let policy_yaml = policy_yaml.to_string();
+        Box::pin(async move {
+            let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)
+                .map_err(|e| format!("invalid policy: {e}"))?;
+            let mut mgr = self.mgr.lock().await;
+            let id = mgr.create(policy, command, args, vec![]).await?;
+            Ok(id.to_string())
+        })
+    }
+
+    fn destroy_sandbox(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let sandbox_id: axis_core::types::SandboxId = id
+                .parse()
+                .map_err(|_| format!("invalid sandbox id: {id}"))?;
+            let mut mgr = self.mgr.lock().await;
+            mgr.destroy(&sandbox_id)
+        })
+    }
+
+    fn list_sandboxes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let mgr = self.mgr.lock().await;
+            mgr.list()
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id.to_string(),
+                        "status": format!("{:?}", s.status),
+                        "pid": s.pid,
+                        "proxy_addr": s.proxy_addr,
+                        "gpu_worker": s.gpu_worker,
+                    })
+                })
+                .collect()
+        })
     }
 }

@@ -22,6 +22,14 @@ impl std::fmt::Display for SandboxId {
     }
 }
 
+impl std::str::FromStr for SandboxId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
 /// Status of a sandbox instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -33,15 +33,53 @@ impl Default for GatewayConfig {
     }
 }
 
+/// Trait for sandbox management — implemented by the daemon's SandboxManager.
+/// Allows the gateway to create/destroy/list sandboxes without depending on axis-daemon.
+///
+/// All methods take `&self` and use interior mutability (Arc<Mutex<>>) since
+/// the gateway serves concurrent requests.
+pub trait SandboxBackend: Send + Sync {
+    fn create_sandbox(
+        &self,
+        policy_yaml: &str,
+        command: String,
+        args: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>;
+
+    fn destroy_sandbox(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
+
+    fn list_sandboxes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + '_>>;
+}
+
 /// Shared gateway state passed to all handlers.
 pub struct GatewayState {
     /// Broadcast channel for audit events.
     pub event_tx: broadcast::Sender<axis_core::audit::AuditEvent>,
+    /// Optional sandbox backend (connected when running inside axisd).
+    pub sandbox_backend: Option<Arc<dyn SandboxBackend>>,
 }
 
 impl GatewayState {
     pub fn new(event_tx: broadcast::Sender<axis_core::audit::AuditEvent>) -> Self {
-        Self { event_tx }
+        Self {
+            event_tx,
+            sandbox_backend: None,
+        }
+    }
+
+    pub fn with_backend(
+        event_tx: broadcast::Sender<axis_core::audit::AuditEvent>,
+        backend: Arc<dyn SandboxBackend>,
+    ) -> Self {
+        Self {
+            event_tx,
+            sandbox_backend: Some(backend),
+        }
     }
 
     /// Subscribe to the event stream.

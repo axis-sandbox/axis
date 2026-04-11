@@ -1,17 +1,20 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! IPC server for axisd ↔ CLI communication.
+//! IPC server for axisd <-> CLI communication.
 //! Unix sockets on Linux/macOS, TCP on Windows.
 
 use crate::sandbox_mgr::SandboxManager;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+
+pub type SharedManager = Arc<Mutex<SandboxManager>>;
 
 /// Socket path for the AXIS daemon.
-/// Override with AXIS_SOCKET env var.
 pub fn default_socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("AXIS_SOCKET") {
         return PathBuf::from(path);
@@ -23,7 +26,6 @@ pub fn default_socket_path() -> PathBuf {
     }
 }
 
-/// IPC request from the CLI.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcRequest {
@@ -46,7 +48,6 @@ pub enum IpcRequest {
     List,
 }
 
-/// IPC response to the CLI.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IpcResponse {
     pub success: bool,
@@ -56,7 +57,7 @@ pub struct IpcResponse {
 }
 
 /// Start the IPC server (platform-specific transport).
-pub async fn serve(socket_path: &PathBuf, mgr: &mut SandboxManager) -> Result<()> {
+pub async fn serve(socket_path: &PathBuf, mgr: SharedManager) -> Result<()> {
     #[cfg(unix)]
     {
         serve_unix(socket_path, mgr).await
@@ -69,9 +70,8 @@ pub async fn serve(socket_path: &PathBuf, mgr: &mut SandboxManager) -> Result<()
     }
 }
 
-/// Unix socket server (Linux/macOS).
 #[cfg(unix)]
-async fn serve_unix(socket_path: &PathBuf, mgr: &mut SandboxManager) -> Result<()> {
+async fn serve_unix(socket_path: &PathBuf, mgr: SharedManager) -> Result<()> {
     use tokio::net::UnixListener;
 
     if let Some(parent) = socket_path.parent() {
@@ -85,16 +85,15 @@ async fn serve_unix(socket_path: &PathBuf, mgr: &mut SandboxManager) -> Result<(
     loop {
         let (stream, _) = listener.accept().await?;
         let (reader, mut writer) = stream.into_split();
-        let response = read_and_handle(reader, mgr).await?;
+        let response = read_and_handle(reader, &mgr).await?;
         let json = serde_json::to_string(&response)?;
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
     }
 }
 
-/// TCP server (Windows).
 #[cfg(windows)]
-async fn serve_tcp(mgr: &mut SandboxManager) -> Result<()> {
+async fn serve_tcp(mgr: SharedManager) -> Result<()> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:18516").await?;
@@ -103,17 +102,16 @@ async fn serve_tcp(mgr: &mut SandboxManager) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (reader, mut writer) = stream.into_split();
-        let response = read_and_handle(reader, mgr).await?;
+        let response = read_and_handle(reader, &mgr).await?;
         let json = serde_json::to_string(&response)?;
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
     }
 }
 
-/// Read a request line and dispatch to handler.
 async fn read_and_handle<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
-    mgr: &mut SandboxManager,
+    mgr: &SharedManager,
 ) -> Result<IpcResponse> {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -135,7 +133,7 @@ async fn read_and_handle<R: tokio::io::AsyncRead + Unpin>(
     })
 }
 
-async fn handle_request(mgr: &mut SandboxManager, req: IpcRequest) -> IpcResponse {
+async fn handle_request(mgr: &SharedManager, req: IpcRequest) -> IpcResponse {
     match req {
         IpcRequest::Create {
             policy_yaml,
@@ -143,18 +141,21 @@ async fn handle_request(mgr: &mut SandboxManager, req: IpcRequest) -> IpcRespons
             args,
             env,
         } => match axis_core::policy::Policy::from_yaml(&policy_yaml) {
-            Ok(policy) => match mgr.create(policy, command, args, env).await {
-                Ok(id) => IpcResponse {
-                    success: true,
-                    data: serde_json::json!({ "sandbox_id": id.to_string() }),
-                    error: None,
-                },
-                Err(e) => IpcResponse {
-                    success: false,
-                    data: serde_json::Value::Null,
-                    error: Some(e),
-                },
-            },
+            Ok(policy) => {
+                let mut mgr = mgr.lock().await;
+                match mgr.create(policy, command, args, env).await {
+                    Ok(id) => IpcResponse {
+                        success: true,
+                        data: serde_json::json!({ "sandbox_id": id.to_string() }),
+                        error: None,
+                    },
+                    Err(e) => IpcResponse {
+                        success: false,
+                        data: serde_json::Value::Null,
+                        error: Some(e),
+                    },
+                }
+            }
             Err(e) => IpcResponse {
                 success: false,
                 data: serde_json::Value::Null,
@@ -169,6 +170,7 @@ async fn handle_request(mgr: &mut SandboxManager, req: IpcRequest) -> IpcRespons
         } => match uuid::Uuid::parse_str(&sandbox_id) {
             Ok(uuid) => {
                 let id = axis_core::types::SandboxId(uuid);
+                let mut mgr = mgr.lock().await;
                 match mgr.exec_in_sandbox(&id, command, args) {
                     Ok(exit_code) => IpcResponse {
                         success: true,
@@ -192,6 +194,7 @@ async fn handle_request(mgr: &mut SandboxManager, req: IpcRequest) -> IpcRespons
         IpcRequest::Destroy { sandbox_id } => match uuid::Uuid::parse_str(&sandbox_id) {
             Ok(uuid) => {
                 let id = axis_core::types::SandboxId(uuid);
+                let mut mgr = mgr.lock().await;
                 match mgr.destroy(&id) {
                     Ok(()) => IpcResponse {
                         success: true,
@@ -213,6 +216,7 @@ async fn handle_request(mgr: &mut SandboxManager, req: IpcRequest) -> IpcRespons
         },
 
         IpcRequest::List => {
+            let mgr = mgr.lock().await;
             let sandboxes = mgr.list();
             IpcResponse {
                 success: true,

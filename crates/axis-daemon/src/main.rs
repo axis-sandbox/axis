@@ -61,7 +61,8 @@ async fn main() -> Result<()> {
     // Create broadcast channel for streaming audit events to the gateway.
     let (event_tx, _) = tokio::sync::broadcast::channel::<axis_core::audit::AuditEvent>(1024);
 
-    let mut mgr = sandbox_mgr::SandboxManager::with_event_broadcast(Some(event_tx.clone()));
+    let mgr = sandbox_mgr::SandboxManager::with_event_broadcast(Some(event_tx.clone()));
+    let shared_mgr = std::sync::Arc::new(tokio::sync::Mutex::new(mgr));
     let socket_path = ipc::default_socket_path();
 
     tracing::info!("listening on {}", socket_path.display());
@@ -70,9 +71,14 @@ async fn main() -> Result<()> {
     let health_state = health::HealthState::new();
     tokio::spawn(health::serve_health(health_state.clone()));
 
-    // Start HTTP+WebSocket gateway for GUI clients.
+    // Start HTTP+WebSocket gateway for GUI clients with sandbox backend.
     let gateway_config = axis_gateway::GatewayConfig::default();
-    let gateway_state = std::sync::Arc::new(axis_gateway::GatewayState::new(event_tx));
+    let backend = std::sync::Arc::new(
+        sandbox_mgr::SandboxManagerBackend::new(shared_mgr.clone())
+    );
+    let gateway_state = std::sync::Arc::new(
+        axis_gateway::GatewayState::with_backend(event_tx, backend)
+    );
     let (gw_shutdown_tx, gw_shutdown_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(e) = axis_gateway::start_gateway(gateway_config, gateway_state, gw_shutdown_rx).await {
@@ -83,7 +89,7 @@ async fn main() -> Result<()> {
     // Run IPC server with graceful shutdown on SIGTERM/SIGINT.
     // If IPC bind fails (port taken), keep running for the gateway.
     tokio::select! {
-        result = ipc::serve(&socket_path, &mut mgr) => {
+        result = ipc::serve(&socket_path, shared_mgr.clone()) => {
             match result {
                 Err(e) => {
                     tracing::warn!("IPC server unavailable: {e}");
@@ -105,6 +111,7 @@ async fn main() -> Result<()> {
     // Graceful shutdown: destroy all running sandboxes.
     tracing::info!("shutting down — destroying all sandboxes");
 
+    let mut mgr = shared_mgr.lock().await;
     let sandbox_ids: Vec<axis_core::types::SandboxId> =
         mgr.list().iter().map(|s| s.id).collect();
 

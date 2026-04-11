@@ -12,14 +12,13 @@ use std::sync::Arc;
 type BoxBody = Full<Bytes>;
 
 /// GET /api/v1/sandboxes — list running sandboxes.
-pub async fn list_sandboxes(_state: Arc<GatewayState>) -> Response<BoxBody> {
-    // TODO: Wire to SandboxManager via shared Arc<Mutex<>> once daemon integration is done.
-    json_response(
-        StatusCode::OK,
-        serde_json::json!({
-            "sandboxes": []
-        }),
-    )
+pub async fn list_sandboxes(state: Arc<GatewayState>) -> Response<BoxBody> {
+    if let Some(ref backend) = state.sandbox_backend {
+        let sandboxes = backend.list_sandboxes().await;
+        json_response(StatusCode::OK, serde_json::json!({ "sandboxes": sandboxes }))
+    } else {
+        json_response(StatusCode::OK, serde_json::json!({ "sandboxes": [] }))
+    }
 }
 
 /// POST /api/v1/sandboxes — create a new sandbox.
@@ -39,16 +38,17 @@ pub async fn create_sandbox(
 /// DELETE /api/v1/sandboxes/:id — destroy a sandbox.
 pub async fn destroy_sandbox(
     id: &str,
-    _state: Arc<GatewayState>,
+    state: Arc<GatewayState>,
 ) -> Response<BoxBody> {
-    // TODO: Wire to SandboxManager.
     tracing::info!("destroy sandbox requested: {id}");
-    json_response(
-        StatusCode::OK,
-        serde_json::json!({
-            "destroyed": id
-        }),
-    )
+    if let Some(ref backend) = state.sandbox_backend {
+        match backend.destroy_sandbox(id).await {
+            Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "destroyed": id })),
+            Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e })),
+        }
+    } else {
+        json_response(StatusCode::OK, serde_json::json!({ "destroyed": id }))
+    }
 }
 
 /// GET /api/v1/agents — list installed agents.
@@ -61,10 +61,10 @@ pub async fn list_agents(_state: Arc<GatewayState>) -> Response<BoxBody> {
 }
 
 /// POST /api/v1/agents/:name/run — one-click agent launch.
-/// Installs if needed, creates a sandbox with PTY, returns sandbox_id.
+/// Finds the agent binary, resolves its policy, creates a sandbox, returns sandbox_id.
 pub async fn run_agent(
     name: &str,
-    _state: Arc<GatewayState>,
+    state: Arc<GatewayState>,
 ) -> Response<BoxBody> {
     tracing::info!("run agent requested: {name}");
 
@@ -82,18 +82,126 @@ pub async fn run_agent(
         );
     }
 
-    // TODO: Actually create sandbox with PTY via SandboxManager.
-    // For now, return a mock sandbox_id to unblock UI testing.
-    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    // Find the agent's wrapper script (which contains the real binary path).
+    let (binary, policy_path) = match find_agent_binary(name) {
+        Some(pair) => pair,
+        None => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": format!("agent '{name}' is installed but wrapper not found")
+                }),
+            );
+        }
+    };
 
-    json_response(
-        StatusCode::OK,
-        serde_json::json!({
+    // Read the policy YAML.
+    let policy_yaml = match std::fs::read_to_string(&policy_path) {
+        Ok(yaml) => yaml,
+        Err(e) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": format!("cannot read policy: {e}") }),
+            );
+        }
+    };
+
+    // Create sandbox via backend if available, otherwise return mock.
+    if let Some(ref backend) = state.sandbox_backend {
+        match backend.create_sandbox(&policy_yaml, binary, vec![]).await {
+            Ok(sandbox_id) => {
+                json_response(StatusCode::OK, serde_json::json!({
+                    "sandbox_id": sandbox_id,
+                    "agent": name,
+                    "status": "running"
+                }))
+            }
+            Err(e) => {
+                json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({
+                    "error": format!("sandbox creation failed: {e}")
+                }))
+            }
+        }
+    } else {
+        // No backend — return mock sandbox_id for UI testing.
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        json_response(StatusCode::OK, serde_json::json!({
             "sandbox_id": sandbox_id,
             "agent": name,
-            "status": "created"
-        }),
-    )
+            "status": "created (mock — no daemon backend)"
+        }))
+    }
+}
+
+/// Find an agent's real binary path and policy path from its wrapper script.
+fn find_agent_binary(name: &str) -> Option<(String, String)> {
+    let axis_root = if cfg!(windows) {
+        std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\axis"
+    } else {
+        std::env::var("HOME").unwrap_or("/tmp".into()) + "/.axis"
+    };
+
+    let bin_dir = std::path::Path::new(&axis_root).join("bin");
+    let policies_dir = std::path::Path::new(&axis_root).join("policies").join("agents");
+
+    // Read the .cmd wrapper to extract the real binary path.
+    let wrapper = if cfg!(windows) {
+        bin_dir.join(agent_binary_name(name)).with_extension("cmd")
+    } else {
+        bin_dir.join(agent_binary_name(name))
+    };
+
+    if let Ok(content) = std::fs::read_to_string(&wrapper) {
+        // Parse the wrapper to find the real binary and policy.
+        // Windows .cmd format: ... run --policy "POLICY" -- "BINARY" ...
+        let binary = extract_quoted_after(&content, "-- \"")
+            .or_else(|| extract_quoted_after(&content, "-- '"));
+        let policy = extract_quoted_after(&content, "--policy \"")
+            .or_else(|| extract_quoted_after(&content, "--policy '"));
+
+        if let (Some(bin), Some(pol)) = (binary, policy) {
+            return Some((bin, pol));
+        }
+    }
+
+    // Fallback: look for a well-known policy file.
+    let policy_file = policies_dir.join(format!("{name}.yaml"));
+    if !policy_file.exists() {
+        // Try common aliases.
+        let aliases = [
+            (name, format!("{name}.yaml")),
+            ("claude-code", "claude-code.yaml".to_string()),
+        ];
+        for (agent_name, pol_name) in &aliases {
+            if *agent_name == name {
+                let p = policies_dir.join(pol_name);
+                if p.exists() {
+                    return Some((name.to_string(), p.to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Map agent name to its binary name.
+fn agent_binary_name(name: &str) -> &str {
+    match name {
+        "claude-code" => "claude",
+        "gemini-cli" => "gemini",
+        other => other,
+    }
+}
+
+/// Extract a quoted string after a marker in text.
+fn extract_quoted_after(text: &str, marker: &str) -> Option<String> {
+    let idx = text.find(marker)?;
+    let start = idx + marker.len();
+    let quote = marker.chars().last()?;
+    let rest = &text[start..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
 }
 
 /// Discover installed agents from the filesystem.
