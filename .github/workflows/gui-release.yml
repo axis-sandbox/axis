@@ -1,0 +1,126 @@
+name: GUI Release & Nightly Build
+
+on:
+  push:
+    tags: ["v*"]
+  schedule:
+    # Nightly at 3:17 AM UTC
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: gui/shared/package-lock.json
+      - run: cd gui/shared && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: gui/shared/dist/
+
+  build-macos:
+    needs: build-frontend
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: gui/macos/AXIS/Resources/web
+      - run: cd gui/macos && swift build -c release
+      - run: |
+          mkdir -p release
+          cp gui/macos/.build/release/AXIS release/AXIS-macos-arm64
+          chmod +x release/AXIS-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axis-desktop-macos-arm64
+          path: release/AXIS-macos-arm64
+
+  build-linux:
+    needs: build-frontend
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: gui/linux/data/web
+      - name: Install GTK4 + WebKitGTK dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cd gui/linux && cargo build --release
+      - run: |
+          mkdir -p release
+          cp gui/linux/target/release/axis-desktop release/axis-desktop-linux-x86_64
+          chmod +x release/axis-desktop-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axis-desktop-linux-x86_64
+          path: release/axis-desktop-linux-x86_64
+
+  build-windows:
+    needs: build-frontend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: gui/shared/dist
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: cd gui\windows\AXIS && dotnet publish -c Release -r win-x64 --self-contained false -o ..\release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axis-desktop-windows-x64
+          path: gui/windows/release/
+
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/axis-desktop-macos-arm64/AXIS-macos-arm64
+            artifacts/axis-desktop-linux-x86_64/axis-desktop-linux-x86_64
+            artifacts/axis-desktop-windows-x64/**
+          generate_release_notes: true
+
+  nightly-release:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Update nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          prerelease: true
+          name: "Nightly Build"
+          body: "Automated nightly build from main branch."
+          files: |
+            artifacts/axis-desktop-macos-arm64/AXIS-macos-arm64
+            artifacts/axis-desktop-linux-x86_64/axis-desktop-linux-x86_64
+            artifacts/axis-desktop-windows-x64/**
