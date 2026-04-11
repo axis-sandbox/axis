@@ -62,6 +62,8 @@ pub struct Sandbox {
     pub stdout: Option<std::process::ChildStdout>,
     /// Captured stderr from the child process (when capture_output=true).
     pub stderr: Option<std::process::ChildStderr>,
+    /// ConPTY read handle (Windows) — merged TTY output with ANSI codes.
+    pub pty_read: Option<std::fs::File>,
 }
 
 impl Sandbox {
@@ -112,6 +114,7 @@ impl Sandbox {
             agent_symlinks,
             stdout: None,
             stderr: None,
+            pty_read: None,
         })
     }
 
@@ -122,6 +125,7 @@ impl Sandbox {
         // Take captured stdio handles from the platform impl.
         self.stdout = self.inner.take_stdout();
         self.stderr = self.inner.take_stderr();
+        self.pty_read = self.inner.take_pty_read();
         self.status = SandboxStatus::Running;
         Ok(())
     }
@@ -156,6 +160,9 @@ pub(crate) trait SandboxImpl: Send {
 
     /// Take captured stderr handle (if capture_output was enabled).
     fn take_stderr(&mut self) -> Option<std::process::ChildStderr> { None }
+
+    /// Take ConPTY read handle (Windows only — provides merged TTY output).
+    fn take_pty_read(&mut self) -> Option<std::fs::File> { None }
 
     /// Kill the process and clean up isolation resources.
     fn destroy(&mut self) -> Result<(), SandboxError>;

@@ -106,9 +106,12 @@ pub async fn run_agent(
         }
     };
 
+    // Get default flags for this agent (same as wrapper scripts).
+    let default_args = agent_default_args(name);
+
     // Create sandbox via backend if available, otherwise return mock.
     if let Some(ref backend) = state.sandbox_backend {
-        match backend.create_sandbox(&policy_yaml, binary, vec![]).await {
+        match backend.create_sandbox(&policy_yaml, binary, default_args).await {
             Ok(sandbox_id) => {
                 json_response(StatusCode::OK, serde_json::json!({
                     "sandbox_id": sandbox_id,
@@ -246,6 +249,19 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
     }
 
     None
+}
+
+/// Default CLI args for each agent (matches wrapper scripts).
+fn agent_default_args(name: &str) -> Vec<String> {
+    match name {
+        "claude-code" => vec![
+            "--dangerously-skip-permissions".to_string(),
+        ],
+        "codex" => vec![
+            "--full-auto".to_string(),
+        ],
+        _ => vec![],
+    }
 }
 
 /// Map agent name to its binary name.

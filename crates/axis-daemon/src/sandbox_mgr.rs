@@ -196,37 +196,59 @@ impl SandboxManager {
         );
         self.audit.sandbox_created(id, &policy_name);
 
-        // Spawn background task to read stdout and broadcast to WebSocket clients.
+        // Spawn background task to read output and broadcast to WebSocket clients.
+        // Prefer ConPTY read handle (real terminal output with ANSI) over piped stdout.
         let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
-        if let Some(stdout) = sandbox.stdout.take() {
+        if let Some(pty_read) = sandbox.pty_read.take() {
+            // ConPTY: single merged stream with full terminal output.
             let tx = output_tx.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
-                let mut stdout = tokio::process::ChildStdout::from_std(stdout).unwrap();
+                // Wrap the blocking File in a tokio thread-backed reader.
+                let mut reader = tokio::io::BufReader::new(
+                    tokio::fs::File::from_std(pty_read)
+                );
                 let mut buf = [0u8; 4096];
                 loop {
-                    match stdout.read(&mut buf).await {
-                        Ok(0) => break, // EOF
-                        Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-        if let Some(stderr) = sandbox.stderr.take() {
-            let tx = output_tx.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
-                let mut buf = [0u8; 4096];
-                loop {
-                    match stderr.read(&mut buf).await {
+                    match reader.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
                         Err(_) => break,
                     }
                 }
             });
+        } else {
+            // Fallback: piped stdout/stderr (non-TTY).
+            if let Some(stdout) = sandbox.stdout.take() {
+                let tx = output_tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut stdout = tokio::process::ChildStdout::from_std(stdout).unwrap();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stdout.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            if let Some(stderr) = sandbox.stderr.take() {
+                let tx = output_tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stderr.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => { let _ = tx.send(buf[..n].to_vec()); }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
         }
 
         self.sandboxes.insert(id, ManagedSandbox {
