@@ -133,7 +133,8 @@ pub async fn run_agent(
     }
 }
 
-/// Find an agent's real binary path and policy path from its wrapper script.
+/// Find an agent's real binary path and policy path.
+/// Parses the wrapper script, resolves symlinks, and skips self-referencing wrappers.
 fn find_agent_binary(name: &str) -> Option<(String, String)> {
     let axis_root = if cfg!(windows) {
         std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\axis"
@@ -144,40 +145,102 @@ fn find_agent_binary(name: &str) -> Option<(String, String)> {
     let bin_dir = std::path::Path::new(&axis_root).join("bin");
     let policies_dir = std::path::Path::new(&axis_root).join("policies").join("agents");
 
-    // Read the .cmd wrapper to extract the real binary path.
+    // Read the .cmd wrapper to extract policy path.
     let wrapper = if cfg!(windows) {
         bin_dir.join(agent_binary_name(name)).with_extension("cmd")
     } else {
         bin_dir.join(agent_binary_name(name))
     };
 
-    if let Ok(content) = std::fs::read_to_string(&wrapper) {
-        // Parse the wrapper to find the real binary and policy.
-        // Windows .cmd format: ... run --policy "POLICY" -- "BINARY" ...
-        let binary = extract_quoted_after(&content, "-- \"")
-            .or_else(|| extract_quoted_after(&content, "-- '"));
-        let policy = extract_quoted_after(&content, "--policy \"")
-            .or_else(|| extract_quoted_after(&content, "--policy '"));
+    let policy = if let Ok(content) = std::fs::read_to_string(&wrapper) {
+        extract_quoted_after(&content, "--policy \"")
+            .or_else(|| extract_quoted_after(&content, "--policy '"))
+    } else {
+        None
+    };
 
-        if let (Some(bin), Some(pol)) = (binary, policy) {
-            return Some((bin, pol));
-        }
-    }
+    // Resolve policy path, falling back to well-known locations.
+    let policy_path = policy
+        .filter(|p| std::path::Path::new(p).exists())
+        .or_else(|| {
+            let p = policies_dir.join(format!("{name}.yaml"));
+            if p.exists() { Some(p.to_string_lossy().to_string()) } else { None }
+        })?;
 
-    // Fallback: look for a well-known policy file.
-    let policy_file = policies_dir.join(format!("{name}.yaml"));
-    if !policy_file.exists() {
-        // Try common aliases.
-        let aliases = [
-            (name, format!("{name}.yaml")),
-            ("claude-code", "claude-code.yaml".to_string()),
+    // Find the real agent binary — NOT our own wrappers.
+    let binary = resolve_agent_binary(name, &bin_dir)?;
+
+    Some((binary, policy_path))
+}
+
+/// Resolve the actual executable for an agent, skipping AXIS wrappers.
+fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<String> {
+    let bin_name = agent_binary_name(name);
+
+    // Platform-specific search for the real binary.
+    if cfg!(windows) {
+        // Check well-known install locations first.
+        let candidates = [
+            // WinGet packages (resolve symlink to real exe)
+            format!("{}\\Microsoft\\WinGet\\Links\\{bin_name}.exe",
+                std::env::var("LOCALAPPDATA").unwrap_or_default()),
+            // npm-installed agents in axis tools dir
+            format!("{}\\tools\\{name}\\node_modules\\.bin\\{bin_name}.cmd",
+                std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\axis"),
+            // Scoop
+            format!("{}\\scoop\\shims\\{bin_name}.exe",
+                std::env::var("USERPROFILE").unwrap_or_default()),
         ];
-        for (agent_name, pol_name) in &aliases {
-            if *agent_name == name {
-                let p = policies_dir.join(pol_name);
-                if p.exists() {
-                    return Some((name.to_string(), p.to_string_lossy().to_string()));
+
+        for candidate in &candidates {
+            let path = std::path::Path::new(candidate);
+            if path.exists() {
+                // Resolve symlinks to get the real binary.
+                if let Ok(resolved) = std::fs::canonicalize(path) {
+                    let resolved_str = resolved.to_string_lossy().to_string();
+                    // Skip if it points back to our own wrappers.
+                    if !resolved_str.contains(&axis_bin_dir.to_string_lossy().to_string()) {
+                        return Some(resolved_str);
+                    }
                 }
+                // If canonicalize fails, use the original path.
+                return Some(candidate.clone());
+            }
+        }
+
+        // Fallback: try `where.exe` to find it on PATH (skipping our bin dir).
+        if let Ok(output) = std::process::Command::new("where.exe")
+            .arg(format!("{bin_name}.exe"))
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if !line.is_empty()
+                    && !line.contains(&axis_bin_dir.to_string_lossy().to_string())
+                {
+                    // Resolve symlinks.
+                    if let Ok(resolved) = std::fs::canonicalize(line) {
+                        return Some(resolved.to_string_lossy().to_string());
+                    }
+                    return Some(line.to_string());
+                }
+            }
+        }
+    } else {
+        // Unix: use `which` skipping our bin dir.
+        if let Ok(output) = std::process::Command::new("which")
+            .arg(bin_name)
+            .output()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty()
+                && !path.contains(&axis_bin_dir.to_string_lossy().to_string())
+            {
+                if let Ok(resolved) = std::fs::canonicalize(&path) {
+                    return Some(resolved.to_string_lossy().to_string());
+                }
+                return Some(path);
             }
         }
     }
