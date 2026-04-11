@@ -86,16 +86,20 @@ impl SandboxImpl for WindowsSandbox {
         //     cmd.env("HTTPS_PROXY", &proxy_url);
         // }
 
-        // Capture stdout/stderr for daemon/gateway streaming.
-        // NOTE: ConPTY requires CreateProcess with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
-        // which std::process::Command doesn't support. Use piped stdout for now —
-        // agents should be launched in non-interactive mode (e.g., claude -p ...).
+        // Capture output by redirecting to files in the workspace.
+        // We use files instead of pipes because std::process::Command's piped
+        // stdout doesn't work reliably when the parent runs inside a tokio runtime
+        // (the blocking read in spawn_blocking never receives data).
         if self.config.capture_output {
-            // Use null stdin — piped stdin causes some Node.js agents (Claude Code)
-            // to exit immediately. Input is sent via stream-json on stdin when needed.
+            let stdout_path = self.config.workspace_dir.join("stdout.log");
+            let stderr_path = self.config.workspace_dir.join("stderr.log");
+            let stdout_file = std::fs::File::create(&stdout_path)
+                .map_err(|e| SandboxError::SpawnFailed(format!("stdout file: {e}")))?;
+            let stderr_file = std::fs::File::create(&stderr_path)
+                .map_err(|e| SandboxError::SpawnFailed(format!("stderr file: {e}")))?;
             cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::from(stdout_file));
+            cmd.stderr(std::process::Stdio::from(stderr_file));
         }
 
         let child = cmd

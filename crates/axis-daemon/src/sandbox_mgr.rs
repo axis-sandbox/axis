@@ -208,6 +208,44 @@ impl SandboxManager {
         tracing::info!("sandbox {id}: stdout={}, stderr={}, stdin={}, pty_read={}",
             sandbox.stdout.is_some(), sandbox.stderr.is_some(),
             sandbox.stdin.is_some(), sandbox.pty_read.is_some());
+
+        // Check for file-based output (Windows uses stdout.log in workspace).
+        let stdout_log = sandbox.workspace_dir.join("stdout.log");
+        if stdout_log.exists() && sandbox.stdout.is_none() {
+            let tx = output_tx.clone();
+            let buf_clone = output_buffer.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::{BufRead, BufReader, Seek, SeekFrom};
+                let file = match std::fs::File::open(&stdout_log) {
+                    Ok(f) => f,
+                    Err(e) => { tracing::warn!("can't open stdout.log: {e}"); return; }
+                };
+                let mut reader = BufReader::new(file);
+                let mut eof_count = 0;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => {
+                            // EOF — sleep and retry (tail -f).
+                            eof_count += 1;
+                            if eof_count > 600 { break; } // Stop after 60s of no data.
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        Ok(_) => {
+                            eof_count = 0;
+                            let data = line.into_bytes();
+                            if let Ok(mut b) = buf_clone.lock() {
+                                b.push(data.clone());
+                                if b.len() > 1000 { b.drain(..500); }
+                            }
+                            if tx.send(data).is_err() { break; }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
         if let Some(pty_read) = sandbox.pty_read.take() {
             // ConPTY pipe: use a blocking thread since Windows pipe handles
             // can't be used with tokio's async file I/O.
