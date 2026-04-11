@@ -41,6 +41,7 @@ axis-sandbox = { workspace = true }
 axis-proxy = { workspace = true }
 axis-router = { workspace = true }
 axis-gpu = { workspace = true }
+axis-gateway = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

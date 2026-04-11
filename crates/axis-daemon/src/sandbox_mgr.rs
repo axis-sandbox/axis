@@ -12,7 +12,7 @@
 //! The proxy enforces OPA network policy and leak detection.
 //! The sandbox process has HTTP_PROXY/HTTPS_PROXY pointing to its proxy.
 
-use axis_core::audit::{AuditLog, TracingSink};
+use axis_core::audit::{AuditLog, AuditEvent, BroadcastSink, TracingSink};
 use axis_core::policy::Policy;
 use axis_core::types::{SandboxId, SandboxStatus};
 use axis_gpu::api_filter::GpuPolicy as GpuFilterPolicy;
@@ -49,8 +49,19 @@ pub struct SandboxManager {
 
 impl SandboxManager {
     pub fn new() -> Self {
+        Self::with_event_broadcast(None)
+    }
+
+    /// Create a SandboxManager with an optional broadcast channel for streaming
+    /// audit events to the gateway (GUI/WebSocket clients).
+    pub fn with_event_broadcast(
+        event_tx: Option<tokio::sync::broadcast::Sender<AuditEvent>>,
+    ) -> Self {
         let mut audit = AuditLog::new();
         audit.add_sink(Box::new(TracingSink));
+        if let Some(tx) = event_tx {
+            audit.add_sink(Box::new(BroadcastSink::new(tx)));
+        }
 
         let sandbox_base_dir = dirs_base();
         std::fs::create_dir_all(&sandbox_base_dir).ok();

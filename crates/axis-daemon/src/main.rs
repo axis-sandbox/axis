@@ -58,7 +58,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("axisd starting (pid={})", std::process::id());
 
-    let mut mgr = sandbox_mgr::SandboxManager::new();
+    // Create broadcast channel for streaming audit events to the gateway.
+    let (event_tx, _) = tokio::sync::broadcast::channel::<axis_core::audit::AuditEvent>(1024);
+
+    let mut mgr = sandbox_mgr::SandboxManager::with_event_broadcast(Some(event_tx.clone()));
     let socket_path = ipc::default_socket_path();
 
     tracing::info!("listening on {}", socket_path.display());
@@ -66,6 +69,16 @@ async fn main() -> Result<()> {
     // Start health check endpoint in background.
     let health_state = health::HealthState::new();
     tokio::spawn(health::serve_health(health_state.clone()));
+
+    // Start HTTP+WebSocket gateway for GUI clients.
+    let gateway_config = axis_gateway::GatewayConfig::default();
+    let gateway_state = std::sync::Arc::new(axis_gateway::GatewayState::new(event_tx));
+    let (gw_shutdown_tx, gw_shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Err(e) = axis_gateway::start_gateway(gateway_config, gateway_state, gw_shutdown_rx).await {
+            tracing::error!("gateway error: {e}");
+        }
+    });
 
     // Run IPC server with graceful shutdown on SIGTERM/SIGINT.
     tokio::select! {
@@ -78,6 +91,9 @@ async fn main() -> Result<()> {
             tracing::info!("shutdown signal received");
         }
     }
+
+    // Shutdown gateway.
+    let _ = gw_shutdown_tx.send(());
 
     // Graceful shutdown: destroy all running sandboxes.
     tracing::info!("shutting down — destroying all sandboxes");

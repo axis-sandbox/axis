@@ -162,6 +162,26 @@ impl AuditSink for TracingSink {
     }
 }
 
+/// Broadcasts audit events to a tokio broadcast channel.
+/// Used by the gateway to stream events to WebSocket clients.
+pub struct BroadcastSink {
+    tx: tokio::sync::broadcast::Sender<AuditEvent>,
+}
+
+impl BroadcastSink {
+    pub fn new(tx: tokio::sync::broadcast::Sender<AuditEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl AuditSink for BroadcastSink {
+    fn write(&self, event: &AuditEvent) -> Result<(), Box<dyn std::error::Error>> {
+        // Ignore send errors (no subscribers is not an error).
+        let _ = self.tx.send(event.clone());
+        Ok(())
+    }
+}
+
 /// Writes audit events as JSON lines to a file.
 pub struct FileSink {
     path: std::path::PathBuf,
