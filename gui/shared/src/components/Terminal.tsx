@@ -106,45 +106,8 @@ export function Terminal(props: TerminalProps) {
       term!.write("\r\n\r\n  [Connection closed]\r\n");
     };
 
-    // Input handling: collect keystrokes into a line buffer.
-    // On Enter, send as stream-json user message to Claude's stdin.
-    let inputBuffer = "";
-    let inputReady = false;
-
-    // Show prompt once we receive the first output (agent is ready).
-    function showPrompt() {
-      if (!inputReady) {
-        inputReady = true;
-      }
-      term!.write("\r\n\x1b[33m> \x1b[0m");
-    }
-
-    const disposable = term.onData((data) => {
-      if (!inputReady) return; // Ignore input until agent is ready.
-
-      if (data === "\r" || data === "\n") {
-        term!.write("\r\n");
-        if (inputBuffer.trim()) {
-          const msg = JSON.stringify({
-            type: "user",
-            message: { role: "user", content: inputBuffer.trim() },
-          }) + "\n";
-          ptyConn?.send(msg);
-          term!.write(`\x1b[2mSending to agent...\x1b[0m\r\n`);
-        }
-        inputBuffer = "";
-      } else if (data === "\x7f" || data === "\b") {
-        if (inputBuffer.length > 0) {
-          inputBuffer = inputBuffer.slice(0, -1);
-          term!.write("\b \b");
-        }
-      } else if (data >= " ") {
-        inputBuffer += data;
-        term!.write(data);
-      }
-    });
-
-    onCleanup(() => disposable.dispose());
+    // Input is not yet supported (stdin is null in one-shot mode).
+    // Interactive multi-turn requires ConPTY which is a future enhancement.
   });
 
   return (
@@ -180,8 +143,7 @@ function renderOutput(term: XTerm, text: string) {
           term.write(msg.result.replace(/\n/g, "\r\n"));
           term.write("\r\n");
         }
-        // Show prompt for next input.
-        if (onResultCallback) onResultCallback();
+        term.write("\r\n\x1b[33m[Session complete — interactive mode coming soon]\x1b[0m\r\n");
       } else if (msg.type === "content_block_delta" && msg.delta?.text) {
         // Streaming text delta.
         term.write(msg.delta.text);
