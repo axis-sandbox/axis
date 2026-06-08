@@ -694,7 +694,7 @@ async fn main() -> Result<()> {
                         axis_core::policy::NetworkMode::Proxy => {
                             let proxy_config = axis_proxy::proxy::ProxyConfig {
                                 sandbox_id,
-                                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                                bind_addr: proxy_bind_addr_for_sandbox(sandbox_id, 0, &policy),
                                 policy: policy.clone(),
                                 enable_l7: false,
                                 enable_leak_detection: true,
@@ -1052,6 +1052,22 @@ async fn send_ipc(
     }
 }
 
+fn proxy_bind_addr_for_sandbox(
+    id: axis_core::types::SandboxId,
+    proxy_port: u16,
+    policy: &axis_core::policy::Policy,
+) -> std::net::SocketAddr {
+    #[cfg(target_os = "linux")]
+    {
+        if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
+            return axis_sandbox::linux::netns::proxy_bind_addr(id, proxy_port);
+        }
+    }
+
+    let _ = id;
+    format!("127.0.0.1:{proxy_port}").parse().unwrap()
+}
+
 /// Discover common runtime directories (Node.js, Python) that may not be
 /// in PATH. Returns directories that exist and contain expected binaries.
 /// This lets npm-installed agents and Python venvs work out-of-the-box
@@ -1107,4 +1123,56 @@ fn discover_runtime_dirs() -> Vec<String> {
 #[cfg(not(windows))]
 fn discover_runtime_dirs() -> Vec<String> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axis_core::policy::{
+        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, Policy,
+        ProcessPolicy, SshPolicy,
+    };
+    use axis_core::types::SandboxId;
+    use std::str::FromStr;
+
+    #[test]
+    fn standalone_proxy_mode_uses_linux_netns_bind_addr_for_ephemeral_port() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let policy = test_policy(NetworkMode::Proxy);
+        let bind_addr = proxy_bind_addr_for_sandbox(id, 0, &policy);
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(bind_addr, axis_sandbox::linux::netns::proxy_bind_addr(id, 0));
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(bind_addr, "127.0.0.1:0".parse().unwrap());
+    }
+
+    #[test]
+    fn standalone_non_proxy_modes_keep_loopback_bind_addr() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let policy = test_policy(NetworkMode::Block);
+
+        assert_eq!(
+            proxy_bind_addr_for_sandbox(id, 0, &policy),
+            "127.0.0.1:0".parse().unwrap()
+        );
+    }
+
+    fn test_policy(network_mode: NetworkMode) -> Policy {
+        Policy {
+            version: 1,
+            name: "test-policy".into(),
+            filesystem: FilesystemPolicy::default(),
+            process: ProcessPolicy::default(),
+            network: NetworkPolicy {
+                mode: network_mode,
+                policies: Vec::new(),
+            },
+            inference: InferencePolicy::default(),
+            gpu: GpuPolicy::default(),
+            ssh: SshPolicy::default(),
+            amd: None,
+        }
+    }
 }

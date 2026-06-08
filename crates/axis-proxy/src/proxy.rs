@@ -16,9 +16,13 @@ use axis_core::policy::Policy;
 use axis_core::types::{NetworkAction, SandboxId};
 use axis_safety::leak_detect::LeakDetector;
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::net::TcpListener;
+#[cfg(target_os = "linux")]
+use tokio::net::TcpSocket;
 
 use crate::identity::TofuStore;
 
@@ -106,9 +110,7 @@ impl AxisProxy {
 
     /// Start listening for proxy connections.
     pub async fn bind(&mut self) -> Result<SocketAddr, ProxyError> {
-        let listener = TcpListener::bind(self.config.bind_addr)
-            .await
-            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+        let listener = bind_proxy_listener(self.config.bind_addr).await?;
 
         let addr = listener.local_addr()?;
         tracing::info!(
@@ -143,6 +145,65 @@ impl AxisProxy {
                 }
             });
         }
+    }
+}
+
+async fn bind_proxy_listener(bind_addr: SocketAddr) -> Result<TcpListener, ProxyError> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux_proxy_bind_requires_freebind(bind_addr) {
+            return bind_linux_freebind_listener(bind_addr);
+        }
+    }
+
+    TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| ProxyError::BindFailed(e.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proxy_bind_requires_freebind(bind_addr: SocketAddr) -> bool {
+    match bind_addr.ip() {
+        std::net::IpAddr::V4(addr) => !addr.is_loopback() && !addr.is_unspecified(),
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_linux_freebind_listener(bind_addr: SocketAddr) -> Result<TcpListener, ProxyError> {
+    let socket = match bind_addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+    socket
+        .set_reuseaddr(true)
+        .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+    set_ip_freebind(socket.as_raw_fd()).map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+    socket
+        .bind(bind_addr)
+        .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+    socket
+        .listen(1024)
+        .map_err(|e| ProxyError::BindFailed(e.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn set_ip_freebind(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_FREEBIND,
+            &enabled as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -561,6 +622,23 @@ mod tests {
     #[test]
     fn parse_connect_invalid() {
         assert!(parse_connect_target("GET / HTTP/1.1\r\n").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_freebind_is_used_only_for_nonlocal_ipv4_binds() {
+        assert!(linux_proxy_bind_requires_freebind(
+            "10.200.0.1:3128".parse().unwrap()
+        ));
+        assert!(!linux_proxy_bind_requires_freebind(
+            "127.0.0.1:3128".parse().unwrap()
+        ));
+        assert!(!linux_proxy_bind_requires_freebind(
+            "0.0.0.0:3128".parse().unwrap()
+        ));
+        assert!(!linux_proxy_bind_requires_freebind(
+            "[::1]:3128".parse().unwrap()
+        ));
     }
 
     #[test]

@@ -13,6 +13,23 @@ use std::io;
 use std::process::Child;
 
 const CLOSED_FD: i32 = -1;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const LINUX_CAPABILITY_U32S_3: usize = 2;
+const CAP_LAST_CAP: i32 = 40;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
 
 #[derive(Debug, Clone)]
 struct ResolvedIdentity {
@@ -29,8 +46,9 @@ enum ChildSetupErrorKind {
     SetGroups = 5,
     SetGid = 6,
     SetUid = 7,
-    CloseFileDescriptors = 8,
-    Seccomp = 9,
+    DropCapabilities = 8,
+    CloseFileDescriptors = 9,
+    Seccomp = 10,
 }
 
 impl ChildSetupErrorKind {
@@ -43,6 +61,7 @@ impl ChildSetupErrorKind {
             Self::SetGroups => "clear supplementary groups",
             Self::SetGid => "drop group id",
             Self::SetUid => "drop user id",
+            Self::DropCapabilities => "drop capabilities",
             Self::CloseFileDescriptors => "close inherited file descriptors",
             Self::Seccomp => "apply seccomp",
         }
@@ -57,8 +76,9 @@ impl ChildSetupErrorKind {
             5 => Some(Self::SetGroups),
             6 => Some(Self::SetGid),
             7 => Some(Self::SetUid),
-            8 => Some(Self::CloseFileDescriptors),
-            9 => Some(Self::Seccomp),
+            8 => Some(Self::DropCapabilities),
+            9 => Some(Self::CloseFileDescriptors),
+            10 => Some(Self::Seccomp),
             _ => None,
         }
     }
@@ -147,19 +167,35 @@ impl LinuxSandbox {
         })
     }
 
-    fn cleanup_netns(&mut self) {
-        self.cleanup_netns_with(netns::destroy_netns);
+    fn cleanup_netns(&mut self) -> Option<String> {
+        self.cleanup_netns_with(netns::destroy_netns)
     }
 
-    fn cleanup_netns_with<F>(&mut self, destroy: F)
+    fn cleanup_netns_with<F>(&mut self, destroy: F) -> Option<String>
     where
         F: FnOnce(&str) -> Result<(), String>,
     {
-        if let Some(ns_name) = self.netns_name.take() {
+        if let Some(ns_name) = self.netns_name.clone() {
             if let Err(e) = destroy(&ns_name) {
                 tracing::warn!("failed to destroy netns '{ns_name}': {e}");
+                return Some(format!("netns '{ns_name}': {e}"));
             }
+            self.netns_name = None;
         }
+        None
+    }
+
+    fn cleanup_after_process_exit(&mut self) -> Option<String> {
+        self.cleanup_after_process_exit_with(netns::destroy_netns)
+    }
+
+    fn cleanup_after_process_exit_with<F>(&mut self, destroy: F) -> Option<String>
+    where
+        F: FnOnce(&str) -> Result<(), String>,
+    {
+        let netns_cleanup_error = self.cleanup_netns_with(destroy);
+        self.cleanup_tmpdir_after_stop();
+        netns_cleanup_error
     }
 
     fn cleanup_parent_resources_after_setup_failure(
@@ -178,8 +214,18 @@ impl LinuxSandbox {
         F: FnOnce(&str) -> Result<(), String>,
     {
         close_fd(netns_fd);
-        self.cleanup_netns_with(destroy);
-        self.cleanup_tmpdir_for_setup_failure()
+        let mut cleanup_errors = Vec::new();
+        if let Some(e) = self.cleanup_netns_with(destroy) {
+            cleanup_errors.push(format!("netns cleanup failed: {e}"));
+        }
+        if let Some(e) = self.cleanup_tmpdir_for_setup_failure() {
+            cleanup_errors.push(format!("tmpdir cleanup failed: {e}"));
+        }
+        if cleanup_errors.is_empty() {
+            None
+        } else {
+            Some(cleanup_errors.join("; "))
+        }
     }
 
     fn cleanup_tmpdir_after_stop(&mut self) {
@@ -260,10 +306,10 @@ fn append_cleanup_failure(error: SandboxError, cleanup_error: Option<String>) ->
     };
     match error {
         SandboxError::IsolationFailed(message) => SandboxError::IsolationFailed(format!(
-            "{message}; tmpdir cleanup failed: {cleanup_error}"
+            "{message}; cleanup failed: {cleanup_error}"
         )),
         SandboxError::SpawnFailed(message) => {
-            SandboxError::SpawnFailed(format!("{message}; tmpdir cleanup failed: {cleanup_error}"))
+            SandboxError::SpawnFailed(format!("{message}; cleanup failed: {cleanup_error}"))
         }
         other => other,
     }
@@ -307,6 +353,74 @@ fn close_child_fd_range(first: u32, last: u32, flags: libc::c_uint) -> Result<()
 fn mark_unexpected_child_fds_close_on_exec() -> Result<(), i32> {
     let (first, last, flags) = child_fd_close_on_exec_range();
     close_child_fd_range(first, last, flags)
+}
+
+fn empty_capability_data() -> [CapData; LINUX_CAPABILITY_U32S_3] {
+    [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; LINUX_CAPABILITY_U32S_3]
+}
+
+fn clear_ambient_capabilities() -> Result<(), i32> {
+    let ret = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    };
+    if ret < 0 {
+        Err(current_errno())
+    } else {
+        Ok(())
+    }
+}
+
+fn drop_capability_bounding_set() -> Result<(), i32> {
+    for cap in 0..=CAP_LAST_CAP {
+        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+        if ret < 0 {
+            match current_errno() {
+                // Some kernels expose fewer capabilities than CAP_LAST_CAP.
+                libc::EINVAL => continue,
+                // Non-privileged callers cannot edit the bounding set. Clearing
+                // the process sets below is still mandatory and fail-closed.
+                libc::EPERM => continue,
+                errno => return Err(errno),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_process_capability_sets() -> Result<(), i32> {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = empty_capability_data();
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut CapHeader,
+            data.as_ptr(),
+        )
+    };
+    if ret < 0 {
+        Err(current_errno())
+    } else {
+        Ok(())
+    }
+}
+
+fn drop_process_capabilities() -> Result<(), i32> {
+    clear_ambient_capabilities()?;
+    drop_capability_bounding_set()?;
+    clear_process_capability_sets()
 }
 
 fn current_errno() -> i32 {
@@ -353,17 +467,15 @@ impl SandboxImpl for LinuxSandbox {
                 proxy_port,
                 ..
             } => {
-                let ns_name = format!("{sandbox_id}");
-                match netns::create_netns(&ns_name, *proxy_port) {
+                match netns::create_netns(sandbox_id, *proxy_port) {
                     Ok(name) => {
                         self.netns_name = Some(name.clone());
                         // Open the netns fd for the child to setns() into.
                         match netns::enter_netns(&name) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                let _ = netns::destroy_netns(&name);
-                                self.netns_name = None;
-                                let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                                let cleanup_error =
+                                    self.cleanup_parent_resources_after_setup_failure(None);
                                 return Err(append_cleanup_failure(
                                     SandboxError::IsolationFailed(format!(
                                         "netns: cannot open fd for '{name}': {e}"
@@ -526,7 +638,17 @@ impl SandboxImpl for LinuxSandbox {
                     }
                 }
 
-                // 6. Prevent inherited descriptors from surviving a successful exec.
+                // 6. Drop Linux capabilities before exec so a privileged parent
+                // cannot leave CAP_NET_ADMIN inside the sandbox netns.
+                if let Err(errno) = drop_process_capabilities() {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::DropCapabilities,
+                        errno,
+                    ));
+                }
+
+                // 7. Prevent inherited descriptors from surviving a successful exec.
                 if let Err(errno) = mark_unexpected_child_fds_close_on_exec() {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -535,7 +657,7 @@ impl SandboxImpl for LinuxSandbox {
                     ));
                 }
 
-                // 7. seccomp-BPF syscall filter (must be last — it restricts further syscalls).
+                // 8. seccomp-BPF syscall filter (must be last — it restricts further syscalls).
                 if let Err(e) = prepared_seccomp.apply_current_process() {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -576,6 +698,13 @@ impl SandboxImpl for LinuxSandbox {
     {
         Box::pin(async {
             if let Some(code) = self.exit_code {
+                if self.netns_name.is_some() {
+                    if let Some(e) = self.cleanup_after_process_exit() {
+                        return Err(SandboxError::IsolationFailed(format!(
+                            "netns cleanup failed: {e}"
+                        )));
+                    }
+                }
                 return Ok(code);
             }
 
@@ -589,7 +718,11 @@ impl SandboxImpl for LinuxSandbox {
             let code = status.code().unwrap_or(-1);
             self.exit_code = Some(code);
             kill_process_group(pid);
-            self.cleanup_tmpdir_after_stop();
+            if let Some(e) = self.cleanup_after_process_exit() {
+                return Err(SandboxError::IsolationFailed(format!(
+                    "netns cleanup failed: {e}"
+                )));
+            }
             Ok(code)
         })
     }
@@ -610,8 +743,14 @@ impl SandboxImpl for LinuxSandbox {
             kill_process_group(pid);
         }
 
-        self.cleanup_netns();
+        let netns_cleanup_error = self.cleanup_netns();
         self.cleanup_tmpdir_after_stop();
+
+        if let Some(e) = netns_cleanup_error {
+            return Err(SandboxError::IsolationFailed(format!(
+                "netns cleanup failed: {e}"
+            )));
+        }
 
         tracing::info!("sandbox {} destroyed", self.config.id);
         Ok(())
@@ -701,6 +840,50 @@ mod tests {
             child_fd_close_on_exec_range(),
             (3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC)
         );
+    }
+
+    #[test]
+    fn empty_capability_data_has_no_capabilities() {
+        for data in empty_capability_data() {
+            assert_eq!(data.effective, 0);
+            assert_eq!(data.permitted, 0);
+            assert_eq!(data.inheritable, 0);
+        }
+    }
+
+    #[test]
+    fn capability_drop_clears_effective_caps_for_exec_target() {
+        if !Path::new("/bin/sh").exists() || !Path::new("/proc/self/status").exists() {
+            eprintln!("/bin/sh or /proc unavailable (test skipped)");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let marker_path = workspace.path().join("cap-status");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(
+                "grep -E '^(CapInh|CapPrm|CapEff|CapAmb):' /proc/self/status > \"$AXIS_CAP_MARKER\"",
+            )
+            .env("AXIS_CAP_MARKER", &marker_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| drop_process_capabilities().map_err(io::Error::from_raw_os_error));
+        }
+
+        let status = cmd.status().unwrap();
+        let cap_status = std::fs::read_to_string(marker_path).unwrap_or_default();
+
+        assert!(status.success(), "capability status command failed");
+        for label in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+            let expected = format!("{label}:\t0000000000000000");
+            assert!(
+                cap_status.contains(&expected),
+                "unexpected capability status: {cap_status}"
+            );
+        }
     }
 
     #[test]
@@ -821,19 +1004,30 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_netns_takes_name_after_destroy_attempt() {
+    fn cleanup_netns_preserves_name_until_destroy_succeeds() {
         let workspace = tempfile::tempdir().unwrap();
         let id = SandboxId::new();
         let mut sandbox = test_sandbox(id, workspace.path(), None);
         sandbox.netns_name = Some("axis-test-cleanup".into());
 
-        sandbox.cleanup_netns_with(|name| {
+        let cleanup_error = sandbox.cleanup_netns_with(|name| {
             assert_eq!(name, "axis-test-cleanup");
             Err("expected fake cleanup failure".into())
         });
 
+        let cleanup_error = cleanup_error.expect("netns cleanup failure should be returned");
+        assert!(cleanup_error.contains("expected fake cleanup failure"));
+        assert_eq!(sandbox.netns_name.as_deref(), Some("axis-test-cleanup"));
+        assert!(sandbox
+            .cleanup_netns_with(|name| {
+                assert_eq!(name, "axis-test-cleanup");
+                Ok(())
+            })
+            .is_none());
         assert!(sandbox.netns_name.is_none());
-        sandbox.cleanup_netns_with(|_| panic!("cleanup must be idempotent"));
+        assert!(sandbox
+            .cleanup_netns_with(|_| panic!("cleanup must be idempotent"))
+            .is_none());
     }
 
     #[test]
@@ -899,6 +1093,65 @@ mod tests {
         unsafe {
             libc::close(fds[1]);
         }
+    }
+
+    #[test]
+    fn setup_failure_cleanup_surfaces_netns_cleanup_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.netns_name = Some("axis-test-cleanup".into());
+
+        let cleanup_error = sandbox.cleanup_parent_resources_after_setup_failure_with(None, |name| {
+            assert_eq!(name, "axis-test-cleanup");
+            Err("expected fake netns cleanup failure".into())
+        });
+
+        let cleanup_error = cleanup_error.expect("netns cleanup failure should be returned");
+        assert!(cleanup_error.contains("netns cleanup failed"));
+        assert!(cleanup_error.contains("expected fake netns cleanup failure"));
+        assert_eq!(sandbox.netns_name.as_deref(), Some("axis-test-cleanup"));
+    }
+
+    #[test]
+    fn process_exit_cleanup_removes_netns_and_tmpdir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.netns_name = Some("axis-test-cleanup".into());
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        sandbox.tmpdir_active = true;
+
+        let cleanup_error = sandbox.cleanup_after_process_exit_with(|name| {
+            assert_eq!(name, "axis-test-cleanup");
+            Ok(())
+        });
+
+        assert!(cleanup_error.is_none());
+        assert!(sandbox.netns_name.is_none());
+        assert!(!tmpdir.exists());
+    }
+
+    #[test]
+    fn process_exit_cleanup_preserves_netns_name_when_cleanup_fails() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.netns_name = Some("axis-test-cleanup".into());
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        sandbox.tmpdir_active = true;
+
+        let cleanup_error = sandbox.cleanup_after_process_exit_with(|name| {
+            assert_eq!(name, "axis-test-cleanup");
+            Err("expected fake netns cleanup failure".into())
+        });
+
+        let cleanup_error = cleanup_error.expect("netns cleanup failure should be returned");
+        assert!(cleanup_error.contains("expected fake netns cleanup failure"));
+        assert_eq!(sandbox.netns_name.as_deref(), Some("axis-test-cleanup"));
+        assert!(!tmpdir.exists());
     }
 
     #[test]

@@ -170,7 +170,7 @@ async fn handle_request(mgr: &SharedManager, req: IpcRequest) -> IpcResponse {
         } => match uuid::Uuid::parse_str(&sandbox_id) {
             Ok(uuid) => {
                 let id = axis_core::types::SandboxId(uuid);
-                let mgr = mgr.lock().await;
+                let mut mgr = mgr.lock().await;
                 match mgr.exec_in_sandbox(&id, command, args).await {
                     Ok(exit_code) => IpcResponse {
                         success: true,

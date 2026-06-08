@@ -107,48 +107,10 @@ impl SandboxManager {
         let inference_endpoint = self.ensure_inference_server(&policy).await;
 
         // 2. Start the proxy only for proxy-mode policies.
-        let (proxy_addr, proxy_shutdown) = if policy_uses_proxy(&policy) {
-            let proxy_port = allocate_port();
-            let bind_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
+        let (proxy_addr, proxy_shutdown) =
+            start_proxy_for_sandbox(id, &policy, inference_endpoint).await?;
 
-            let proxy_config = ProxyConfig {
-                sandbox_id: id,
-                bind_addr,
-                policy: policy.clone(),
-                enable_l7: false,
-                enable_leak_detection: true,
-                inference_endpoint,
-            };
-
-            let mut proxy = AxisProxy::new(proxy_config).map_err(|e| format!("proxy init: {e}"))?;
-            let proxy_addr = proxy.bind().await.map_err(|e| format!("proxy bind: {e}"))?;
-
-            tracing::info!("sandbox {id}: proxy on {proxy_addr}");
-
-            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            tokio::spawn(async move {
-                tokio::select! {
-                    result = proxy.run() => {
-                        if let Err(e) = result {
-                            tracing::error!("proxy for sandbox exited: {e}");
-                        }
-                    }
-                    _ = &mut shutdown_rx => {
-                        tracing::info!("proxy shutdown signal received");
-                    }
-                }
-            });
-
-            (Some(proxy_addr), Some(shutdown_tx))
-        } else {
-            tracing::info!(
-                "sandbox {id}: network proxy disabled for {:?} mode",
-                policy.network.mode
-            );
-            (None, None)
-        };
-
-        // 2. Optionally start a GPU worker.
+        // 3. Optionally start a GPU worker.
         let mut extra_env: Vec<(String, String)> = Vec::new();
 
         if gpu_enabled {
@@ -188,7 +150,7 @@ impl SandboxManager {
             }
         }
 
-        // 3. Create and start the sandbox process.
+        // 4. Create and start the sandbox process.
         let mut all_env = env;
         all_env.extend(extra_env);
 
@@ -216,7 +178,11 @@ impl SandboxManager {
             }
         };
         if let Err(e) = sandbox.start() {
+            let cleanup_error = sandbox.destroy().err();
             shutdown_proxy(proxy_shutdown);
+            if let Some(cleanup_error) = cleanup_error {
+                return Err(format!("sandbox start: {e}; cleanup: {cleanup_error}"));
+            }
             return Err(format!("sandbox start: {e}"));
         }
 
@@ -471,18 +437,35 @@ impl SandboxManager {
     /// as the original sandbox process. On Linux, it inherits the sandbox's
     /// Landlock and seccomp restrictions via a fresh pre_exec application.
     pub async fn exec_in_sandbox(
-        &self,
+        &mut self,
         id: &SandboxId,
         command: String,
         args: Vec<String>,
     ) -> Result<i32, String> {
-        let managed = self
-            .sandboxes
-            .get(id)
-            .ok_or_else(|| format!("sandbox not found: {id}"))?;
-
-        let workspace = managed.sandbox.workspace_dir.clone();
-        let config = contained_exec_config(managed, command.clone(), args.clone());
+        let (policy, workspace, env) = {
+            let managed = self
+                .sandboxes
+                .get(id)
+                .ok_or_else(|| format!("sandbox not found: {id}"))?;
+            (
+                managed.policy.clone(),
+                managed.sandbox.workspace_dir.clone(),
+                managed.env.clone(),
+            )
+        };
+        let exec_id = SandboxId::new();
+        let inference_endpoint = self.ensure_inference_server(&policy).await;
+        let (exec_proxy_addr, mut exec_proxy_shutdown) =
+            start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
+        let config = contained_exec_config_from(
+            &policy,
+            &workspace,
+            &env,
+            exec_id,
+            exec_proxy_addr,
+            command.clone(),
+            args.clone(),
+        );
         let exec_workspace = config.workspace_dir.clone();
 
         tracing::info!("sandbox {id}: exec '{command}' in {}", workspace.display());
@@ -490,12 +473,14 @@ impl SandboxManager {
         let mut exec_sandbox = match Sandbox::create_for_exec(config) {
             Ok(sandbox) => sandbox,
             Err(e) => {
+                shutdown_proxy(exec_proxy_shutdown.take());
                 cleanup_contained_exec_workspace(&exec_workspace);
                 return Err(format!("exec sandbox create: {e}"));
             }
         };
         if let Err(e) = exec_sandbox.start() {
             let _ = exec_sandbox.destroy();
+            shutdown_proxy(exec_proxy_shutdown.take());
             cleanup_contained_exec_workspace(&exec_workspace);
             return Err(format!("exec sandbox start: {e}"));
         }
@@ -503,14 +488,17 @@ impl SandboxManager {
             Ok(code) => code,
             Err(e) => {
                 let _ = exec_sandbox.destroy();
+                shutdown_proxy(exec_proxy_shutdown.take());
                 cleanup_contained_exec_workspace(&exec_workspace);
                 return Err(format!("exec sandbox wait: {e}"));
             }
         };
         if let Err(e) = exec_sandbox.destroy() {
+            shutdown_proxy(exec_proxy_shutdown.take());
             cleanup_contained_exec_workspace(&exec_workspace);
             return Err(format!("exec sandbox cleanup: {e}"));
         }
+        shutdown_proxy(exec_proxy_shutdown.take());
         cleanup_contained_exec_workspace(&exec_workspace);
 
         tracing::info!("sandbox {id}: exec '{command}' exited with code {code}");
@@ -524,16 +512,17 @@ impl SandboxManager {
             .get_mut(id)
             .ok_or_else(|| format!("sandbox not found: {id}"))?;
 
-        managed.sandbox.destroy().map_err(|e| e.to_string())?;
-
-        if let Some(tx) = managed.proxy_shutdown.take() {
-            let _ = tx.send(());
-        }
+        let sandbox_cleanup = managed.sandbox.destroy().map_err(|e| e.to_string());
+        shutdown_proxy(managed.proxy_shutdown.take());
 
         if managed.gpu_enabled {
             if let Err(e) = self.gpu_manager.stop_worker(id) {
                 tracing::warn!("sandbox {id}: GPU worker cleanup: {e}");
             }
+        }
+
+        if let Err(e) = sandbox_cleanup {
+            return Err(e);
         }
 
         self.audit.sandbox_destroyed(*id);
@@ -674,6 +663,64 @@ fn policy_uses_proxy(policy: &Policy) -> bool {
     matches!(policy.network.mode, NetworkMode::Proxy)
 }
 
+async fn start_proxy_for_sandbox(
+    id: SandboxId,
+    policy: &Policy,
+    inference_endpoint: Option<SocketAddr>,
+) -> Result<(Option<SocketAddr>, Option<tokio::sync::oneshot::Sender<()>>), String> {
+    if !policy_uses_proxy(policy) {
+        tracing::info!(
+            "sandbox {id}: network proxy disabled for {:?} mode",
+            policy.network.mode
+        );
+        return Ok((None, None));
+    }
+
+    let proxy_port = allocate_port();
+    let bind_addr = proxy_bind_addr_for_sandbox(id, proxy_port, policy);
+    let proxy_config = ProxyConfig {
+        sandbox_id: id,
+        bind_addr,
+        policy: policy.clone(),
+        enable_l7: false,
+        enable_leak_detection: true,
+        inference_endpoint,
+    };
+
+    let mut proxy = AxisProxy::new(proxy_config).map_err(|e| format!("proxy init: {e}"))?;
+    let proxy_addr = proxy.bind().await.map_err(|e| format!("proxy bind: {e}"))?;
+
+    tracing::info!("sandbox {id}: proxy on {proxy_addr}");
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        tokio::select! {
+            result = proxy.run() => {
+                if let Err(e) = result {
+                    tracing::error!("proxy for sandbox exited: {e}");
+                }
+            }
+            _ = &mut shutdown_rx => {
+                tracing::info!("proxy shutdown signal received");
+            }
+        }
+    });
+
+    Ok((Some(proxy_addr), Some(shutdown_tx)))
+}
+
+fn proxy_bind_addr_for_sandbox(id: SandboxId, proxy_port: u16, policy: &Policy) -> SocketAddr {
+    #[cfg(target_os = "linux")]
+    {
+        if policy_uses_proxy(policy) {
+            return axis_sandbox::linux::netns::proxy_bind_addr(id, proxy_port);
+        }
+    }
+
+    let _ = id;
+    format!("127.0.0.1:{proxy_port}").parse().unwrap()
+}
+
 fn shutdown_proxy(tx: Option<tokio::sync::oneshot::Sender<()>>) {
     if let Some(tx) = tx {
         let _ = tx.send(());
@@ -684,37 +731,22 @@ fn apply_proxy_env(cmd: &mut std::process::Command, proxy_addr: Option<SocketAdd
     let Some(proxy_addr) = proxy_addr else {
         return;
     };
-    let proxy_url = format!("http://127.0.0.1:{}", proxy_addr.port());
+    let proxy_url = format!("http://{proxy_addr}");
     cmd.env("HTTP_PROXY", &proxy_url)
         .env("HTTPS_PROXY", &proxy_url)
         .env("http_proxy", &proxy_url)
         .env("https_proxy", &proxy_url);
 }
 
-fn contained_exec_config(
-    managed: &ManagedSandbox,
-    command: String,
-    args: Vec<String>,
-) -> SandboxConfig {
-    contained_exec_config_from(
-        &managed.policy,
-        &managed.sandbox.workspace_dir,
-        &managed.env,
-        managed.proxy_addr,
-        command,
-        args,
-    )
-}
-
 fn contained_exec_config_from(
     policy: &Policy,
     workspace_dir: &Path,
     env: &[(String, String)],
+    exec_id: SandboxId,
     proxy_addr: Option<SocketAddr>,
     command: String,
     args: Vec<String>,
 ) -> SandboxConfig {
-    let exec_id = SandboxId::new();
     let exec_workspace = contained_exec_workspace_dir(workspace_dir, exec_id);
     let mut policy = policy.clone();
     let workspace_policy_path = workspace_dir.to_string_lossy().into_owned();
@@ -940,6 +972,7 @@ mod tests {
     use axis_core::policy::{
         FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkPolicy, ProcessPolicy, SshPolicy,
     };
+    use std::str::FromStr;
 
     #[test]
     fn block_mode_does_not_use_daemon_proxy() {
@@ -953,6 +986,33 @@ mod tests {
         let policy = test_policy(NetworkMode::Proxy);
 
         assert!(policy_uses_proxy(&policy));
+    }
+
+    #[test]
+    fn proxy_mode_uses_linux_netns_bind_addr() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let policy = test_policy(NetworkMode::Proxy);
+        let bind_addr = proxy_bind_addr_for_sandbox(id, 3128, &policy);
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            bind_addr,
+            axis_sandbox::linux::netns::proxy_bind_addr(id, 3128)
+        );
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(bind_addr, "127.0.0.1:3128".parse().unwrap());
+    }
+
+    #[test]
+    fn non_proxy_modes_keep_loopback_bind_addr() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let policy = test_policy(NetworkMode::Block);
+
+        assert_eq!(
+            proxy_bind_addr_for_sandbox(id, 3128, &policy),
+            "127.0.0.1:3128".parse().unwrap()
+        );
     }
 
     #[test]
@@ -970,7 +1030,7 @@ mod tests {
     #[test]
     fn apply_proxy_env_sets_proxy_vars_when_proxy_addr_exists() {
         let mut cmd = std::process::Command::new("true");
-        let proxy_addr: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let proxy_addr: SocketAddr = "10.200.0.1:3128".parse().unwrap();
 
         apply_proxy_env(&mut cmd, Some(proxy_addr));
 
@@ -988,7 +1048,7 @@ mod tests {
                 envs.iter()
                     .find(|(env_key, _)| env_key == key)
                     .and_then(|(_, value)| value.as_deref()),
-                Some("http://127.0.0.1:3128")
+                Some("http://10.200.0.1:3128")
             );
         }
     }
@@ -997,16 +1057,19 @@ mod tests {
     fn contained_exec_config_for_block_mode_omits_proxy_state() {
         let workspace = std::env::temp_dir().join("axis-daemon-block-exec-test");
         let policy = test_policy(NetworkMode::Block);
+        let exec_id = SandboxId::from_str("00000000-0000-4000-8000-000000000101").unwrap();
 
         let config = contained_exec_config_from(
             &policy,
             &workspace,
             &[("PATH".into(), "/bin".into())],
+            exec_id,
             None,
             "true".into(),
             Vec::new(),
         );
 
+        assert_eq!(config.id, exec_id);
         assert!(matches!(config.policy.network.mode, NetworkMode::Block));
         assert_eq!(config.proxy_port, 0);
         assert!(config.proxy_addr.is_none());
@@ -1031,20 +1094,28 @@ mod tests {
     fn contained_exec_config_for_proxy_mode_retains_proxy_state() {
         let workspace = std::env::temp_dir().join("axis-daemon-proxy-exec-test");
         let policy = test_policy(NetworkMode::Proxy);
-        let proxy_addr: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let exec_id = SandboxId::from_str("00000000-0000-4000-8000-000000000102").unwrap();
+        let proxy_addr = proxy_bind_addr_for_sandbox(exec_id, 3128, &policy);
 
         let config = contained_exec_config_from(
             &policy,
             &workspace,
             &[("PATH".into(), "/bin".into())],
+            exec_id,
             Some(proxy_addr),
             "true".into(),
             Vec::new(),
         );
 
+        assert_eq!(config.id, exec_id);
         assert!(matches!(config.policy.network.mode, NetworkMode::Proxy));
         assert_eq!(config.proxy_port, 3128);
         assert_eq!(config.proxy_addr, Some(proxy_addr));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            config.proxy_addr,
+            Some(axis_sandbox::linux::netns::proxy_bind_addr(exec_id, 3128))
+        );
         assert_eq!(config.working_dir.as_deref(), Some(workspace.as_path()));
         assert_ne!(config.workspace_dir, workspace);
         assert!(
@@ -1063,9 +1134,17 @@ mod tests {
             .filesystem
             .read_write
             .push(workspace_policy_path.clone());
+        let exec_id = SandboxId::from_str("00000000-0000-4000-8000-000000000103").unwrap();
 
-        let config =
-            contained_exec_config_from(&policy, &workspace, &[], None, "true".into(), Vec::new());
+        let config = contained_exec_config_from(
+            &policy,
+            &workspace,
+            &[],
+            exec_id,
+            None,
+            "true".into(),
+            Vec::new(),
+        );
 
         assert_eq!(
             config

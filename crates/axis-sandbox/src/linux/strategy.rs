@@ -11,12 +11,10 @@ use crate::sandbox::SandboxConfig;
 use axis_core::policy::{NetworkMode, Policy, ProcessPolicy};
 use axis_core::types::SandboxId;
 use std::ffi::CString;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-const HOST_VETH_ADDR: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
-const SANDBOX_VETH_ADDR: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 2);
 const CAP_NET_ADMIN_BIT: u32 = 12;
 const SECCOMP_GET_ACTION_AVAIL: libc::c_long = 2;
 
@@ -233,7 +231,7 @@ pub(crate) fn plan_with_probe(
     let identity = plan_identity(&policy.process)?;
     let filesystem = plan_filesystem(policy, &caps)?;
     let seccomp = plan_seccomp(&caps)?;
-    let (network, proxy) = plan_network(policy, proxy_port, proxy_addr, &caps)?;
+    let (network, proxy) = plan_network(policy, sandbox_id, proxy_port, proxy_addr, &caps)?;
     let resources = plan_resources(&policy.process, &caps, &mut fallbacks)?;
 
     Ok(LinuxIsolationPlan {
@@ -292,6 +290,7 @@ fn plan_seccomp(caps: &CapabilitySnapshot) -> Result<SeccompStrategy, StrategyEr
 
 fn plan_network(
     policy: &Policy,
+    sandbox_id: SandboxId,
     proxy_port: u16,
     proxy_addr: Option<SocketAddr>,
     caps: &CapabilitySnapshot,
@@ -306,11 +305,12 @@ fn plan_network(
             Ok((NetworkStrategy::AllowHost, ProxyStrategy::None))
         }
         NetworkMode::Proxy => {
-            let proxy_addr = validate_proxy_bind(proxy_port, proxy_addr)?;
+            let proxy_addr = validate_proxy_bind(sandbox_id, proxy_port, proxy_addr)?;
 
             let firewall = selected_firewall(caps);
             if caps.cap_net_admin && caps.ip && firewall.is_some() {
                 return Ok(proxy_plan(
+                    sandbox_id,
                     ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
                     firewall,
                     proxy_addr,
@@ -354,6 +354,7 @@ fn plan_network(
 }
 
 fn validate_proxy_bind(
+    sandbox_id: SandboxId,
     proxy_port: u16,
     proxy_addr: Option<SocketAddr>,
 ) -> Result<SocketAddr, StrategyError> {
@@ -374,12 +375,11 @@ fn validate_proxy_bind(
         ));
     }
 
-    if proxy_addr.ip() != IpAddr::V4(HOST_VETH_ADDR) {
+    let expected = super::netns::proxy_bind_addr(sandbox_id, proxy_port);
+    if proxy_addr != expected {
         return Err(StrategyError::new(
             "network",
-            format!(
-                "proxy mode requires proxy bind address {HOST_VETH_ADDR}:{proxy_port}, got {proxy_addr}"
-            ),
+            format!("proxy mode requires proxy bind address {expected}, got {proxy_addr}"),
         ));
     }
 
@@ -409,22 +409,24 @@ fn selected_firewall(caps: &CapabilitySnapshot) -> Option<FirewallTool> {
 }
 
 fn proxy_plan(
+    sandbox_id: SandboxId,
     setup: ProxyNetworkSetup,
     firewall: Option<FirewallTool>,
     proxy_addr: SocketAddr,
 ) -> (NetworkStrategy, ProxyStrategy) {
     let proxy_port = proxy_addr.port();
+    let allocation = super::netns::proxy_netns_allocation(sandbox_id, proxy_port);
     (
         NetworkStrategy::Proxy {
             setup,
             firewall,
-            host_addr: HOST_VETH_ADDR,
-            sandbox_addr: SANDBOX_VETH_ADDR,
+            host_addr: allocation.host_addr,
+            sandbox_addr: allocation.sandbox_addr,
             proxy_port,
         },
         ProxyStrategy::Required {
-            bind_addr: HOST_VETH_ADDR,
-            sandbox_addr: HOST_VETH_ADDR,
+            bind_addr: allocation.host_addr,
+            sandbox_addr: allocation.host_addr,
             port: proxy_port,
         },
     )
@@ -587,10 +589,12 @@ fn cap_eff_contains(cap_eff: u64, bit: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux::netns;
     use axis_core::policy::{
         Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkPolicy,
         SshPolicy,
     };
+    use std::str::FromStr;
 
     struct FakeProbe {
         snapshot: CapabilitySnapshot,
@@ -644,22 +648,27 @@ mod tests {
 
     fn plan(policy: &Policy, caps: CapabilitySnapshot, proxy_port: u16) -> LinuxIsolationPlan {
         let workspace = tempfile::tempdir().unwrap();
+        let sandbox_id = test_sandbox_id();
         plan_with_probe(
             policy,
-            SandboxId::new(),
+            sandbox_id,
             workspace.path(),
             proxy_port,
-            proxy_bind(proxy_port),
+            proxy_bind(sandbox_id, proxy_port),
             &FakeProbe { snapshot: caps },
         )
         .unwrap()
     }
 
-    fn proxy_bind(port: u16) -> Option<SocketAddr> {
+    fn test_sandbox_id() -> SandboxId {
+        SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap()
+    }
+
+    fn proxy_bind(sandbox_id: SandboxId, port: u16) -> Option<SocketAddr> {
         if port == 0 {
             None
         } else {
-            Some(SocketAddr::new(IpAddr::V4(HOST_VETH_ADDR), port))
+            Some(netns::proxy_bind_addr(sandbox_id, port))
         }
     }
 
@@ -685,6 +694,7 @@ mod tests {
     #[test]
     fn proxy_mode_uses_native_netns_when_capabilities_are_present() {
         let plan = plan(&policy(NetworkMode::Proxy), full_caps(), 3128);
+        let allocation = netns::proxy_netns_allocation(plan.sandbox_id, 3128);
 
         assert_eq!(plan.filesystem, FilesystemStrategy::Landlock { abi: 7 });
         assert_eq!(plan.seccomp, SeccompStrategy::Native);
@@ -693,16 +703,16 @@ mod tests {
             NetworkStrategy::Proxy {
                 setup: ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
                 firewall: Some(FirewallTool::Iptables),
-                host_addr: HOST_VETH_ADDR,
-                sandbox_addr: SANDBOX_VETH_ADDR,
+                host_addr: allocation.host_addr,
+                sandbox_addr: allocation.sandbox_addr,
                 proxy_port: 3128,
             }
         );
         assert_eq!(
             plan.proxy,
             ProxyStrategy::Required {
-                bind_addr: HOST_VETH_ADDR,
-                sandbox_addr: HOST_VETH_ADDR,
+                bind_addr: allocation.host_addr,
+                sandbox_addr: allocation.host_addr,
                 port: 3128,
             }
         );
@@ -728,9 +738,10 @@ mod tests {
 
     #[test]
     fn proxy_mode_rejects_loopback_proxy_bind() {
+        let sandbox_id = test_sandbox_id();
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
             Some("127.0.0.1:3128".parse().unwrap()),
@@ -741,17 +752,22 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.area, "network");
-        assert!(err.message.contains("10.200.0.1:3128"));
+        assert!(
+            err.message
+                .contains(&netns::proxy_bind_addr(sandbox_id, 3128).to_string())
+        );
     }
 
     #[test]
     fn proxy_mode_rejects_mismatched_proxy_port() {
+        let sandbox_id = test_sandbox_id();
+        let wrong_addr = SocketAddr::new(netns::proxy_bind_addr(sandbox_id, 3128).ip(), 4000);
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            Some(SocketAddr::new(IpAddr::V4(HOST_VETH_ADDR), 4000)),
+            Some(wrong_addr),
             &FakeProbe {
                 snapshot: full_caps(),
             },
@@ -769,13 +785,14 @@ mod tests {
         caps.ip = false;
         caps.iptables = false;
         caps.netns_helper = true;
+        let sandbox_id = test_sandbox_id();
 
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            proxy_bind(3128),
+            proxy_bind(sandbox_id, 3128),
             &FakeProbe { snapshot: caps },
         )
         .unwrap_err();
@@ -789,13 +806,14 @@ mod tests {
         let mut caps = full_caps();
         caps.cap_net_admin = false;
         caps.unprivileged_userns = true;
+        let sandbox_id = test_sandbox_id();
 
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            proxy_bind(3128),
+            proxy_bind(sandbox_id, 3128),
             &FakeProbe { snapshot: caps },
         )
         .unwrap_err();
@@ -813,13 +831,14 @@ mod tests {
             bubblewrap: true,
             ..CapabilitySnapshot::default()
         };
+        let sandbox_id = test_sandbox_id();
 
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            proxy_bind(3128),
+            proxy_bind(sandbox_id, 3128),
             &FakeProbe { snapshot: caps },
         )
         .unwrap_err();
@@ -833,13 +852,14 @@ mod tests {
         let mut caps = full_caps();
         caps.iptables = false;
         caps.nft = true;
+        let sandbox_id = test_sandbox_id();
 
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            proxy_bind(3128),
+            proxy_bind(sandbox_id, 3128),
             &FakeProbe { snapshot: caps },
         )
         .unwrap_err();
@@ -853,13 +873,14 @@ mod tests {
         let mut caps = full_caps();
         caps.iptables = false;
         caps.nft = false;
+        let sandbox_id = test_sandbox_id();
 
         let err = plan_with_probe(
             &policy(NetworkMode::Proxy),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            proxy_bind(3128),
+            proxy_bind(sandbox_id, 3128),
             &FakeProbe { snapshot: caps },
         )
         .unwrap_err();
@@ -870,12 +891,13 @@ mod tests {
 
     #[test]
     fn block_mode_uses_seccomp_socket_filter_without_proxy() {
+        let sandbox_id = test_sandbox_id();
         let plan = plan_with_probe(
             &policy(NetworkMode::Block),
-            SandboxId::new(),
+            sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
-            proxy_bind(3128),
+            proxy_bind(sandbox_id, 3128),
             &FakeProbe {
                 snapshot: full_caps(),
             },
