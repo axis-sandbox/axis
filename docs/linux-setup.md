@@ -44,6 +44,23 @@ fails before running the command.
 specific limit is not requested. Defaults in richer policies may request
 resource limits; those policies fail closed on hosts that cannot enforce them.
 
+## Proxy Credential Handling
+
+Linux sandboxes do not receive common provider API keys or inherited proxy
+credentials in their process environment by default. In proxy mode, inference
+routes with `api_key_env` are resolved in the AXIS proxy process and injected
+only into matching, policy-allowed provider requests. The sandbox sends an
+ordinary request without the raw key; the proxy adds the provider credential at
+the host boundary.
+
+Credential injection is intentionally fail-closed:
+
+- missing `api_key_env` values are not forwarded upstream,
+- unsupported `axis:resolve:*` placeholders reject the route,
+- injected values are not logged or added to sandbox argv/env/audit fields,
+- L7-readable HTTP is required. Real HTTPS providers require the L7 TLS
+  termination and per-sandbox CA trust path to be configured.
+
 ## Optional Netns Helper
 
 Proxy mode needs network namespace and firewall setup. Standard user processes

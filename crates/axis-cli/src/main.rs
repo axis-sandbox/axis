@@ -1046,6 +1046,7 @@ fn standalone_proxy_config_for_sandbox(
         policy: policy.clone(),
         enable_l7: false,
         enable_leak_detection: true,
+        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
     })
 }

@@ -25,6 +25,9 @@ use tokio::net::TcpListener;
 use tokio::net::TcpSocket;
 
 use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
+use crate::secrets::CredentialInjector;
+
+const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -53,6 +56,9 @@ pub struct ProxyConfig {
     pub policy: Policy,
     pub enable_l7: bool,
     pub enable_leak_detection: bool,
+    /// Additional PEM-encoded trust anchors for upstream TLS provider tests or
+    /// private provider deployments. System/webpki roots are always included.
+    pub upstream_tls_roots_pem: Vec<String>,
     /// Local inference server endpoint for `inference.local` virtual host.
     /// When set, CONNECT requests to `inference.local` are routed here
     /// instead of the real internet.
@@ -65,6 +71,8 @@ struct ProxyState {
     tofu_store: TofuStore,
     audit_log: AuditLog,
     leak_detector: Option<LeakDetector>,
+    credential_injector: CredentialInjector,
+    upstream_tls_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 /// An AXIS HTTP CONNECT proxy serving a single sandbox.
@@ -76,7 +84,7 @@ pub struct AxisProxy {
 
 impl AxisProxy {
     /// Create a new proxy with OPA policy evaluation.
-    pub fn new(config: ProxyConfig) -> Result<Self, ProxyError> {
+    pub fn new(mut config: ProxyConfig) -> Result<Self, ProxyError> {
         // Initialize the OPA policy engine with the sandbox policy.
         let mut policy_engine = PolicyEngine::new()
             .map_err(|e| ProxyError::BindFailed(format!("OPA engine init: {e}")))?;
@@ -94,11 +102,21 @@ impl AxisProxy {
             None
         };
 
+        let credential_injector = CredentialInjector::from_policy(&config.policy)
+            .map_err(|e| ProxyError::BindFailed(format!("credential injection: {e}")))?;
+        if credential_injector.has_rules() {
+            config.enable_l7 = true;
+        }
+        let upstream_tls_roots = parse_upstream_tls_roots(&config.upstream_tls_roots_pem)
+            .map_err(|e| ProxyError::BindFailed(format!("upstream TLS roots: {e}")))?;
+
         let state = Arc::new(Mutex::new(ProxyState {
             policy_engine,
             tofu_store: TofuStore::new(),
             audit_log: AuditLog::new(),
             leak_detector,
+            credential_injector,
+            upstream_tls_roots,
         }));
 
         Ok(Self {
@@ -226,7 +244,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     binary_identity: Result<Option<BinaryFingerprint>, IdentityError>,
     state: Arc<Mutex<ProxyState>>,
-    _enable_l7: bool,
+    enable_l7: bool,
     inference_endpoint: Option<SocketAddr>,
 ) -> Result<(), ProxyError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -352,10 +370,10 @@ async fn handle_connection(
         st.leak_detector.is_some()
     };
 
-    if _enable_l7 {
-        relay_with_l7_inspection(sandbox_id, &host, stream, upstream, state).await
+    if enable_l7 {
+        relay_with_l7_inspection(sandbox_id, &host, port, stream, upstream, state).await
     } else if leak_enabled {
-        relay_with_leak_detection(sandbox_id, stream, upstream, state).await
+        relay_with_leak_detection(sandbox_id, &host, port, false, stream, upstream, state).await
     } else {
         relay_plain(stream, upstream).await
     }
@@ -365,6 +383,7 @@ async fn handle_connection(
 async fn relay_with_l7_inspection(
     sandbox_id: SandboxId,
     hostname: &str,
+    port: u16,
     client: tokio::net::TcpStream,
     upstream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxyState>>,
@@ -376,11 +395,11 @@ async fn relay_with_l7_inspection(
     if n > 0 && peek_buf[0] == 0x16 {
         // TLS detected — terminate and inspect.
         tracing::debug!("sandbox {sandbox_id}: L7 TLS detected for {hostname}, terminating");
-        relay_tls_inspected(sandbox_id, hostname, client, upstream, state).await
+        relay_tls_inspected(sandbox_id, hostname, port, client, upstream, state).await
     } else {
         // Not TLS — relay with leak detection on plaintext.
         tracing::debug!("sandbox {sandbox_id}: L7 plaintext for {hostname}");
-        relay_with_leak_detection(sandbox_id, client, upstream, state).await
+        relay_with_leak_detection(sandbox_id, hostname, port, false, client, upstream, state).await
     }
 }
 
@@ -388,6 +407,7 @@ async fn relay_with_l7_inspection(
 async fn relay_tls_inspected(
     sandbox_id: SandboxId,
     hostname: &str,
+    port: u16,
     client: tokio::net::TcpStream,
     upstream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxyState>>,
@@ -424,46 +444,33 @@ async fn relay_tls_inspected(
 
     tracing::info!("sandbox {sandbox_id}: L7 TLS terminated for {hostname}");
 
-    // Now relay plaintext between decrypted client and raw upstream.
-    // The upstream connection stays plaintext (the proxy is the TLS endpoint).
-    // Scan the decrypted traffic for credential leaks.
+    let upstream_tls_roots = {
+        let st = state.lock().unwrap();
+        st.upstream_tls_roots.clone()
+    };
+    let upstream = connect_tls_upstream(hostname, upstream, &upstream_tls_roots).await?;
+    relay_tls_inspected_to_upstream(sandbox_id, hostname, port, tls_client, upstream, state).await
+}
+
+async fn relay_tls_inspected_to_upstream(
+    sandbox_id: SandboxId,
+    hostname: &str,
+    port: u16,
+    tls_client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    tls_upstream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    state: Arc<Mutex<ProxyState>>,
+) -> Result<(), ProxyError> {
     let (mut cr, mut cw) = tokio::io::split(tls_client);
-    let (mut ur, mut uw) = tokio::io::split(upstream);
+    let (mut ur, mut uw) = tokio::io::split(tls_upstream);
 
     let state_c2u = Arc::clone(&state);
     let sid = sandbox_id;
+    let hostname = hostname.to_string();
     let c2u = async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut cr, &mut buf).await?;
-            if n == 0 {
-                break;
-            }
-
-            // Scan decrypted outgoing data for credential leaks.
-            {
-                let st = state_c2u.lock().unwrap();
-                if let Some(ref detector) = st.leak_detector {
-                    let findings = detector.scan(&buf[..n]);
-                    for f in &findings {
-                        tracing::warn!(
-                            "sandbox {sid}: L7 CREDENTIAL LEAK in TLS traffic: {} at offset {}",
-                            f.pattern_name,
-                            f.byte_offset,
-                        );
-                        st.audit_log.credential_leak_detected(sid, f.pattern_name);
-                    }
-                    if !findings.is_empty() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "credential leak in TLS-decrypted traffic",
-                        ));
-                    }
-                }
-            }
-
-            tokio::io::AsyncWriteExt::write_all(&mut uw, &buf[..n]).await?;
-        }
+        relay_client_to_upstream_with_policy(
+            sid, &hostname, port, true, &mut cr, &mut uw, state_c2u,
+        )
+        .await?;
         Ok::<_, std::io::Error>(())
     };
 
@@ -474,6 +481,50 @@ async fn relay_tls_inspected(
         r = u2c => { r?; }
     }
     Ok(())
+}
+
+async fn connect_tls_upstream(
+    hostname: &str,
+    upstream: tokio::net::TcpStream,
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, ProxyError> {
+    let mut root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    for cert in extra_roots {
+        root_store
+            .add(cert.clone())
+            .map_err(|e| ProxyError::ConnectionError(format!("invalid upstream TLS root: {e}")))?;
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let server_name =
+        rustls::pki_types::ServerName::try_from(hostname.to_string()).map_err(|_| {
+            ProxyError::ConnectionError(format!("invalid TLS upstream name: {hostname}"))
+        })?;
+    connector
+        .connect(server_name, upstream)
+        .await
+        .map_err(|e| ProxyError::ConnectionError(format!("TLS upstream {hostname}: {e}")))
+}
+
+fn parse_upstream_tls_roots(
+    root_pems: &[String],
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let mut roots = Vec::new();
+    for pem in root_pems {
+        let mut reader = pem.as_bytes();
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if certs.is_empty() {
+            return Err("PEM block did not contain a certificate".into());
+        }
+        roots.extend(certs);
+    }
+    Ok(roots)
 }
 
 /// Plain bidirectional TCP relay (no inspection).
@@ -497,6 +548,9 @@ async fn relay_plain(
 /// Bidirectional relay with leak detection on response data.
 async fn relay_with_leak_detection(
     sandbox_id: SandboxId,
+    hostname: &str,
+    port: u16,
+    is_tls: bool,
     stream: tokio::net::TcpStream,
     upstream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxyState>>,
@@ -504,45 +558,15 @@ async fn relay_with_leak_detection(
     let (mut cr, mut cw) = tokio::io::split(stream);
     let (mut ur, mut uw) = tokio::io::split(upstream);
 
-    // Client → upstream: scan outgoing data for leaked credentials.
+    // Client -> upstream: scan sandbox-origin bytes, then inject host-side
+    // provider credentials into each matching HTTP request head.
     let state_c2u = Arc::clone(&state);
+    let hostname = hostname.to_string();
     let c2u = async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut cr, &mut buf).await?;
-            if n == 0 {
-                break;
-            }
-
-            // Scan outgoing data for credential leaks.
-            {
-                let st = state_c2u.lock().unwrap();
-                if let Some(ref detector) = st.leak_detector {
-                    let findings = detector.scan(&buf[..n]);
-                    for finding in &findings {
-                        tracing::warn!(
-                            "sandbox {sandbox_id}: CREDENTIAL LEAK in outgoing data: {} at offset {}",
-                            finding.pattern_name,
-                            finding.byte_offset,
-                        );
-                        st.audit_log
-                            .credential_leak_detected(sandbox_id, finding.pattern_name);
-                    }
-                    if !findings.is_empty() {
-                        // Block the data — don't forward it.
-                        tracing::warn!(
-                            "sandbox {sandbox_id}: BLOCKED outgoing data ({n} bytes) due to credential leak"
-                        );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "credential leak detected in outgoing data",
-                        ));
-                    }
-                }
-            }
-
-            tokio::io::AsyncWriteExt::write_all(&mut uw, &buf[..n]).await?;
-        }
+        relay_client_to_upstream_with_policy(
+            sandbox_id, &hostname, port, is_tls, &mut cr, &mut uw, state_c2u,
+        )
+        .await?;
         Ok::<_, std::io::Error>(())
     };
 
@@ -554,6 +578,219 @@ async fn relay_with_leak_detection(
         r = u2c => { r?; }
     }
     Ok(())
+}
+
+async fn relay_client_to_upstream_with_policy<R, W>(
+    sandbox_id: SandboxId,
+    hostname: &str,
+    port: u16,
+    is_tls: bool,
+    client_read: &mut R,
+    upstream_write: &mut W,
+    state: Arc<Mutex<ProxyState>>,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let requires_injection = {
+        let st = state.lock().unwrap();
+        st.credential_injector
+            .connection_requires_injection(hostname, port, is_tls)
+    };
+    if !requires_injection {
+        return relay_scanned_bytes(sandbox_id, client_read, upstream_write, state).await;
+    }
+
+    let mut buf = vec![0u8; 65536];
+    let mut pending = Vec::new();
+    let mut body_remaining = 0usize;
+    loop {
+        let n = tokio::io::AsyncReadExt::read(client_read, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        scan_sandbox_bytes(sandbox_id, &buf[..n], &state)?;
+        pending.extend_from_slice(&buf[..n]);
+
+        loop {
+            if body_remaining > 0 {
+                let take = body_remaining.min(pending.len());
+                if take == 0 {
+                    break;
+                }
+                tokio::io::AsyncWriteExt::write_all(upstream_write, &pending[..take]).await?;
+                pending.drain(..take);
+                body_remaining -= take;
+                if body_remaining > 0 {
+                    break;
+                }
+                continue;
+            }
+
+            let Some(head_end) = find_http_head_end(&pending) else {
+                if pending.len() > MAX_HTTP_HEAD_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "credential injection failed closed for {hostname}: HTTP request head exceeds {MAX_HTTP_HEAD_BYTES} bytes"
+                        ),
+                    ));
+                }
+                break;
+            };
+
+            let head = pending[..head_end].to_vec();
+            let next_body_len = http_body_length(&head)?;
+            let rewritten = {
+                let st = state.lock().unwrap();
+                st.credential_injector
+                    .rewrite_http_request_head(hostname, port, is_tls, &head)
+                    .map_err(secret_error_to_io)?
+            };
+            if let Some(rewritten_head) = rewritten {
+                tokio::io::AsyncWriteExt::write_all(upstream_write, &rewritten_head).await?;
+            } else {
+                tokio::io::AsyncWriteExt::write_all(upstream_write, &head).await?;
+            }
+            pending.drain(..head_end);
+            body_remaining = next_body_len;
+
+            if body_remaining == 0 {
+                continue;
+            }
+        }
+    }
+
+    if body_remaining == 0 && !pending.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "credential injection failed closed for {hostname}: incomplete HTTP request head"
+            ),
+        ));
+    }
+    if !pending.is_empty() {
+        tokio::io::AsyncWriteExt::write_all(upstream_write, &pending).await?;
+    }
+    Ok(())
+}
+
+fn http_body_length(head: &[u8]) -> std::io::Result<usize> {
+    let text = std::str::from_utf8(head).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "credential injection failed closed: HTTP request head is not UTF-8",
+        )
+    })?;
+    let mut length = None;
+    for line in text.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "credential injection failed closed: transfer-encoded request bodies are not supported",
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "credential injection failed closed: invalid Content-Length",
+                )
+            })?;
+            if let Some(existing) = length {
+                if existing != parsed {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "credential injection failed closed: conflicting Content-Length values",
+                    ));
+                }
+            }
+            length = Some(parsed);
+        }
+    }
+    Ok(length.unwrap_or(0))
+}
+
+async fn relay_scanned_bytes<R, W>(
+    sandbox_id: SandboxId,
+    client_read: &mut R,
+    upstream_write: &mut W,
+    state: Arc<Mutex<ProxyState>>,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(client_read, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        scan_sandbox_bytes(sandbox_id, &buf[..n], &state)?;
+        tokio::io::AsyncWriteExt::write_all(upstream_write, &buf[..n]).await?;
+    }
+    Ok(())
+}
+
+fn scan_sandbox_bytes(
+    sandbox_id: SandboxId,
+    bytes: &[u8],
+    state: &Arc<Mutex<ProxyState>>,
+) -> std::io::Result<()> {
+    let st = state.lock().unwrap();
+    if let Some(ref detector) = st.leak_detector {
+        let findings = detector.scan(bytes);
+        for finding in &findings {
+            tracing::warn!(
+                "sandbox {sandbox_id}: CREDENTIAL LEAK in outgoing data: {} at offset {}",
+                finding.pattern_name,
+                finding.byte_offset,
+            );
+            st.audit_log
+                .credential_leak_detected(sandbox_id, finding.pattern_name);
+        }
+        if !findings.is_empty() {
+            tracing::warn!(
+                "sandbox {sandbox_id}: BLOCKED outgoing data ({} bytes) due to credential leak",
+                bytes.len()
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "credential leak detected in outgoing data",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn secret_error_to_io(error: crate::secrets::SecretError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("credential injection failed closed: {error}"),
+    )
+}
+
+fn find_http_head_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .or_else(|| {
+            bytes
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|idx| idx + 2)
+        })
 }
 
 /// Resolve the calling binary path from the peer address.
@@ -645,6 +882,56 @@ mod tests {
         assert!(parse_connect_target("GET / HTTP/1.1\r\n").is_err());
     }
 
+    #[test]
+    fn find_http_head_end_accepts_crlf_and_lf_heads() {
+        assert_eq!(
+            find_http_head_end(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody"),
+            Some(37)
+        );
+        assert_eq!(
+            find_http_head_end(b"GET / HTTP/1.1\nHost: example.com\n\nbody"),
+            Some(34)
+        );
+    }
+
+    #[test]
+    fn http_body_length_reads_content_length() {
+        let len =
+            http_body_length(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 12\r\n\r\n")
+                .unwrap();
+        assert_eq!(len, 12);
+    }
+
+    #[test]
+    fn http_body_length_rejects_chunked_bodies() {
+        let err = http_body_length(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("transfer-encoded"));
+    }
+
+    #[test]
+    fn http_body_length_rejects_invalid_content_length() {
+        let err = http_body_length(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: nope\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("Content-Length"));
+    }
+
+    #[test]
+    fn http_body_length_rejects_conflicting_content_lengths() {
+        let err = http_body_length(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("conflicting Content-Length"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_freebind_is_used_only_for_nonlocal_ipv4_binds() {
@@ -716,6 +1003,7 @@ mod tests {
             policy,
             enable_l7: false,
             enable_leak_detection: true,
+            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
         };
         let proxy = AxisProxy::new(config);
@@ -742,6 +1030,7 @@ network:
             policy,
             enable_l7: false,
             enable_leak_detection: false,
+            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
         };
         let proxy = AxisProxy::new(config).unwrap();

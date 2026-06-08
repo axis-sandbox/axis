@@ -189,6 +189,17 @@ expect_axis_success_or_skip \
     "printf ok > inside.txt; if printf bad > '$denied'; then echo outside-write-succeeded; exit 42; else echo outside-write-denied; fi; test -f inside.txt"
 rm -f "$denied"
 
+echo "--- Environment boundary through axis run ---"
+env_policy="$(write_policy allow)"
+export OPENAI_API_KEY="axis-e2e-openai-secret"
+export ANTHROPIC_API_KEY="axis-e2e-anthropic-secret"
+export HTTPS_PROXY="http://proxy-user:proxy-pass@example.invalid:8080"
+expect_axis_success_or_skip \
+    "provider secrets and inherited proxy env are omitted" \
+    --policy "$env_policy" -- /bin/sh -c \
+    'if env | grep -E "^(OPENAI_API_KEY|ANTHROPIC_API_KEY|HTTPS_PROXY)="; then exit 42; fi'
+unset OPENAI_API_KEY ANTHROPIC_API_KEY HTTPS_PROXY
+
 echo "--- Block-mode network through axis run ---"
 if require_cmd python3 "block-mode network test"; then
     net_policy="$(write_policy block)"

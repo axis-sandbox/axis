@@ -24,7 +24,7 @@ This document surveys the current landscape of agent sandboxing technologies, as
 
 | Framework | Isolation Mechanism | Startup | GPU | Network Isolation | Credential Protection | Root Required | Platforms |
 |---|---|---|---|---|---|---|---|
-| **AXIS** | Landlock + seccomp + optional netns proxy (Linux), AppContainer + Job Object (Windows), Seatbelt (macOS) | **0.6ms** | **HIP Remote** (538 APIs, VRAM quotas) | Linux block mode needs no root; proxy mode needs native capability or optional helper | Sandbox env filtering; proxy-level injection planned | Quickstart: no. Linux proxy mode: capability/helper. | Linux, macOS, Windows |
+| **AXIS** | Landlock + seccomp + optional netns proxy (Linux), AppContainer + Job Object (Windows), Seatbelt (macOS) | **0.6ms** | **HIP Remote** (538 APIs, VRAM quotas) | Linux block mode needs no root; proxy mode needs native capability or optional helper | Sandbox env filtering; route-scoped proxy credential injection | Quickstart: no. Linux proxy mode: capability/helper. | Linux, macOS, Windows |
 | **Claude Code** | bubblewrap (Linux), Seatbelt (macOS) | ~ms | None | Proxy-based filtering | Allowlist-only FS | No | Linux, macOS |
 | **Codex CLI** | Seatbelt (macOS), bubblewrap (Linux), native (Windows) | ~ms | None | Disabled by default | Workspace-scoped FS | No | macOS, Linux, Windows |
 | **Cursor** | Seatbelt (macOS), Landlock+seccomp (Linux), WSL2 (Windows) | ~ms | None | Disabled by default | Workspace + overlay FS | No | macOS, Linux, Windows |
@@ -87,9 +87,9 @@ The Microsoft Defender Security Research article identifies six control domains 
 
 **AXIS advantage:** Linux sandboxes do not receive common provider secrets from
 the host environment by default, and credential-store paths can be denied by
-Landlock policy. Host-boundary credential injection at the proxy is tracked as
-a follow-up so approved provider access can be restored without exposing raw
-secrets to the sandbox process.
+Landlock policy. Route-scoped proxy credential injection restores approved
+provider access at the host boundary without exposing raw secrets to the
+sandbox process.
 
 ### 4.2 Execution: Code Containment
 
@@ -186,7 +186,7 @@ The agent sandboxing landscape is converging on OS-native primitives (Landlock, 
 AXIS is unique in four ways:
 
 1. **GPU isolation** — no other sandbox technology provides per-agent GPU access with VRAM quotas and API whitelisting
-2. **Credential containment roadmap** — current Linux sandboxes strip common provider secrets from the environment; proxy-boundary credential injection is tracked as a follow-up
+2. **Credential containment** — current Linux sandboxes strip common provider secrets from the environment and proxy-boundary injection restores approved provider access without exposing raw keys to the sandbox
 3. **Default-deny seccomp** — the strictest syscall policy of any agent sandbox (142 of ~400 allowed)
 4. **Cross-platform direction** — Linux (Landlock + seccomp + optional netns proxy), Windows (AppContainer + Job Object), and macOS (Seatbelt), with a no-admin Linux block-mode quickstart and optional helper/capability requirements for stronger Linux proxy networking
 

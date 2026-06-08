@@ -21,7 +21,7 @@ Linux behavior, and setup requirements, see
 | **axis-sandbox (Linux)** | Complete | Landlock ABI V2+, seccomp default-deny (142 whitelist), netns + veth + iptables with setns() in pre_exec |
 | **axis-sandbox (macOS)** | Complete | Seatbelt (sandbox-exec) with generated .sb profiles, localhost-only network for proxy mode |
 | **axis-sandbox (Windows)** | Complete | Job Object, Restricted Token + Low IL, AppContainer (userenv.dll FFI), ETW bypass detector (GetExtendedTcpTable) |
-| **axis-proxy** | Historical target | OPA eval per CONNECT, TOFU identity, L7 TLS termination, inference.local routing, leak detection on encrypted traffic, planned credential injection |
+| **axis-proxy** | Historical target | OPA eval per CONNECT, TOFU identity, L7 TLS termination, inference.local routing, leak detection on encrypted traffic, route-scoped credential injection |
 | **axis-router** | Complete | Route resolution, DRR scheduler, token budgets, model registry, HuggingFace pull, smart routing (8-dim scorer), embedded LLM (llama-cpp-2) |
 | **axis-gpu** | Complete | HIP Remote protocol (~150 opcodes), API filter, VRAM quota, TCP transport, worker lifecycle |
 | **hip-remote (C)** | Integrated | libamdhip64.so (538 symbols) + hip-worker. From `users/jam/hip-remote`. |
@@ -129,7 +129,7 @@ Default-allow filter with targeted blocks. Three categories: (a) socket domain b
 
 **Layer 3 — Network: netns + iptables + HTTP CONNECT proxy**
 
-A veth pair (10.200.0.1 host ↔ 10.200.0.2 sandbox) routes all sandbox traffic through an HTTP CONNECT proxy. The proxy resolves the calling binary via `/proc/net/tcp` → PID → `/proc/[pid]/exe`, computes a SHA256 fingerprint (TOFU model), and evaluates an OPA policy before allowing or denying the connection. For allowed connections, optional L7 inspection TLS-terminates the stream (ephemeral per-sandbox CA), parses HTTP requests, and enforces method/path rules. Host-boundary credential injection is planned so approved provider routes can receive API keys without exposing them in the agent's environment.
+A veth pair (10.200.0.1 host ↔ 10.200.0.2 sandbox) routes all sandbox traffic through an HTTP CONNECT proxy. The proxy resolves the calling binary via `/proc/net/tcp` → PID → `/proc/[pid]/exe`, computes a SHA256 fingerprint (TOFU model), and evaluates an OPA policy before allowing or denying the connection. For allowed connections, optional L7 inspection TLS-terminates the stream (ephemeral per-sandbox CA), parses HTTP requests, and enforces method/path rules. Host-boundary credential injection lets approved provider routes receive API keys without exposing them in the agent's environment.
 
 **Bypass detection:** iptables LOG + REJECT rules in the sandbox namespace catch any traffic not going through the proxy, parsed from `/dev/kmsg` and aggregated into denial reports.
 
@@ -139,7 +139,7 @@ A veth pair (10.200.0.1 host ↔ 10.200.0.2 sandbox) routes all sandbox traffic 
 - The YAML policy schema (filesystem, network, process sections)
 - The HTTP CONNECT proxy architecture for network policy enforcement
 - L7 inspection with ephemeral CA for TLS termination
-- Planned credential injection via placeholder resolution
+- Route-scoped credential injection via placeholder resolution
 - Binary identity fingerprinting (SHA256 TOFU)
 - The OCSF structured audit log format
 
@@ -1512,7 +1512,7 @@ Decorators compose in any order — the same architectural pattern AXIS should u
 | **Isolation** | Container + seccomp + Landlock | WASM capability-based + Docker | Landlock/seccomp/netns + AppContainer |
 | **LLM handling** | API proxying | Multi-provider failover + smart routing | Managed local server + cloud fallback |
 | **Tool model** | Container tools | WASM + built-in + MCP | Policy-governed processes |
-| **Credential model** | Env var injection | Host-boundary injection (WASM never sees secrets) | Default sandbox env stripping; proxy-level placeholder injection planned |
+| **Credential model** | Env var injection | Host-boundary injection (WASM never sees secrets) | Default sandbox env stripping; proxy-level placeholder injection |
 | **Security layers** | 3 (Landlock + seccomp + netns) | 6+ (validation through autonomy controls) | 4 (process + filesystem + network + inference) |
 
 ### C.8 Lessons for AXIS
@@ -1521,7 +1521,7 @@ Decorators compose in any order — the same architectural pattern AXIS should u
 
 1. **Composable LLM provider decorators.** The FailoverProvider → SmartRoutingProvider → CachedProvider chain is elegant and directly maps to the axis-router. AXIS should use the same `InferenceProvider` trait with decorator wrapping for failover, smart routing, and caching. The 13-dimension complexity scorer is a cost optimization that matters when routing between local (free) and cloud (expensive) backends.
 
-2. **Host-boundary credential injection.** Ironclaw's pattern where sandboxed code never sees secret values is stronger than injecting env vars into the sandbox process. AXIS already plans proxy-level credential injection — this validates the approach and suggests adding leak scanning (Aho-Corasick on known key patterns) to the proxy's L7 inspection layer.
+2. **Host-boundary credential injection.** Ironclaw's pattern where sandboxed code never sees secret values is stronger than injecting env vars into the sandbox process. AXIS uses proxy-level credential injection for policy-approved provider routes; this validates the approach and suggests extending leak scanning (Aho-Corasick on known key patterns) through the proxy's L7 inspection layer.
 
 3. **Leak detection in the proxy.** Ironclaw scans both request and response bodies for accidentally leaked credentials using fast Aho-Corasick prefix matching + regex. AXIS's proxy should do the same — catch agents that try to exfiltrate injected credentials via encoded channels.
 

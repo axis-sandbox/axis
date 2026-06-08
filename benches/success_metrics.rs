@@ -112,6 +112,7 @@ network:
         policy,
         enable_l7: false,
         enable_leak_detection: false,
+        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
     };
 
@@ -222,6 +223,7 @@ network:
         policy,
         enable_l7: false,
         enable_leak_detection: true,
+        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
     };
 
@@ -370,6 +372,7 @@ async fn main() {
             policy,
             enable_l7: false,
             enable_leak_detection: true,
+            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
         };
         let _proxy = axis_proxy::proxy::AxisProxy::new(config).unwrap();
