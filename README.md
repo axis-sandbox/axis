@@ -1,6 +1,6 @@
 # AXIS: Agent eXecution Isolation Substrate
 
-A high-performance OS-native agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. No containers, no VMs, no admin privileges.
+A high-performance OS-native agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default quickstart path uses no containers, VMs, or admin privileges; stronger Linux proxy networking may require host capabilities or the optional AXIS helper.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="AXIS Architecture" width="800">
@@ -14,11 +14,11 @@ AXIS isolates AI agent processes using OS-native primitives:
 |---|---|---|---|
 | Process | seccomp-BPF (142-syscall whitelist) | Restricted Token + Job Object | Seatbelt (sandbox-exec) |
 | Filesystem | Landlock LSM | NTFS ACLs + Low Integrity | Seatbelt profile (subpath rules) |
-| Network | netns + veth + iptables + HTTP proxy | AppContainer + loopback proxy | Seatbelt network deny + proxy |
+| Network | seccomp block mode or netns + veth + iptables + HTTP proxy | AppContainer + loopback proxy | Seatbelt network deny + proxy |
 | GPU | HIP Remote (para-virtual GPU via TCP) | HIP Remote (TCP) | HIP Remote (TCP to Linux host) |
 | Inference | Local LLM via llama.cpp or vLLM | Same | Same |
 
-Every network request goes through a policy-evaluated proxy. The agent never touches the real GPU driver — HIP API calls are proxied to a worker process.
+In proxy mode, every network request goes through a policy-evaluated proxy. The agent never touches the real GPU driver — HIP API calls are proxied to a worker process.
 
 ## Install
 
@@ -52,7 +52,7 @@ sudo rpm -i axis-0.1.0-1.x86_64.rpm  # Fedora/RHEL
 axis run -- python -c "print('Hello from AXIS sandbox')"
 ```
 
-That's it. The process runs with Landlock filesystem isolation, seccomp syscall filtering, and network policy enforcement — all in 0.6ms startup with no admin privileges.
+That's it. The default `minimal` policy runs with Landlock filesystem isolation, seccomp syscall filtering, and block-mode network enforcement with no admin privileges.
 
 ```bash
 # Run an agent with a policy
@@ -80,10 +80,11 @@ No admin or root required. Works on macOS 12+ (Monterey and later).
 
 ### Linux (Landlock + seccomp + netns)
 
-Linux uses three independent kernel isolation layers applied in the child's `pre_exec`:
-1. `setns(CLONE_NEWNET)` — enters a network namespace with veth pair routing through the proxy
-2. Landlock ABI V2+ — filesystem allowlist enforced by the kernel
-3. seccomp default-deny — 142 of ~400 syscalls whitelisted; everything else returns EPERM
+Linux selects the strongest strategy that satisfies the requested policy and fails closed when a policy cannot be enforced:
+1. Landlock ABI V2+ — filesystem allowlist enforced by the kernel
+2. seccomp default-deny — 142 of ~400 syscalls whitelisted; everything else returns EPERM
+3. block-mode networking — seccomp denies IP socket domains when the policy requests no network
+4. proxy-mode networking — netns + veth + iptables routes traffic through the AXIS proxy when native `CAP_NET_ADMIN`, an installed AXIS helper, or another supported setup path is available
 
 ### Windows (AppContainer + Job Object)
 

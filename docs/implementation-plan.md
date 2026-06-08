@@ -83,12 +83,12 @@ The VM has **zero GPU drivers and zero ROCm installation** — only the 188KB dr
 
 AXIS is AMD's native agent sandbox runtime — a secure, policy-governed execution environment for autonomous AI agents (claws) running on AMD client hardware. Where NVIDIA's OpenShell relies on Docker containers and a K3s Kubernetes cluster, AXIS is designed from the ground up for **native execution on Windows 11 Home and Linux desktops** with zero container dependencies. This makes AXIS the natural companion to ROCm Everywhere: if ROCm makes every AMD system an AI-capable platform, AXIS makes every AMD system a safe platform for autonomous agents.
 
-AXIS adopts OpenShell's core architectural insight — **out-of-process policy enforcement** — but replaces the container-centric isolation stack with OS-native primitives that work on consumer hardware without Docker, Hyper-V, or administrative privileges.
+AXIS adopts OpenShell's core architectural insight — **out-of-process policy enforcement** — but replaces the container-centric isolation stack with OS-native primitives that work on consumer hardware without Docker or Hyper-V. The quickstart and block-mode Linux paths are unprivileged; full Linux proxy networking may require native capabilities or the optional AXIS helper.
 
 ### Design Principles
 
 1. **No containers, no VMs.** Every isolation primitive is an OS-native syscall or API. The user never installs Docker.
-2. **No admin required.** AXIS runs as a standard user on Windows 11 Home and unprivileged Linux. No kernel drivers, no elevation prompts.
+2. **No admin required for the quickstart path.** AXIS runs as a standard user on Windows 11 Home and unprivileged Linux for policies that can be represented without host network setup. Stronger Linux proxy networking is an explicit optional capability.
 3. **Policy-as-code.** Declarative YAML policies govern filesystem, network, process, and inference access. Evaluated by an embedded OPA engine (Rego).
 4. **Defense in depth.** Four isolation layers (process, filesystem, network, inference) are applied independently; compromise of one does not unlock the others.
 5. **AMD-optimized.** NPU offload for policy evaluation, ROCm-aware GPU passthrough, APEX-aware memory policies.
@@ -281,11 +281,11 @@ Identical to OpenShell's design:
 5. Run proxy on host side listening on 10.200.0.1:3128
 6. Set `HTTP_PROXY` / `HTTPS_PROXY` env vars in child process
 
-**Requirement:** `ip netns` requires `CAP_NET_ADMIN`. AXIS acquires this via a small setuid helper binary (`axis-netns-helper`) installed during setup, or uses unprivileged user namespaces on kernels that support them (`sysctl kernel.unprivileged_userns_clone=1`).
+**Requirement:** proxy-mode netns setup requires `CAP_NET_ADMIN` or an equivalent authorized setup path. A setup-only `ip netns` command is insufficient for an unprivileged daemon because entering a root-created network namespace also requires namespace privileges. AXIS therefore needs either native capabilities, an optional `axis-netns-helper` that performs the narrow setup and launch/entry operation, or a future unprivileged-userns design that preserves the same proxy reachability and direct-egress denial contract.
 
 #### 4.1.4 Fallback: Bubblewrap Mode
 
-For environments where Landlock is unavailable (older kernels) or netns requires root, AXIS can optionally use [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) as an alternative isolation wrapper. Bubblewrap uses unprivileged user namespaces to create mount/PID/network namespaces without root, and is the same technology used by Flatpak.
+For environments where Landlock is unavailable (older kernels), AXIS can optionally use [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) as an alternative isolation wrapper. Bubblewrap uses unprivileged user namespaces to create mount/PID/network namespaces without root, and is the same technology used by Flatpak. AXIS treats bubblewrap `--unshare-net` as a block-mode fallback unless a future implementation can preserve proxy reachability.
 
 ```bash
 bwrap \
@@ -1164,13 +1164,23 @@ WSL2 runs a real Linux kernel in a lightweight Hyper-V VM. It would allow runnin
 
 ### 9.3 Handling the netns Privilege Gap on Linux
 
-Network namespace creation (`ip netns add`) requires `CAP_NET_ADMIN`, which standard users lack. AXIS provides three escalation strategies, tried in order:
+Network namespace creation (`ip netns add`) requires `CAP_NET_ADMIN`, which standard users lack. AXIS treats proxy networking as an optional stronger Linux mode, not as a prerequisite for the quickstart block-mode sandbox. Proxy mode can be satisfied by these strategies:
 
-1. **Unprivileged user namespaces** (preferred). On kernels with `kernel.unprivileged_userns_clone=1` (default on Ubuntu 24.04+), AXIS creates a user namespace first, then a network namespace inside it. No root needed.
+1. **Native privileges.** If the AXIS process already has `CAP_NET_ADMIN`, it can create the namespace, veth pair, routes, and firewall rules directly.
 
-2. **setuid helper** (`axis-netns-helper`). A minimal (< 200 LOC) setuid binary that creates/destroys network namespaces and veth pairs. Installed to `/usr/libexec/axis/` during package install. The helper validates arguments strictly (UUID format only, no path injection) and drops all capabilities except `CAP_NET_ADMIN`.
+2. **Optional setuid helper** (`axis-netns-helper`). A narrowly scoped helper installed to `/usr/libexec/axis/` during package install or explicit local setup. The helper must validate arguments strictly, avoid shell/PATH execution, use fixed root-owned command paths, authorize the caller, and supervise launch/entry so the main daemon remains unprivileged.
 
-3. **Bubblewrap fallback**. If neither option is available, AXIS uses `bwrap --unshare-net` which leverages bubblewrap's own setuid/user-namespace logic. Network isolation is all-or-nothing (no proxy, just blocked), but still provides a security boundary.
+3. **Future unprivileged user namespace path.** A userns design is acceptable only if it preserves the same host-veth proxy reachability and direct-egress denial semantics.
+
+4. **Bubblewrap block fallback.** If proxy mode cannot be satisfied, `bwrap --unshare-net` may still provide all-or-nothing network denial for block mode. It must not be treated as a proxy-mode fallback unless proxy reachability is also implemented.
+
+Testing for the helper path must not rely on a a manually installed local setuid helper.
+The source tree owns the test plan: ordinary cargo tests cover parser,
+authorization, command-planning, fd, and cleanup invariants; capability-gated
+kernel tests skip with explicit reasons when local privileges are absent; and
+the full helper launch proof runs in an ephemeral privileged CI/container runner
+that builds the helper from the current checkout, installs it only inside that
+disposable runner, and executes the proof as a non-root user.
 
 ### 9.4 Why HIP Remote for GPU Isolation?
 
@@ -1233,7 +1243,7 @@ With ROCm-CPU unifying CPU/GPU/NPU under PyTorch dispatch, every AMD system beco
 | Sophisticated agent bypasses seccomp filter | Sandbox escape | Medium | Default-deny seccomp policy (flip from OpenShell's default-allow). External security audit in Phase 4. |
 | User-mode proxy has latency overhead | Agent performance degraded | Medium | Benchmark proxy latency. For local inference, bypass proxy entirely (trusted localhost). |
 | AppContainer + Restricted Token interaction bugs | Windows isolation gaps | Medium | Test matrix: Win11 Home 23H2, 24H2, 25H2. Follow Chromium's sandbox test patterns. |
-| setuid helper is an attack surface | Privilege escalation | Low | Minimal code (< 200 LOC), strict input validation, external audit. Prefer unprivileged userns where available. |
+| setuid helper is an attack surface | Privilege escalation | Low | Keep helper operations narrow, validate inputs strictly, avoid shell/PATH execution, use fixed root-owned command paths, clear the environment, authorize callers, and require external security review. Prefer an unprivileged userns path only if it preserves the same proxy contract. |
 | HIP Remote protocol has no auth/encryption | Unauthorized GPU access from adjacent processes | Medium | Unix domain socket with filesystem permissions (same-host). mTLS for cross-host. API whitelist blocks dangerous opcodes by default. |
 | HIP Remote per-call TCP overhead | Latency-sensitive GPU workloads degraded | Medium | UDS for same-host (10x lower latency than TCP). Command batching in Phase 3. Benchmark against native to quantify. |
 | HIP Remote max 64 MB transfer limit | Large model weight loads fail | Low | Chunk transfers >64 MB at the client layer. Phase 3 adds transparent chunking. |

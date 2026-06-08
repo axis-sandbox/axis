@@ -11,9 +11,7 @@ use super::resources;
 use crate::sandbox::SandboxConfig;
 use axis_core::policy::{NetworkMode, Policy, ProcessPolicy};
 use axis_core::types::SandboxId;
-use std::ffi::CString;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 const CAP_NET_ADMIN_BIT: u32 = 12;
@@ -61,6 +59,7 @@ pub(crate) enum NetworkStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProxyNetworkSetup {
     IpNetnsWithCapNetAdmin,
+    AxisNetnsHelperLaunch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,11 +187,11 @@ impl CapabilityProbe for DefaultCapabilityProbe {
                 .and_then(|abi| u32::try_from(abi).ok()),
             seccomp: detect_seccomp(),
             cgroup_v2: detect_cgroup_v2(),
-            ip: command_available("ip"),
-            iptables: command_available("iptables"),
-            nft: command_available("nft"),
+            ip: super::netns::fixed_system_tool_available("ip"),
+            iptables: super::netns::fixed_system_tool_available("iptables"),
+            nft: super::netns::fixed_system_tool_available("nft"),
             cap_net_admin: detect_cap_net_admin(),
-            netns_helper: command_available("axis-netns-helper"),
+            netns_helper: super::netns::helper_available(),
             unprivileged_userns: detect_unprivileged_userns(),
             bubblewrap: super::bwrap::available(),
         }
@@ -345,9 +344,23 @@ fn plan_network(
             }
 
             if caps.netns_helper {
-                return Err(StrategyError::new(
-                    "network",
-                    "axis-netns-helper is available but helper-backed proxy setup is not implemented yet",
+                if policy.process.run_as_user.is_some() {
+                    return Err(StrategyError::new(
+                        "network",
+                        "axis-netns-helper proxy setup with run_as_user is not implemented yet",
+                    ));
+                }
+                if super::landlock::policy_uses_tmpdir(&policy.filesystem) {
+                    return Err(StrategyError::new(
+                        "network",
+                        "axis-netns-helper proxy setup with {tmpdir} filesystem policy is not implemented yet",
+                    ));
+                }
+                return Ok(proxy_plan(
+                    sandbox_id,
+                    ProxyNetworkSetup::AxisNetnsHelperLaunch,
+                    Some(FirewallTool::Iptables),
+                    proxy_addr,
                 ));
             }
 
@@ -571,27 +584,6 @@ fn detect_unprivileged_userns() -> bool {
         .unwrap_or(false)
 }
 
-fn command_available(command: &str) -> bool {
-    if command.contains('/') {
-        return path_access(Path::new(command), libc::X_OK);
-    }
-
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(command))
-        .any(|candidate| path_access(&candidate, libc::X_OK))
-}
-
-fn path_access(path: &Path, mode: libc::c_int) -> bool {
-    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    unsafe { libc::access(c_path.as_ptr(), mode) == 0 }
-}
-
 fn parse_cap_eff(status: &str) -> Option<u64> {
     status.lines().find_map(|line| {
         let value = line.strip_prefix("CapEff:")?.trim();
@@ -799,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_rejects_helper_until_runtime_support_exists() {
+    fn proxy_mode_uses_helper_launch_when_available_without_cap_net_admin() {
         let mut caps = full_caps();
         caps.cap_net_admin = false;
         caps.ip = false;
@@ -807,8 +799,42 @@ mod tests {
         caps.netns_helper = true;
         let sandbox_id = test_sandbox_id();
 
-        let err = plan_with_probe(
+        let plan = plan_with_probe(
             &policy(NetworkMode::Proxy),
+            sandbox_id,
+            tempfile::tempdir().unwrap().path(),
+            3128,
+            proxy_bind(sandbox_id, 3128),
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap();
+        let allocation = netns::proxy_netns_allocation(sandbox_id, 3128);
+
+        assert_eq!(
+            plan.network,
+            NetworkStrategy::Proxy {
+                setup: ProxyNetworkSetup::AxisNetnsHelperLaunch,
+                firewall: Some(FirewallTool::Iptables),
+                host_addr: allocation.host_addr,
+                sandbox_addr: allocation.sandbox_addr,
+                proxy_port: 3128,
+            }
+        );
+    }
+
+    #[test]
+    fn proxy_mode_rejects_helper_launch_with_run_as_user_until_supported() {
+        let mut caps = full_caps();
+        caps.cap_net_admin = false;
+        caps.ip = false;
+        caps.iptables = false;
+        caps.netns_helper = true;
+        let sandbox_id = test_sandbox_id();
+        let mut policy = policy(NetworkMode::Proxy);
+        policy.process.run_as_user = Some("sandbox-user".into());
+
+        let err = plan_with_probe(
+            &policy,
             sandbox_id,
             tempfile::tempdir().unwrap().path(),
             3128,
@@ -818,7 +844,32 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.area, "network");
-        assert!(err.message.contains("not implemented yet"));
+        assert!(err.message.contains("run_as_user"));
+    }
+
+    #[test]
+    fn proxy_mode_rejects_helper_launch_with_tmpdir_until_supported() {
+        let mut caps = full_caps();
+        caps.cap_net_admin = false;
+        caps.ip = false;
+        caps.iptables = false;
+        caps.netns_helper = true;
+        let sandbox_id = test_sandbox_id();
+        let mut policy = policy(NetworkMode::Proxy);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+
+        let err = plan_with_probe(
+            &policy,
+            sandbox_id,
+            tempfile::tempdir().unwrap().path(),
+            3128,
+            proxy_bind(sandbox_id, 3128),
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.area, "network");
+        assert!(err.message.contains("{tmpdir}"));
     }
 
     #[test]
