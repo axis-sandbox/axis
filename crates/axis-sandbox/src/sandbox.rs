@@ -87,6 +87,11 @@ impl Sandbox {
         config: SandboxConfig,
         manage_agent_workspace: bool,
     ) -> Result<Self, SandboxError> {
+        config
+            .policy
+            .validate()
+            .map_err(|e| SandboxError::CreationFailed(format!("invalid sandbox policy: {e}")))?;
+
         // Prepare agent workspace: create ~/.axis/agents/<name>/ and
         // symlink agent-expected directories (e.g., ~/.claude) to it.
         let mut agent_symlinks = if manage_agent_workspace {
@@ -230,5 +235,71 @@ fn create_platform_sandbox(config: &SandboxConfig) -> Result<Box<dyn SandboxImpl
             "platform '{}' is not yet supported",
             std::env::consts::OS
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axis_core::policy::{
+        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, ProcessPolicy,
+        SshPolicy,
+    };
+
+    fn test_config() -> SandboxConfig {
+        SandboxConfig {
+            id: SandboxId::new(),
+            policy: Policy {
+                version: 1,
+                name: "test".into(),
+                filesystem: FilesystemPolicy::default(),
+                process: ProcessPolicy::default(),
+                network: NetworkPolicy {
+                    mode: NetworkMode::Allow,
+                    policies: Vec::new(),
+                },
+                inference: InferencePolicy::default(),
+                gpu: GpuPolicy::default(),
+                ssh: SshPolicy::default(),
+                amd: None,
+            },
+            command: "true".into(),
+            args: Vec::new(),
+            working_dir: None,
+            workspace_dir: std::env::temp_dir().join("axis-sandbox-validation-test"),
+            env: Vec::new(),
+            proxy_port: 0,
+            proxy_addr: None,
+            capture_output: false,
+            timeout_sec: None,
+        }
+    }
+
+    #[test]
+    fn create_rejects_invalid_manual_resource_policy_before_platform_setup() {
+        let mut config = test_config();
+        config.policy.process.max_memory_mb = 0;
+
+        let err = match Sandbox::create(config) {
+            Ok(_) => panic!("invalid resource policy should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, SandboxError::CreationFailed(_)));
+        assert!(err.to_string().contains("max_memory_mb"));
+    }
+
+    #[test]
+    fn create_for_exec_rejects_invalid_manual_resource_policy_before_platform_setup() {
+        let mut config = test_config();
+        config.policy.process.max_processes = 0;
+
+        let err = match Sandbox::create_for_exec(config) {
+            Ok(_) => panic!("invalid resource policy should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, SandboxError::CreationFailed(_)));
+        assert!(err.to_string().contains("max_processes"));
     }
 }

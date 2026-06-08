@@ -116,6 +116,8 @@ pub struct ProcessPolicy {
     #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: u64,
 
+    /// CPU quota percentage. 0 disables CPU quota enforcement; 1..=100
+    /// requests the platform CPU quota mechanism.
     #[serde(default = "default_cpu_rate")]
     pub cpu_rate_percent: u32,
 
@@ -145,14 +147,19 @@ impl Default for ProcessPolicy {
 
 impl ProcessPolicy {
     fn validate(&self) -> Result<(), PolicyError> {
-        if self.cpu_rate_percent == 0 || self.cpu_rate_percent > 100 {
+        if self.cpu_rate_percent > 100 {
             return Err(PolicyError::ValidationError(format!(
-                "cpu_rate_percent must be 1..=100, got {}",
+                "cpu_rate_percent must be 0..=100, got {}",
                 self.cpu_rate_percent
             )));
         }
         if self.max_processes == 0 {
             return Err(PolicyError::ValidationError("max_processes must be > 0".into()));
+        }
+        if self.max_memory_mb == 0 {
+            return Err(PolicyError::ValidationError(
+                "max_memory_mb must be > 0".into(),
+            ));
         }
         Ok(())
     }
@@ -578,8 +585,22 @@ amd:
     }
 
     #[test]
-    fn reject_invalid_cpu_rate() {
+    fn allow_zero_cpu_rate_to_disable_cpu_quota() {
         let yaml = "version: 1\nname: test\nprocess:\n  cpu_rate_percent: 0\n";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert_eq!(policy.process.cpu_rate_percent, 0);
+    }
+
+    #[test]
+    fn reject_invalid_cpu_rate() {
+        let yaml = "version: 1\nname: test\nprocess:\n  cpu_rate_percent: 101\n";
+        let err = Policy::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, PolicyError::ValidationError(_)));
+    }
+
+    #[test]
+    fn reject_zero_memory_limit() {
+        let yaml = "version: 1\nname: test\nprocess:\n  max_memory_mb: 0\n";
         let err = Policy::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, PolicyError::ValidationError(_)));
     }

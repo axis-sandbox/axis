@@ -7,6 +7,7 @@
 //! spawned. Later setup code consumes this plan; the important property here is
 //! that fallbacks are explicit and unsupported combinations fail before launch.
 
+use super::resources;
 use crate::sandbox::SandboxConfig;
 use axis_core::policy::{NetworkMode, Policy, ProcessPolicy};
 use axis_core::types::SandboxId;
@@ -530,7 +531,7 @@ fn detect_cgroup_v2() -> CgroupV2Support {
         return CgroupV2Support::Unavailable;
     }
 
-    if path_access(Path::new("/sys/fs/cgroup"), libc::W_OK) {
+    if resources::probe_cgroup_v2_delegation(Path::new("/sys/fs/cgroup")).is_ok() {
         CgroupV2Support::Writable
     } else {
         CgroupV2Support::AvailableReadOnly
@@ -1119,12 +1120,33 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_absence_allows_memory_only_rlimit_fallback() {
+    fn cgroup_absence_with_full_cpu_quota_is_fatal() {
         let mut caps = full_caps();
         caps.cgroup_v2 = CgroupV2Support::Unavailable;
 
         let mut policy = policy(NetworkMode::Allow);
-        policy.process.max_processes = 0;
+        policy.process.cpu_rate_percent = 100;
+        let err = plan_with_probe(
+            &policy,
+            SandboxId::new(),
+            tempfile::tempdir().unwrap().path(),
+            0,
+            None,
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.area, "resources");
+        assert!(err.message.contains("CPU rate limits"));
+    }
+
+    #[test]
+    fn cgroup_absence_allows_rlimit_fallback_when_cpu_is_not_requested() {
+        let mut caps = full_caps();
+        caps.cgroup_v2 = CgroupV2Support::Unavailable;
+
+        let mut policy = policy(NetworkMode::Allow);
+        policy.process.run_as_user = Some("sandbox-user".into());
         policy.process.cpu_rate_percent = 0;
 
         let plan = plan(&policy, caps, 0);
@@ -1133,7 +1155,7 @@ mod tests {
             plan.resources,
             ResourceStrategy::RlimitFallback {
                 memory_limit: true,
-                process_limit: ProcessLimitFallback::NotRequested,
+                process_limit: ProcessLimitFallback::RlimitNprocWithDedicatedUser,
                 cpu_limit: CpuLimitFallback::NotRequested,
             }
         );
@@ -1178,28 +1200,6 @@ mod tests {
             ResourceStrategy::RlimitFallback {
                 memory_limit: true,
                 process_limit: ProcessLimitFallback::RlimitNprocWithDedicatedUser,
-                cpu_limit: CpuLimitFallback::NotRequested,
-            }
-        );
-    }
-
-    #[test]
-    fn rlimit_fallback_records_unrequested_limits() {
-        let mut caps = full_caps();
-        caps.cgroup_v2 = CgroupV2Support::Unavailable;
-
-        let mut policy = policy(NetworkMode::Allow);
-        policy.process.max_memory_mb = 0;
-        policy.process.max_processes = 0;
-        policy.process.cpu_rate_percent = 0;
-
-        let plan = plan(&policy, caps, 0);
-
-        assert_eq!(
-            plan.resources,
-            ResourceStrategy::RlimitFallback {
-                memory_limit: false,
-                process_limit: ProcessLimitFallback::NotRequested,
                 cpu_limit: CpuLimitFallback::NotRequested,
             }
         );

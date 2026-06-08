@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 /// Base port for dynamic proxy allocation.
 const PROXY_PORT_BASE: u16 = 13100;
 const EXEC_OUTPUT_DIR: &str = ".axis-exec";
+const TIMEOUT_DESTROY_ATTEMPTS: usize = 3;
+const TIMEOUT_DESTROY_RETRY_DELAY_MS: u64 = 100;
 
 /// Atomic counter for allocating unique proxy ports.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(PROXY_PORT_BASE);
@@ -88,421 +90,103 @@ impl SandboxManager {
         }
     }
 
-    /// Create and start a new sandbox with its own proxy (and optional GPU worker).
-    pub async fn create(
-        &mut self,
+    /// Create and start a new sandbox with its own proxy (and optional GPU worker)
+    /// without holding the manager mutex across slow setup operations.
+    pub async fn create_from_shared(
+        mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
         policy: Policy,
         command: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
     ) -> Result<SandboxId, String> {
         let id = SandboxId::new();
-        let workspace_dir = self.sandbox_base_dir.join(id.to_string());
-        std::fs::create_dir_all(&workspace_dir).map_err(|e| e.to_string())?;
-
+        let workspace_dir = {
+            let manager = mgr.lock().await;
+            let workspace_dir = manager.sandbox_base_dir.join(id.to_string());
+            std::fs::create_dir_all(&workspace_dir).map_err(|e| e.to_string())?;
+            workspace_dir
+        };
         let policy_name = policy.name.clone();
         let gpu_enabled = policy.gpu.enabled;
 
         // 1. Start inference server if policy has routes with a local endpoint.
-        let inference_endpoint = self.ensure_inference_server(&policy).await;
+        let inference_endpoint = ensure_inference_server_from_shared(mgr.clone(), &policy).await;
 
         // 2. Start the proxy only for proxy-mode policies.
         let (proxy_addr, proxy_shutdown) =
-            start_proxy_for_sandbox(id, &policy, inference_endpoint).await?;
-
-        // 3. Optionally start a GPU worker.
-        let mut extra_env: Vec<(String, String)> = Vec::new();
-
-        if gpu_enabled {
-            let gpu_filter_policy = GpuFilterPolicy {
-                enabled: true,
-                device: policy.gpu.device,
-                transport: match policy.gpu.transport {
-                    axis_core::policy::GpuTransport::Uds => axis_gpu::api_filter::GpuTransport::Uds,
-                    axis_core::policy::GpuTransport::Tcp => axis_gpu::api_filter::GpuTransport::Tcp,
-                },
-                vram_limit_mb: policy.gpu.vram_limit_mb,
-                compute_timeout_sec: policy.gpu.compute_timeout_sec,
-                allowed_apis: Vec::new(), // use defaults
-                denied_apis: Vec::new(),  // use defaults
+            match start_proxy_for_sandbox(id, &policy, inference_endpoint).await {
+                Ok(proxy) => proxy,
+                Err(e) => {
+                    cleanup_failed_create_workspace(&workspace_dir);
+                    return Err(e);
+                }
             };
 
-            match self
-                .gpu_manager
-                .spawn_worker(id, &gpu_filter_policy, &workspace_dir)
-                .await
-            {
-                Ok(endpoint) => {
-                    tracing::info!("sandbox {id}: GPU worker on {endpoint}");
-                    extra_env.extend(endpoint.to_env_vars());
-                    // Add hip-remote client library to LD_LIBRARY_PATH so the sandbox
-                    // picks up our libamdhip64.so instead of the real one.
-                    let client_lib_dir = find_hip_client_lib();
-                    if let Some(dir) = client_lib_dir {
-                        extra_env.push(("LD_LIBRARY_PATH".into(), dir));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "sandbox {id}: GPU worker failed: {e} (sandbox will run without GPU)"
-                    );
-                }
-            }
-        }
+        // 3. Optionally start a GPU worker.
+        let extra_env =
+            spawn_gpu_worker_from_shared(mgr.clone(), id, &policy, &workspace_dir).await;
 
         // 4. Create and start the sandbox process.
-        let mut all_env = env;
-        all_env.extend(extra_env);
-
-        let timeout_sec = policy.process.timeout_sec;
-        tracing::info!("sandbox {id}: spawning: {command} {}", args.join(" "));
-        let config = SandboxConfig {
+        let managed = match start_managed_sandbox(
             id,
-            policy: policy.clone(),
+            policy,
+            policy_name.clone(),
+            gpu_enabled,
             command,
             args,
-            working_dir: None,
-            workspace_dir,
-            env: all_env.clone(),
-            proxy_port: proxy_addr.map(|addr| addr.port()).unwrap_or(0),
+            env,
+            extra_env,
+            workspace_dir.clone(),
             proxy_addr,
-            capture_output: true,
-            timeout_sec,
-        };
-
-        let mut sandbox = match Sandbox::create(config) {
-            Ok(sandbox) => sandbox,
+            proxy_shutdown,
+        ) {
+            Ok(managed) => managed,
             Err(e) => {
-                shutdown_proxy(proxy_shutdown);
-                return Err(e.to_string());
+                if gpu_enabled {
+                    stop_gpu_worker_from_shared(mgr.clone(), &id).await;
+                }
+                cleanup_failed_create_workspace(&workspace_dir);
+                return Err(e);
             }
         };
-        if let Err(e) = sandbox.start() {
-            let cleanup_error = sandbox.destroy().err();
-            shutdown_proxy(proxy_shutdown);
-            if let Some(cleanup_error) = cleanup_error {
-                return Err(format!("sandbox start: {e}; cleanup: {cleanup_error}"));
-            }
-            return Err(format!("sandbox start: {e}"));
-        }
 
-        let gpu_label = if gpu_enabled { ", gpu=on" } else { "" };
-        let proxy_label = proxy_addr
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "none".into());
-        tracing::info!(
-            "sandbox {id}: started (pid={}, proxy={proxy_label}, policy='{policy_name}'{gpu_label})",
-            sandbox.pid.unwrap_or(0),
-        );
-        self.audit.sandbox_created(id, &policy_name);
-
-        // Spawn background task to read output and broadcast to WebSocket clients.
-        // Prefer ConPTY read handle (real terminal output with ANSI) over piped stdout.
-        let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
-        let output_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
-        tracing::info!(
-            "sandbox {id}: stdout={}, stderr={}, stdin={}, pty_read={}",
-            sandbox.stdout.is_some(),
-            sandbox.stderr.is_some(),
-            sandbox.stdin.is_some(),
-            sandbox.pty_read.is_some()
-        );
-
-        // Check for file-based output (Windows uses stdout.log in workspace).
-        let stdout_log = sandbox.workspace_dir.join("stdout.log");
-        if stdout_log.exists() && sandbox.stdout.is_none() {
-            let tx = output_tx.clone();
-            let buf_clone = output_buffer.clone();
-            tokio::task::spawn_blocking(move || {
-                use std::io::{BufRead, BufReader};
-                let file = match std::fs::File::open(&stdout_log) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!("can't open stdout.log: {e}");
-                        return;
-                    }
-                };
-                let mut reader = BufReader::new(file);
-                let mut eof_count = 0;
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => {
-                            // EOF — sleep and retry (tail -f).
-                            eof_count += 1;
-                            if eof_count > 600 {
-                                break;
-                            } // Stop after 60s of no data.
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        Ok(_) => {
-                            eof_count = 0;
-                            let data = line.into_bytes();
-                            if let Ok(mut b) = buf_clone.lock() {
-                                b.push(data.clone());
-                                if b.len() > 1000 {
-                                    b.drain(..500);
-                                }
-                            }
-                            if tx.send(data).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-
-        if let Some(pty_read) = sandbox.pty_read.take() {
-            // ConPTY pipe: use a blocking thread since Windows pipe handles
-            // can't be used with tokio's async file I/O.
-            let tx = output_tx.clone();
-            tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let mut reader = pty_read;
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = tx.send(buf[..n].to_vec());
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        } else {
-            // Fallback: piped stdout/stderr (non-TTY).
-            if let Some(stdout) = sandbox.stdout.take() {
-                let tx = output_tx.clone();
-                let buf_clone = output_buffer.clone();
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    let mut stdout = stdout;
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stdout.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let data = buf[..n].to_vec();
-                                // Buffer for late-connecting clients.
-                                if let Ok(mut b) = buf_clone.lock() {
-                                    b.push(data.clone());
-                                    // Cap buffer at 1000 chunks (~4MB).
-                                    if b.len() > 1000 {
-                                        b.drain(..500);
-                                    }
-                                }
-                                let _ = tx.send(data);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
-            }
-            if let Some(stderr) = sandbox.stderr.take() {
-                let tx = output_tx.clone();
-                let buf_clone = output_buffer.clone();
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    let mut stderr = stderr;
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stderr.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let data = buf[..n].to_vec();
-                                if let Ok(mut b) = buf_clone.lock() {
-                                    b.push(data.clone());
-                                    if b.len() > 1000 {
-                                        b.drain(..500);
-                                    }
-                                }
-                                let _ = tx.send(data);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
-            }
-        }
-
-        // Set up stdin writer — spawn task that reads from channel and writes to child stdin.
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        if let Some(stdin) = sandbox.stdin.take() {
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let mut stdin = tokio::process::ChildStdin::from_std(stdin).unwrap();
-                while let Some(data) = input_rx.recv().await {
-                    if stdin.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    if stdin.flush().await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        self.sandboxes.insert(
-            id,
-            ManagedSandbox {
-                sandbox,
-                policy,
-                env: all_env,
-                proxy_addr,
-                proxy_shutdown,
-                gpu_enabled,
-                policy_name: policy_name.clone(),
-                output_tx: Some(output_tx),
-                output_buffer,
-                input_tx: Some(input_tx),
-            },
-        );
+        let mut manager = mgr.lock().await;
+        manager.audit.sandbox_created(id, &policy_name);
+        manager.sandboxes.insert(id, managed);
 
         Ok(id)
     }
 
-    /// Start or reuse an inference server based on the policy's inference config.
-    async fn ensure_inference_server(&mut self, policy: &Policy) -> Option<SocketAddr> {
-        // If we already have a running inference server, reuse it.
-        if let Some(ref server) = self.inference_server {
-            if server.healthy {
-                return server.addr();
-            }
-        }
-
-        // Check if the policy has a local inference route.
-        let local_route = policy.inference.routes.iter().find(|r| {
-            r.endpoint.is_some()
-                && r.endpoint.as_ref().is_some_and(|e| {
-                    e.starts_with("http://localhost") || e.starts_with("http://127.0.0.1")
-                })
-        });
-
-        if local_route.is_none() && policy.inference.routes.is_empty() {
-            return None;
-        }
-
-        // Try to find a model to serve.
-        let registry = axis_router::models::ModelRegistry::new();
-        let model_path = policy.inference.routes.iter().find_map(|r| {
-            r.model.as_ref().and_then(|name| {
-                registry
-                    .get(name)
-                    .and_then(|entry| entry.local_path.clone())
-            })
-        });
-
-        let Some(model_path) = model_path else {
-            tracing::info!("inference: no local model available, skipping server start");
-            return None;
-        };
-
-        // Start a managed llama-server or embedded server.
-        let mode = if which_exists("llama-server") {
-            ServerMode::Managed {
-                backend: ManagedBackend::LlamaServer,
-                binary: PathBuf::from("llama-server"),
-                extra_args: vec![],
-            }
-        } else {
-            ServerMode::Embedded {
-                n_gpu_layers: 0, // CPU-only by default
-                context_size: 4096,
-            }
-        };
-
-        let mut server = InferenceServer::new(mode);
-        match server.start(&model_path).await {
-            Ok(addr) => {
-                tracing::info!(
-                    "inference: server started on {addr} (model={})",
-                    model_path.display()
-                );
-                self.inference_server = Some(server);
-                Some(addr)
-            }
-            Err(e) => {
-                tracing::warn!("inference: server start failed: {e}");
-                None
-            }
-        }
-    }
-
-    /// Execute a command inside an existing sandbox's workspace.
-    ///
-    /// The command runs with the same optional proxy env vars and working directory
-    /// as the original sandbox process. On Linux, it inherits the sandbox's
-    /// Landlock and seccomp restrictions via a fresh pre_exec application.
-    pub async fn exec_in_sandbox(
-        &mut self,
-        id: &SandboxId,
+    /// Execute a command inside an existing sandbox's workspace without
+    /// holding the manager mutex while the command runs.
+    pub async fn exec_in_sandbox_from_shared(
+        mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+        id: SandboxId,
         command: String,
         args: Vec<String>,
     ) -> Result<i32, String> {
         let (policy, workspace, env) = {
-            let managed = self
-                .sandboxes
-                .get(id)
-                .ok_or_else(|| format!("sandbox not found: {id}"))?;
-            (
-                managed.policy.clone(),
-                managed.sandbox.workspace_dir.clone(),
-                managed.env.clone(),
-            )
+            let manager = mgr.lock().await;
+            manager.exec_context(&id)?
         };
-        let exec_id = SandboxId::new();
-        let inference_endpoint = self.ensure_inference_server(&policy).await;
-        let (exec_proxy_addr, mut exec_proxy_shutdown) =
-            start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
-        let config = contained_exec_config_from(
-            &policy,
-            &workspace,
-            &env,
-            exec_id,
-            exec_proxy_addr,
-            command.clone(),
-            args.clone(),
-        );
-        let exec_workspace = config.workspace_dir.clone();
+        let inference_endpoint = ensure_inference_server_from_shared(mgr, &policy).await;
 
-        tracing::info!("sandbox {id}: exec '{command}' in {}", workspace.display());
+        run_contained_exec(policy, workspace, env, inference_endpoint, command, args).await
+    }
 
-        let mut exec_sandbox = match Sandbox::create_for_exec(config) {
-            Ok(sandbox) => sandbox,
-            Err(e) => {
-                shutdown_proxy(exec_proxy_shutdown.take());
-                cleanup_contained_exec_workspace(&exec_workspace);
-                return Err(format!("exec sandbox create: {e}"));
-            }
-        };
-        if let Err(e) = exec_sandbox.start() {
-            let _ = exec_sandbox.destroy();
-            shutdown_proxy(exec_proxy_shutdown.take());
-            cleanup_contained_exec_workspace(&exec_workspace);
-            return Err(format!("exec sandbox start: {e}"));
-        }
-        let code = match exec_sandbox.wait().await {
-            Ok(code) => code,
-            Err(e) => {
-                let _ = exec_sandbox.destroy();
-                shutdown_proxy(exec_proxy_shutdown.take());
-                cleanup_contained_exec_workspace(&exec_workspace);
-                return Err(format!("exec sandbox wait: {e}"));
-            }
-        };
-        if let Err(e) = exec_sandbox.destroy() {
-            shutdown_proxy(exec_proxy_shutdown.take());
-            cleanup_contained_exec_workspace(&exec_workspace);
-            return Err(format!("exec sandbox cleanup: {e}"));
-        }
-        shutdown_proxy(exec_proxy_shutdown.take());
-        cleanup_contained_exec_workspace(&exec_workspace);
-
-        tracing::info!("sandbox {id}: exec '{command}' exited with code {code}");
-        Ok(code)
+    fn exec_context(
+        &self,
+        id: &SandboxId,
+    ) -> Result<(Policy, PathBuf, Vec<(String, String)>), String> {
+        let managed = self
+            .sandboxes
+            .get(id)
+            .ok_or_else(|| format!("sandbox not found: {id}"))?;
+        Ok((
+            managed.policy.clone(),
+            managed.sandbox.workspace_dir.clone(),
+            managed.env.clone(),
+        ))
     }
 
     /// Destroy a sandbox, its proxy, and its GPU worker.
@@ -522,6 +206,7 @@ impl SandboxManager {
         }
 
         if let Err(e) = sandbox_cleanup {
+            managed.sandbox.status = SandboxStatus::Failed;
             return Err(e);
         }
 
@@ -579,6 +264,451 @@ impl SandboxManager {
             Some((buffer, rx))
         })
     }
+}
+
+async fn ensure_inference_server_from_shared(
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+    policy: &Policy,
+) -> Option<SocketAddr> {
+    {
+        let manager = mgr.lock().await;
+        if let Some(addr) = current_inference_endpoint(&manager) {
+            return Some(addr);
+        }
+    }
+
+    let Some((server, addr)) = start_inference_server_for_policy(policy).await else {
+        return None;
+    };
+
+    let mut manager = mgr.lock().await;
+    if let Some(existing_addr) = current_inference_endpoint(&manager) {
+        return Some(existing_addr);
+    }
+    manager.inference_server = Some(server);
+    Some(addr)
+}
+
+fn current_inference_endpoint(manager: &SandboxManager) -> Option<SocketAddr> {
+    manager
+        .inference_server
+        .as_ref()
+        .filter(|server| server.healthy)
+        .and_then(|server| server.addr())
+}
+
+async fn start_inference_server_for_policy(
+    policy: &Policy,
+) -> Option<(InferenceServer, SocketAddr)> {
+    let Some((model_path, mode)) = inference_server_start_plan(policy) else {
+        return None;
+    };
+
+    let mut server = InferenceServer::new(mode);
+    match server.start(&model_path).await {
+        Ok(addr) => {
+            tracing::info!(
+                "inference: server started on {addr} (model={})",
+                model_path.display()
+            );
+            Some((server, addr))
+        }
+        Err(e) => {
+            tracing::warn!("inference: server start failed: {e}");
+            None
+        }
+    }
+}
+
+fn inference_server_start_plan(policy: &Policy) -> Option<(PathBuf, ServerMode)> {
+    let local_route = policy.inference.routes.iter().find(|r| {
+        r.endpoint.is_some()
+            && r.endpoint.as_ref().is_some_and(|e| {
+                e.starts_with("http://localhost") || e.starts_with("http://127.0.0.1")
+            })
+    });
+
+    if local_route.is_none() && policy.inference.routes.is_empty() {
+        return None;
+    }
+
+    let registry = axis_router::models::ModelRegistry::new();
+    let model_path = policy.inference.routes.iter().find_map(|r| {
+        r.model.as_ref().and_then(|name| {
+            registry
+                .get(name)
+                .and_then(|entry| entry.local_path.clone())
+        })
+    });
+
+    let Some(model_path) = model_path else {
+        tracing::info!("inference: no local model available, skipping server start");
+        return None;
+    };
+
+    let mode = if which_exists("llama-server") {
+        ServerMode::Managed {
+            backend: ManagedBackend::LlamaServer,
+            binary: PathBuf::from("llama-server"),
+            extra_args: vec![],
+        }
+    } else {
+        ServerMode::Embedded {
+            n_gpu_layers: 0,
+            context_size: 4096,
+        }
+    };
+
+    Some((model_path, mode))
+}
+
+async fn spawn_gpu_worker_from_shared(
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+    id: SandboxId,
+    policy: &Policy,
+    workspace_dir: &Path,
+) -> Vec<(String, String)> {
+    if !policy.gpu.enabled {
+        return Vec::new();
+    }
+
+    let gpu_filter_policy = GpuFilterPolicy {
+        enabled: true,
+        device: policy.gpu.device,
+        transport: match policy.gpu.transport {
+            axis_core::policy::GpuTransport::Uds => axis_gpu::api_filter::GpuTransport::Uds,
+            axis_core::policy::GpuTransport::Tcp => axis_gpu::api_filter::GpuTransport::Tcp,
+        },
+        vram_limit_mb: policy.gpu.vram_limit_mb,
+        compute_timeout_sec: policy.gpu.compute_timeout_sec,
+        allowed_apis: Vec::new(),
+        denied_apis: Vec::new(),
+    };
+
+    let endpoint_result = {
+        let mut manager = mgr.lock().await;
+        manager
+            .gpu_manager
+            .spawn_worker(id, &gpu_filter_policy, workspace_dir)
+    };
+
+    match endpoint_result {
+        Ok(endpoint) => {
+            tracing::info!("sandbox {id}: GPU worker on {endpoint}");
+            let mut extra_env = endpoint.to_env_vars();
+            if let Some(dir) = find_hip_client_lib() {
+                extra_env.push(("LD_LIBRARY_PATH".into(), dir));
+            }
+            extra_env
+        }
+        Err(e) => {
+            tracing::warn!("sandbox {id}: GPU worker failed: {e} (sandbox will run without GPU)");
+            Vec::new()
+        }
+    }
+}
+
+async fn stop_gpu_worker_from_shared(
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+    id: &SandboxId,
+) {
+    let mut manager = mgr.lock().await;
+    if let Err(e) = manager.gpu_manager.stop_worker(id) {
+        tracing::warn!("sandbox {id}: GPU worker cleanup: {e}");
+    }
+}
+
+fn start_managed_sandbox(
+    id: SandboxId,
+    policy: Policy,
+    policy_name: String,
+    gpu_enabled: bool,
+    command: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    extra_env: Vec<(String, String)>,
+    workspace_dir: PathBuf,
+    proxy_addr: Option<SocketAddr>,
+    proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<ManagedSandbox, String> {
+    let mut all_env = env;
+    all_env.extend(extra_env);
+
+    let timeout_sec = policy.process.timeout_sec;
+    tracing::info!("sandbox {id}: spawning: {command} {}", args.join(" "));
+    let config = SandboxConfig {
+        id,
+        policy: policy.clone(),
+        command,
+        args,
+        working_dir: None,
+        workspace_dir,
+        env: all_env.clone(),
+        proxy_port: proxy_addr.map(|addr| addr.port()).unwrap_or(0),
+        proxy_addr,
+        capture_output: true,
+        timeout_sec,
+    };
+
+    let mut sandbox = match Sandbox::create(config) {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            shutdown_proxy(proxy_shutdown);
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = sandbox.start() {
+        let cleanup_error = sandbox.destroy().err();
+        shutdown_proxy(proxy_shutdown);
+        if let Some(cleanup_error) = cleanup_error {
+            return Err(format!("sandbox start: {e}; cleanup: {cleanup_error}"));
+        }
+        return Err(format!("sandbox start: {e}"));
+    }
+
+    let gpu_label = if gpu_enabled { ", gpu=on" } else { "" };
+    let proxy_label = proxy_addr
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "none".into());
+    tracing::info!(
+        "sandbox {id}: started (pid={}, proxy={proxy_label}, policy='{policy_name}'{gpu_label})",
+        sandbox.pid.unwrap_or(0),
+    );
+
+    Ok(managed_sandbox_from_started(
+        sandbox,
+        policy,
+        all_env,
+        proxy_addr,
+        proxy_shutdown,
+        gpu_enabled,
+        policy_name,
+    ))
+}
+
+fn managed_sandbox_from_started(
+    mut sandbox: Sandbox,
+    policy: Policy,
+    all_env: Vec<(String, String)>,
+    proxy_addr: Option<SocketAddr>,
+    proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    gpu_enabled: bool,
+    policy_name: String,
+) -> ManagedSandbox {
+    let id = sandbox.id;
+    let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
+    let output_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    tracing::info!(
+        "sandbox {id}: stdout={}, stderr={}, stdin={}, pty_read={}",
+        sandbox.stdout.is_some(),
+        sandbox.stderr.is_some(),
+        sandbox.stdin.is_some(),
+        sandbox.pty_read.is_some()
+    );
+
+    let stdout_log = sandbox.workspace_dir.join("stdout.log");
+    if stdout_log.exists() && sandbox.stdout.is_none() {
+        let tx = output_tx.clone();
+        let buf_clone = output_buffer.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader};
+            let file = match std::fs::File::open(&stdout_log) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("can't open stdout.log: {e}");
+                    return;
+                }
+            };
+            let mut reader = BufReader::new(file);
+            let mut eof_count = 0;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        eof_count += 1;
+                        if eof_count > 600 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Ok(_) => {
+                        eof_count = 0;
+                        let data = line.into_bytes();
+                        if let Ok(mut b) = buf_clone.lock() {
+                            b.push(data.clone());
+                            if b.len() > 1000 {
+                                b.drain(..500);
+                            }
+                        }
+                        if tx.send(data).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    if let Some(pty_read) = sandbox.pty_read.take() {
+        let tx = output_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut reader = pty_read;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = tx.send(buf[..n].to_vec());
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    } else {
+        if let Some(stdout) = sandbox.stdout.take() {
+            let tx = output_tx.clone();
+            let buf_clone = output_buffer.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut stdout = stdout;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stdout.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let data = buf[..n].to_vec();
+                            if let Ok(mut b) = buf_clone.lock() {
+                                b.push(data.clone());
+                                if b.len() > 1000 {
+                                    b.drain(..500);
+                                }
+                            }
+                            let _ = tx.send(data);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = sandbox.stderr.take() {
+            let tx = output_tx.clone();
+            let buf_clone = output_buffer.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut stderr = stderr;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let data = buf[..n].to_vec();
+                            if let Ok(mut b) = buf_clone.lock() {
+                                b.push(data.clone());
+                                if b.len() > 1000 {
+                                    b.drain(..500);
+                                }
+                            }
+                            let _ = tx.send(data);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
+
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    if let Some(stdin) = sandbox.stdin.take() {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = tokio::process::ChildStdin::from_std(stdin).unwrap();
+            while let Some(data) = input_rx.recv().await {
+                if stdin.write_all(&data).await.is_err() {
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    ManagedSandbox {
+        sandbox,
+        policy,
+        env: all_env,
+        proxy_addr,
+        proxy_shutdown,
+        gpu_enabled,
+        policy_name,
+        output_tx: Some(output_tx),
+        output_buffer,
+        input_tx: Some(input_tx),
+    }
+}
+
+async fn run_contained_exec(
+    policy: Policy,
+    workspace: PathBuf,
+    env: Vec<(String, String)>,
+    inference_endpoint: Option<SocketAddr>,
+    command: String,
+    args: Vec<String>,
+) -> Result<i32, String> {
+    let exec_id = SandboxId::new();
+    let (exec_proxy_addr, mut exec_proxy_shutdown) =
+        start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
+    let config = contained_exec_config_from(
+        &policy,
+        &workspace,
+        &env,
+        exec_id,
+        exec_proxy_addr,
+        command.clone(),
+        args.clone(),
+    );
+    let exec_workspace = config.workspace_dir.clone();
+
+    tracing::info!(
+        "exec sandbox {exec_id}: '{command}' in {}",
+        workspace.display()
+    );
+
+    let mut exec_sandbox = match Sandbox::create_for_exec(config) {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            shutdown_proxy(exec_proxy_shutdown.take());
+            cleanup_contained_exec_workspace(&exec_workspace);
+            return Err(format!("exec sandbox create: {e}"));
+        }
+    };
+    if let Err(e) = exec_sandbox.start() {
+        let _ = exec_sandbox.destroy();
+        shutdown_proxy(exec_proxy_shutdown.take());
+        cleanup_contained_exec_workspace(&exec_workspace);
+        return Err(format!("exec sandbox start: {e}"));
+    }
+    let code = match exec_sandbox.wait().await {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = exec_sandbox.destroy();
+            shutdown_proxy(exec_proxy_shutdown.take());
+            cleanup_contained_exec_workspace(&exec_workspace);
+            return Err(format!("exec sandbox wait: {e}"));
+        }
+    };
+    if let Err(e) = exec_sandbox.destroy() {
+        shutdown_proxy(exec_proxy_shutdown.take());
+        cleanup_contained_exec_workspace(&exec_workspace);
+        return Err(format!("exec sandbox cleanup: {e}"));
+    }
+    shutdown_proxy(exec_proxy_shutdown.take());
+    cleanup_contained_exec_workspace(&exec_workspace);
+
+    tracing::info!("exec sandbox {exec_id}: '{command}' exited with code {code}");
+    Ok(code)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -727,6 +857,60 @@ fn shutdown_proxy(tx: Option<tokio::sync::oneshot::Sender<()>>) {
     }
 }
 
+pub(crate) fn schedule_sandbox_timeout(
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+    id: SandboxId,
+    timeout_sec: Option<u64>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    schedule_sandbox_timeout_after(
+        id,
+        timeout_sec.map(std::time::Duration::from_secs),
+        std::time::Duration::from_millis(TIMEOUT_DESTROY_RETRY_DELAY_MS),
+        move |id| {
+            let mgr = mgr.clone();
+            async move {
+                let mut manager = mgr.lock().await;
+                manager.destroy(&id)
+            }
+        },
+    )
+}
+
+fn schedule_sandbox_timeout_after<D, Fut>(
+    id: SandboxId,
+    timeout: Option<std::time::Duration>,
+    retry_delay: std::time::Duration,
+    mut destroy: D,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    D: FnMut(SandboxId) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let timeout = timeout?;
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        for attempt in 1..=TIMEOUT_DESTROY_ATTEMPTS {
+            match destroy(id).await {
+                Ok(()) => {
+                    tracing::warn!(
+                        "sandbox {id}: destroyed after {}s timeout",
+                        timeout.as_secs()
+                    );
+                    return;
+                }
+                Err(e) if e.contains("sandbox not found") => return,
+                Err(e) if attempt == TIMEOUT_DESTROY_ATTEMPTS => {
+                    tracing::warn!("sandbox {id}: timeout cleanup failed: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!("sandbox {id}: timeout cleanup attempt {attempt} failed: {e}");
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        }
+    }))
+}
+
 fn apply_proxy_env(cmd: &mut std::process::Command, proxy_addr: Option<SocketAddr>) {
     let Some(proxy_addr) = proxy_addr else {
         return;
@@ -786,6 +970,17 @@ fn cleanup_contained_exec_workspace(path: &Path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!("failed to remove exec workspace {}: {e}", path.display()),
+    }
+}
+
+fn cleanup_failed_create_workspace(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            "failed to remove sandbox workspace after create failure {}: {e}",
+            path.display()
+        ),
     }
 }
 
@@ -869,6 +1064,7 @@ impl SandboxBackend for SandboxManagerBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
     {
         let policy_yaml = policy_yaml.to_string();
+        let mgr_handle = self.mgr.clone();
         // Collect essential env vars for the sandbox (same logic as axis-cli).
         let env = collect_sandbox_env();
         let claude_vars: Vec<_> = env
@@ -886,8 +1082,11 @@ impl SandboxBackend for SandboxManagerBackend {
         Box::pin(async move {
             let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)
                 .map_err(|e| format!("invalid policy: {e}"))?;
-            let mut mgr = self.mgr.lock().await;
-            let id = mgr.create(policy, command, args, env).await?;
+            let timeout_sec = policy.process.timeout_sec;
+            let id =
+                SandboxManager::create_from_shared(mgr_handle.clone(), policy, command, args, env)
+                    .await?;
+            let _ = schedule_sandbox_timeout(mgr_handle.clone(), id, timeout_sec);
             Ok(id.to_string())
         })
     }
@@ -957,10 +1156,11 @@ impl SandboxBackend for SandboxManagerBackend {
             let sandbox_id: axis_core::types::SandboxId = id
                 .parse()
                 .map_err(|_| format!("invalid sandbox id: {id}"))?;
-            let mgr = self.mgr.lock().await;
-            let tx = mgr
-                .get_input_sender(&sandbox_id)
-                .ok_or_else(|| "sandbox not found or stdin not available".to_string())?;
+            let tx = {
+                let mgr = self.mgr.lock().await;
+                mgr.get_input_sender(&sandbox_id)
+                    .ok_or_else(|| "sandbox not found or stdin not available".to_string())?
+            };
             tx.send(data).await.map_err(|e| format!("stdin send: {e}"))
         })
     }
@@ -1174,6 +1374,123 @@ mod tests {
         assert!(workspace.exists());
         assert!(!exec_workspace.exists());
         std::fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failed_create_workspace_removes_sandbox_workspace() {
+        let workspace = std::env::temp_dir().join(format!(
+            "axis-daemon-create-cleanup-test-{}",
+            SandboxId::new()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("stdout.log"), b"partial create output").unwrap();
+
+        cleanup_failed_create_workspace(&workspace);
+
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn timeout_scheduler_without_timeout_does_not_spawn() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000201").unwrap();
+
+        let handle = schedule_sandbox_timeout_after(
+            id,
+            None,
+            std::time::Duration::from_millis(1),
+            |_| async { Ok::<(), String>(()) },
+        );
+
+        assert!(handle.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_scheduler_invokes_destroy_after_delay() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000202").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        let handle = schedule_sandbox_timeout_after(
+            id,
+            Some(std::time::Duration::from_millis(10)),
+            std::time::Duration::from_millis(1),
+            move |destroyed_id| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(destroyed_id).await.unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        handle.await.unwrap();
+
+        assert_eq!(observed, id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_scheduler_ignores_missing_sandbox_after_delay() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000203").unwrap();
+
+        let handle = schedule_sandbox_timeout_after(
+            id,
+            Some(std::time::Duration::from_millis(1)),
+            std::time::Duration::from_millis(1),
+            move |_| async move { Err(format!("sandbox not found: {id}")) },
+        )
+        .unwrap();
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_scheduler_reports_destroy_failure_without_panicking() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000204").unwrap();
+
+        let handle = schedule_sandbox_timeout_after(
+            id,
+            Some(std::time::Duration::from_millis(1)),
+            std::time::Duration::from_millis(1),
+            |_| async { Err("cleanup failed".to_string()) },
+        )
+        .unwrap();
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_scheduler_retries_destroy_failures() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000205").unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let handle = schedule_sandbox_timeout_after(
+            id,
+            Some(std::time::Duration::from_millis(1)),
+            std::time::Duration::from_millis(1),
+            {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err("cleanup failed".to_string())
+                    }
+                }
+            },
+        )
+        .unwrap();
+
+        handle.await.unwrap();
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            TIMEOUT_DESTROY_ATTEMPTS
+        );
     }
 
     fn test_policy(network_mode: NetworkMode) -> Policy {

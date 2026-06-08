@@ -763,6 +763,7 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    let timeout_sec = policy.process.timeout_sec;
                     let config = axis_sandbox::SandboxConfig {
                         id: sandbox_id,
                         policy,
@@ -774,7 +775,7 @@ async fn main() -> Result<()> {
                         proxy_port,
                         proxy_addr,
                         capture_output: false,
-                        timeout_sec: None,
+                        timeout_sec,
                     };
 
                     let mut sandbox = axis_sandbox::Sandbox::create(config)

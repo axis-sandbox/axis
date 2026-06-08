@@ -59,7 +59,7 @@ impl WorkerManager {
     }
 
     /// Spawn a HIP worker for a sandbox.
-    pub async fn spawn_worker(
+    pub fn spawn_worker(
         &mut self,
         sandbox_id: SandboxId,
         policy: &GpuPolicy,

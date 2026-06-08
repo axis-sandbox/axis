@@ -64,7 +64,7 @@ pub fn create_job_object(
     }.map_err(|e| format!("SetInformationJobObject (limits) failed: {e}"))?;
 
     // Set CPU rate control.
-    if cpu_rate_percent < 100 {
+    if cpu_rate_percent > 0 && cpu_rate_percent < 100 {
         let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
         cpu_info.ControlFlags =
             JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
