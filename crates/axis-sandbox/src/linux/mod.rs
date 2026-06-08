@@ -125,6 +125,7 @@ pub(crate) struct LinuxSandbox {
     child: Option<Child>,
     exit_code: Option<i32>,
     netns_name: Option<String>,
+    tmpdir_active: bool,
 }
 
 impl LinuxSandbox {
@@ -139,6 +140,7 @@ impl LinuxSandbox {
             child: None,
             exit_code: None,
             netns_name: None,
+            tmpdir_active: false,
         })
     }
 
@@ -157,19 +159,43 @@ impl LinuxSandbox {
         }
     }
 
-    fn cleanup_parent_resources_after_setup_failure(&mut self, netns_fd: Option<i32>) {
-        self.cleanup_parent_resources_after_setup_failure_with(netns_fd, netns::destroy_netns);
+    fn cleanup_parent_resources_after_setup_failure(
+        &mut self,
+        netns_fd: Option<i32>,
+    ) -> Option<String> {
+        self.cleanup_parent_resources_after_setup_failure_with(netns_fd, netns::destroy_netns)
     }
 
     fn cleanup_parent_resources_after_setup_failure_with<F>(
         &mut self,
         netns_fd: Option<i32>,
         destroy: F,
-    ) where
+    ) -> Option<String>
+    where
         F: FnOnce(&str) -> Result<(), String>,
     {
         close_fd(netns_fd);
         self.cleanup_netns_with(destroy);
+        self.cleanup_tmpdir_for_setup_failure()
+    }
+
+    fn cleanup_tmpdir_after_stop(&mut self) {
+        if let Err(e) = self.cleanup_tmpdir() {
+            tracing::warn!("sandbox {}: tmpdir cleanup failed: {e}", self.config.id);
+        }
+    }
+
+    fn cleanup_tmpdir_for_setup_failure(&mut self) -> Option<String> {
+        self.cleanup_tmpdir().err()
+    }
+
+    fn cleanup_tmpdir(&mut self) -> Result<(), String> {
+        if !self.tmpdir_active {
+            return Ok(());
+        }
+        landlock::cleanup_tmpdir(&self.config.workspace_dir)?;
+        self.tmpdir_active = false;
+        Ok(())
     }
 
     fn resolve_identity(&self) -> Result<Option<ResolvedIdentity>, SandboxError> {
@@ -225,6 +251,21 @@ fn spawn_error(e: io::Error, child_error_pipe: &mut ChildSetupErrorPipe) -> Sand
     }
 }
 
+fn append_cleanup_failure(error: SandboxError, cleanup_error: Option<String>) -> SandboxError {
+    let Some(cleanup_error) = cleanup_error else {
+        return error;
+    };
+    match error {
+        SandboxError::IsolationFailed(message) => SandboxError::IsolationFailed(format!(
+            "{message}; tmpdir cleanup failed: {cleanup_error}"
+        )),
+        SandboxError::SpawnFailed(message) => {
+            SandboxError::SpawnFailed(format!("{message}; tmpdir cleanup failed: {cleanup_error}"))
+        }
+        other => other,
+    }
+}
+
 fn current_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
@@ -240,9 +281,11 @@ impl SandboxImpl for LinuxSandbox {
             self.plan
         );
         let resolved_identity = self.resolve_identity()?;
+        let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         let prepared_landlock =
             landlock::prepare_landlock(&self.config.policy.filesystem, &self.config.workspace_dir)
                 .map_err(SandboxError::IsolationFailed)?;
+        self.tmpdir_active = tmpdir_required;
         let prepared_seccomp = seccomp::prepare_seccomp(&self.config.policy.process);
 
         // ── Step 1: Create network namespace (parent side) ──
@@ -264,16 +307,22 @@ impl SandboxImpl for LinuxSandbox {
                             Err(e) => {
                                 let _ = netns::destroy_netns(&name);
                                 self.netns_name = None;
-                                return Err(SandboxError::IsolationFailed(format!(
-                                    "netns: cannot open fd for '{name}': {e}"
-                                )));
+                                let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                                return Err(append_cleanup_failure(
+                                    SandboxError::IsolationFailed(format!(
+                                        "netns: cannot open fd for '{name}': {e}"
+                                    )),
+                                    cleanup_error,
+                                ));
                             }
                         }
                     }
                     Err(e) => {
-                        return Err(SandboxError::IsolationFailed(format!(
-                            "netns: creation failed: {e}"
-                        )));
+                        let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                        return Err(append_cleanup_failure(
+                            SandboxError::IsolationFailed(format!("netns: creation failed: {e}")),
+                            cleanup_error,
+                        ));
                     }
                 }
             }
@@ -296,16 +345,24 @@ impl SandboxImpl for LinuxSandbox {
                 match std::fs::File::create(self.config.workspace_dir.join("stdout.log")) {
                     Ok(file) => file,
                     Err(e) => {
-                        self.cleanup_parent_resources_after_setup_failure(netns_fd);
-                        return Err(SandboxError::SpawnFailed(format!("stdout log: {e}")));
+                        let cleanup_error =
+                            self.cleanup_parent_resources_after_setup_failure(netns_fd);
+                        return Err(append_cleanup_failure(
+                            SandboxError::SpawnFailed(format!("stdout log: {e}")),
+                            cleanup_error,
+                        ));
                     }
                 };
             let stderr_file =
                 match std::fs::File::create(self.config.workspace_dir.join("stderr.log")) {
                     Ok(file) => file,
                     Err(e) => {
-                        self.cleanup_parent_resources_after_setup_failure(netns_fd);
-                        return Err(SandboxError::SpawnFailed(format!("stderr log: {e}")));
+                        let cleanup_error =
+                            self.cleanup_parent_resources_after_setup_failure(netns_fd);
+                        return Err(append_cleanup_failure(
+                            SandboxError::SpawnFailed(format!("stderr log: {e}")),
+                            cleanup_error,
+                        ));
                     }
                 };
             cmd.stdout(std::process::Stdio::from(stdout_file));
@@ -337,10 +394,11 @@ impl SandboxImpl for LinuxSandbox {
         let mut child_error_pipe = match ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
             Err(e) => {
-                self.cleanup_parent_resources_after_setup_failure(netns_fd);
-                return Err(SandboxError::SpawnFailed(format!(
-                    "child setup error pipe: {e}"
-                )));
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(netns_fd);
+                return Err(append_cleanup_failure(
+                    SandboxError::SpawnFailed(format!("child setup error pipe: {e}")),
+                    cleanup_error,
+                ));
             }
         };
         let child_error_write_fd = child_error_pipe.write_fd;
@@ -431,8 +489,11 @@ impl SandboxImpl for LinuxSandbox {
                 child
             }
             Err(e) => {
-                self.cleanup_parent_resources_after_setup_failure(netns_fd);
-                return Err(spawn_error(e, &mut child_error_pipe));
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(netns_fd);
+                return Err(append_cleanup_failure(
+                    spawn_error(e, &mut child_error_pipe),
+                    cleanup_error,
+                ));
             }
         };
 
@@ -460,6 +521,7 @@ impl SandboxImpl for LinuxSandbox {
             let status = tokio::task::block_in_place(move || child.wait())?;
             let code = status.code().unwrap_or(-1);
             self.exit_code = Some(code);
+            self.cleanup_tmpdir_after_stop();
             Ok(code)
         })
     }
@@ -484,6 +546,7 @@ impl SandboxImpl for LinuxSandbox {
         }
 
         self.cleanup_netns();
+        self.cleanup_tmpdir_after_stop();
 
         tracing::info!("sandbox {} destroyed", self.config.id);
         Ok(())
@@ -563,6 +626,9 @@ mod tests {
         let id = SandboxId::new();
         let child = Command::new("true").spawn().unwrap();
         let mut sandbox = test_sandbox(id, workspace.path(), Some(child));
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        sandbox.tmpdir_active = true;
 
         let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
         let code_again = SandboxImpl::wait(&mut sandbox).await.unwrap();
@@ -570,6 +636,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(code_again, 0);
         assert!(sandbox.child.is_none());
+        assert!(!tmpdir.exists());
         sandbox.destroy().unwrap();
     }
 
@@ -607,20 +674,77 @@ mod tests {
         let id = SandboxId::new();
         let mut sandbox = test_sandbox(id, workspace.path(), None);
         sandbox.netns_name = Some("axis-test-cleanup".into());
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        sandbox.tmpdir_active = true;
         let mut fds = [0; 2];
         let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(ret, 0);
 
-        sandbox.cleanup_parent_resources_after_setup_failure_with(Some(fds[0]), |name| {
-            assert_eq!(name, "axis-test-cleanup");
-            Ok(())
-        });
+        let cleanup_error =
+            sandbox.cleanup_parent_resources_after_setup_failure_with(Some(fds[0]), |name| {
+                assert_eq!(name, "axis-test-cleanup");
+                Ok(())
+            });
 
+        assert!(cleanup_error.is_none());
         assert!(sandbox.netns_name.is_none());
+        assert!(!tmpdir.exists());
+        unsafe {
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn setup_failure_cleanup_closes_netns_fd() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        let mut fds = [0; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0);
+
+        let cleanup_error = sandbox
+            .cleanup_parent_resources_after_setup_failure_with(Some(fds[0]), |_| {
+                panic!("no netns cleanup should run without a netns name")
+            });
+
+        assert!(cleanup_error.is_none());
         assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, -1);
         unsafe {
             libc::close(fds[1]);
         }
+    }
+
+    #[test]
+    fn setup_failure_cleanup_surfaces_tmpdir_cleanup_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        std::fs::write(&tmpdir, b"not a directory").unwrap();
+        sandbox.tmpdir_active = true;
+
+        let cleanup_error = sandbox.cleanup_parent_resources_after_setup_failure_with(None, |_| {
+            panic!("no netns cleanup should run without a netns name")
+        });
+
+        let cleanup_error = cleanup_error.expect("tmpdir cleanup failure should be returned");
+        assert!(cleanup_error.contains("cannot remove tmpdir"));
+        std::fs::remove_file(&tmpdir).unwrap();
+    }
+
+    #[test]
+    fn inactive_tmpdir_cleanup_does_not_remove_preexisting_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        sandbox.cleanup_tmpdir_after_stop();
+
+        assert!(tmpdir.exists());
     }
 
     #[test]
@@ -676,6 +800,7 @@ mod tests {
             child,
             exit_code: None,
             netns_name: None,
+            tmpdir_active: false,
         }
     }
 

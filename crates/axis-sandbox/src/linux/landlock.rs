@@ -8,8 +8,9 @@
 //! default-deny model: any path not explicitly granted access is blocked.
 
 use axis_core::policy::{Compatibility, FilesystemPolicy};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::RawFd;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 // ── Landlock syscall numbers (x86_64, also used via asm-generic) ──────────
 
@@ -41,6 +42,9 @@ const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const SANDBOX_TMPDIR_NAME: &str = ".axis-tmp";
+const WORKSPACE_PLACEHOLDER: &str = "{workspace}";
+const TMPDIR_PLACEHOLDER: &str = "{tmpdir}";
 
 /// Read-only access rights.
 const ACCESS_READ: u64 =
@@ -132,6 +136,52 @@ impl Drop for PreparedLandlockRuleset {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpandedPath {
+    original: String,
+    path: PathBuf,
+    required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpandedFilesystemPolicy {
+    read_only: Vec<ExpandedPath>,
+    read_write: Vec<ExpandedPath>,
+    deny: Vec<ExpandedPath>,
+    tmpdir_required: bool,
+}
+
+pub(crate) fn sandbox_tmpdir(workspace: &Path) -> PathBuf {
+    workspace.join(SANDBOX_TMPDIR_NAME)
+}
+
+pub(crate) fn policy_uses_tmpdir(policy: &FilesystemPolicy) -> bool {
+    policy
+        .read_only
+        .iter()
+        .chain(policy.read_write.iter())
+        .chain(policy.deny.iter())
+        .any(|path| path.contains(TMPDIR_PLACEHOLDER))
+}
+
+fn create_tmpdir(workspace: &Path) -> Result<(), String> {
+    let tmpdir = sandbox_tmpdir(workspace);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(&tmpdir)
+        .map_err(|e| format!("cannot create exclusive tmpdir {}: {e}", tmpdir.display()))
+}
+
+pub(crate) fn cleanup_tmpdir(workspace: &Path) -> Result<(), String> {
+    let tmpdir = sandbox_tmpdir(workspace);
+    if tmpdir.exists() {
+        std::fs::remove_dir_all(&tmpdir)
+            .map_err(|e| format!("cannot remove tmpdir {}: {e}", tmpdir.display()))?;
+    }
+    Ok(())
+}
+
 /// Detect the highest supported Landlock ABI version.
 pub(crate) fn detect_abi_version() -> Result<i32, String> {
     let ret =
@@ -160,20 +210,48 @@ pub(crate) fn prepare_landlock(
             workspace.display()
         ));
     }
+    let expanded = expand_filesystem_policy(policy, workspace)?;
+    validate_allow_path_overlaps(&expanded)?;
+    validate_workspace_read_only_overlaps(&expanded, workspace)?;
+    validate_deny_paths(&expanded, workspace)?;
 
     // Detect ABI version.
     let abi = detect_abi_version()?;
     tracing::info!("landlock: ABI version {abi}");
+    let handled = handled_access_for_abi(abi)?;
 
-    // Determine which access rights to handle based on ABI version.
-    let mut handled = ACCESS_READ_WRITE;
-    if abi < 2 {
-        handled &= !LANDLOCK_ACCESS_FS_REFER;
+    if expanded.tmpdir_required {
+        create_tmpdir(workspace)?;
     }
+
+    match build_ruleset(policy, workspace, &expanded, handled) {
+        Ok(ruleset) => Ok(ruleset),
+        Err(e) => {
+            if expanded.tmpdir_required {
+                if let Err(cleanup) = cleanup_tmpdir(workspace) {
+                    return Err(format!("{e}; tmpdir cleanup failed: {cleanup}"));
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+fn handled_access_for_abi(abi: i32) -> Result<u64, String> {
     if abi < 3 {
-        handled &= !LANDLOCK_ACCESS_FS_TRUNCATE;
+        return Err(format!(
+            "Landlock ABI {abi} cannot enforce the AXIS filesystem contract; require Landlock ABI >= 3"
+        ));
     }
+    Ok(ACCESS_READ_WRITE)
+}
 
+fn build_ruleset(
+    policy: &FilesystemPolicy,
+    workspace: &Path,
+    expanded: &ExpandedFilesystemPolicy,
+    handled: u64,
+) -> Result<PreparedLandlockRuleset, String> {
     // 1. Create ruleset.
     let attr = LandlockRulesetAttr {
         handled_access_fs: handled,
@@ -190,20 +268,14 @@ pub(crate) fn prepare_landlock(
     let ruleset = PreparedLandlockRuleset {
         fd: ruleset_fd as RawFd,
     };
-    if let Err(e) = set_close_on_exec(ruleset.fd) {
-        unsafe {
-            libc::close(ruleset.fd);
-        }
-        std::mem::forget(ruleset);
-        return Err(e);
-    }
+    set_close_on_exec(ruleset.fd)?;
 
     // 2. Add rules for read-only paths.
     let read_access = ACCESS_READ & handled;
-    for path_str in &policy.read_only {
+    for path in &expanded.read_only {
         add_policy_path_rule(
             ruleset.fd,
-            path_str,
+            path,
             read_access,
             &policy.compatibility,
             "read-only",
@@ -212,11 +284,10 @@ pub(crate) fn prepare_landlock(
 
     // 3. Add rules for read-write paths (including workspace).
     let write_access = handled; // all handled rights
-    for path_str in &policy.read_write {
-        let expanded = expand_path(path_str, workspace);
+    for path in &expanded.read_write {
         add_policy_path_rule(
             ruleset.fd,
-            &expanded,
+            path,
             write_access,
             &policy.compatibility,
             "read-write",
@@ -224,6 +295,7 @@ pub(crate) fn prepare_landlock(
     }
 
     // Always add workspace as read-write.
+    let workspace = normalize_existing_or_absolute_path(workspace)?;
     let ws_str = workspace.to_string_lossy().to_string();
     add_required_path_rule(ruleset.fd, &ws_str, write_access, "workspace")?;
 
@@ -252,20 +324,33 @@ fn current_errno() -> i32 {
 
 fn add_policy_path_rule(
     ruleset_fd: RawFd,
-    path: &str,
+    path: &ExpandedPath,
     access: u64,
     compat: &Compatibility,
     label: &str,
 ) -> Result<(), String> {
-    match add_path_rule(ruleset_fd, path, access, compat) {
+    let path_str = path.path.to_string_lossy();
+    let effective_compat = if path.required {
+        Compatibility::HardRequirement
+    } else {
+        compat.clone()
+    };
+
+    match add_path_rule(ruleset_fd, &path_str, access, &effective_compat) {
         Ok(()) => Ok(()),
-        Err(e) => match compat {
+        Err(e) => match effective_compat {
             Compatibility::BestEffort => {
-                tracing::warn!("landlock: skipping {label} path '{path}': {e}");
+                tracing::warn!(
+                    "landlock: skipping {label} path '{}' expanded to '{}': {e}",
+                    path.original,
+                    path.path.display()
+                );
                 Ok(())
             }
             Compatibility::HardRequirement => Err(format!(
-                "landlock: hard-required {label} path '{path}' cannot be added: {e}"
+                "landlock: hard-required {label} path '{}' expanded to '{}' cannot be added: {e}",
+                path.original,
+                path.path.display()
             )),
         },
     }
@@ -337,10 +422,265 @@ fn set_close_on_exec(fd: RawFd) -> Result<(), String> {
     }
 }
 
-/// Expand policy path placeholders.
-fn expand_path(path: &str, workspace: &Path) -> String {
-    path.replace("{workspace}", &workspace.to_string_lossy())
-        .replace("{tmpdir}", "/tmp")
+fn expand_filesystem_policy(
+    policy: &FilesystemPolicy,
+    workspace: &Path,
+) -> Result<ExpandedFilesystemPolicy, String> {
+    let read_only = expand_policy_paths(&policy.read_only, workspace)?;
+    let read_write = expand_policy_paths(&policy.read_write, workspace)?;
+    let deny = expand_policy_paths(&policy.deny, workspace)?;
+    let tmpdir_required = read_only
+        .iter()
+        .chain(read_write.iter())
+        .chain(deny.iter())
+        .any(|path| path.required);
+
+    Ok(ExpandedFilesystemPolicy {
+        read_only,
+        read_write,
+        deny,
+        tmpdir_required,
+    })
+}
+
+fn expand_policy_paths(paths: &[String], workspace: &Path) -> Result<Vec<ExpandedPath>, String> {
+    paths
+        .iter()
+        .map(|path| expand_policy_path(path, workspace))
+        .collect()
+}
+
+fn expand_policy_path(path: &str, workspace: &Path) -> Result<ExpandedPath, String> {
+    let required = path.contains(TMPDIR_PLACEHOLDER);
+    let expanded = expand_path(path, workspace)?;
+    Ok(ExpandedPath {
+        original: path.to_string(),
+        path: expanded,
+        required,
+    })
+}
+
+fn validate_deny_paths(policy: &ExpandedFilesystemPolicy, workspace: &Path) -> Result<(), String> {
+    let workspace = normalize_existing_or_absolute_path(workspace)?;
+    for deny in &policy.deny {
+        if path_contains_or_equal(&workspace, &deny.path)
+            || path_contains_or_equal(&deny.path, &workspace)
+        {
+            return Err(format!(
+                "deny path '{}' expanded to '{}' conflicts with the sandbox workspace '{}'",
+                deny.original,
+                deny.path.display(),
+                workspace.display()
+            ));
+        }
+
+        for allow in policy
+            .read_only
+            .iter()
+            .map(|path| ("read-only", path))
+            .chain(policy.read_write.iter().map(|path| ("read-write", path)))
+        {
+            let (label, allowed) = allow;
+            if path_contains_or_equal(&allowed.path, &deny.path) {
+                return Err(format!(
+                    "deny path '{}' expanded to '{}' is under allowed {label} path '{}' expanded to '{}'; Landlock cannot subtract deny paths from broad allows",
+                    deny.original,
+                    deny.path.display(),
+                    allowed.original,
+                    allowed.path.display()
+                ));
+            }
+            if path_contains_or_equal(&deny.path, &allowed.path) {
+                return Err(format!(
+                    "deny path '{}' expanded to '{}' contains allowed {label} path '{}' expanded to '{}'; this filesystem policy is ambiguous under Landlock",
+                    deny.original,
+                    deny.path.display(),
+                    allowed.original,
+                    allowed.path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_allow_path_overlaps(policy: &ExpandedFilesystemPolicy) -> Result<(), String> {
+    for read_only in &policy.read_only {
+        for read_write in &policy.read_write {
+            if path_contains_or_equal(&read_write.path, &read_only.path) {
+                return Err(format!(
+                    "read-only path '{}' expanded to '{}' is under read-write path '{}' expanded to '{}'; Landlock unions overlapping allow rules",
+                    read_only.original,
+                    read_only.path.display(),
+                    read_write.original,
+                    read_write.path.display()
+                ));
+            }
+            if path_contains_or_equal(&read_only.path, &read_write.path) {
+                return Err(format!(
+                    "read-write path '{}' expanded to '{}' is under read-only path '{}' expanded to '{}'; overlapping allow rules would make the policy ambiguous",
+                    read_write.original,
+                    read_write.path.display(),
+                    read_only.original,
+                    read_only.path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_read_only_overlaps(
+    policy: &ExpandedFilesystemPolicy,
+    workspace: &Path,
+) -> Result<(), String> {
+    let workspace = normalize_existing_or_absolute_path(workspace)?;
+    for read_only in &policy.read_only {
+        if path_contains_or_equal(&workspace, &read_only.path) {
+            return Err(format!(
+                "read-only path '{}' expanded to '{}' is under the implicit read-write workspace '{}'",
+                read_only.original,
+                read_only.path.display(),
+                workspace.display()
+            ));
+        }
+        if path_contains_or_equal(&read_only.path, &workspace) {
+            return Err(format!(
+                "read-only path '{}' expanded to '{}' contains the implicit read-write workspace '{}'",
+                read_only.original,
+                read_only.path.display(),
+                workspace.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
+    child == parent || child.starts_with(parent)
+}
+
+/// Expand Linux policy paths to absolute sandbox host paths.
+fn expand_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
+    expand_path_with_home(path, workspace, None)
+}
+
+fn expand_path_with_home(
+    path: &str,
+    workspace: &Path,
+    home_override: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let mut expanded = if path == "~" {
+        home_path(home_override)?.to_string_lossy().into_owned()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home_path(home_override)?
+            .join(rest)
+            .to_string_lossy()
+            .into_owned()
+    } else if path.starts_with('~') {
+        return Err(format!(
+            "unsupported home path '{path}': only '~' and '~/' are supported"
+        ));
+    } else {
+        path.to_string()
+    };
+
+    expanded = expanded.replace(WORKSPACE_PLACEHOLDER, &workspace.to_string_lossy());
+    expanded = expanded.replace(
+        TMPDIR_PLACEHOLDER,
+        &sandbox_tmpdir(workspace).to_string_lossy(),
+    );
+
+    let expanded = PathBuf::from(expanded);
+    normalize_existing_or_absolute_path(&expanded)
+}
+
+fn home_path(home_override: Option<&Path>) -> Result<PathBuf, String> {
+    let home = match home_override {
+        Some(home) => home.to_path_buf(),
+        None => std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set for '~' path expansion".to_string())?,
+    };
+    if !home.is_absolute() {
+        return Err(format!("HOME path is not absolute: {}", home.display()));
+    }
+    Ok(home)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "policy path '{}' must be absolute after expansion",
+            path.display()
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "linux policy path '{}' must not contain a non-linux prefix",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        Ok(PathBuf::from("/"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn normalize_existing_or_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    let normalized = normalize_absolute_path(path)?;
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return normalize_absolute_path(&canonical);
+    }
+
+    let mut existing_prefix = PathBuf::from("/");
+    let mut probe = PathBuf::from("/");
+    let mut missing_suffix = Vec::new();
+    let mut missing = false;
+
+    for component in normalized.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) if !missing => {
+                probe.push(part);
+                if probe.exists() {
+                    existing_prefix = probe.clone();
+                } else {
+                    missing = true;
+                    missing_suffix.push(part.to_os_string());
+                }
+            }
+            Component::Normal(part) => missing_suffix.push(part.to_os_string()),
+            Component::CurDir | Component::ParentDir => {}
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "linux policy path '{}' must not contain a non-linux prefix",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let mut resolved = std::fs::canonicalize(&existing_prefix).unwrap_or(existing_prefix);
+    for part in missing_suffix {
+        resolved.push(part);
+    }
+    normalize_absolute_path(&resolved)
 }
 
 #[cfg(test)]
@@ -360,14 +700,351 @@ mod tests {
         }
     }
 
+    fn contract_landlock_available() -> bool {
+        match detect_abi_version() {
+            Ok(v) if v >= 3 => true,
+            Ok(v) => {
+                eprintln!(
+                    "Landlock ABI {v} cannot enforce the AXIS filesystem contract (test skipped)"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("Landlock not available: {e} (test skipped)");
+                false
+            }
+        }
+    }
+
     #[test]
-    fn expand_path_placeholders() {
+    fn handled_access_requires_abi_three_for_contract_semantics() {
+        let err = handled_access_for_abi(2).unwrap_err();
+        assert!(err.contains("require Landlock ABI >= 3"));
+        assert_eq!(handled_access_for_abi(3).unwrap(), ACCESS_READ_WRITE);
+    }
+
+    #[test]
+    fn expand_path_supports_absolute_workspace_tmpdir_and_home() {
         let ws = Path::new("/home/user/sandbox");
         assert_eq!(
-            expand_path("{workspace}/data", ws),
-            "/home/user/sandbox/data"
+            expand_path("/usr/bin", ws).unwrap(),
+            PathBuf::from("/usr/bin")
         );
-        assert_eq!(expand_path("{tmpdir}/axis", ws), "/tmp/axis");
+        assert_eq!(
+            expand_path("{workspace}/data", ws).unwrap(),
+            PathBuf::from("/home/user/sandbox/data")
+        );
+        assert_eq!(
+            expand_path("{tmpdir}/axis", ws).unwrap(),
+            PathBuf::from("/home/user/sandbox/.axis-tmp/axis")
+        );
+        assert_eq!(
+            expand_path_with_home("~/keys", ws, Some(Path::new("/home/user"))).unwrap(),
+            PathBuf::from("/home/user/keys")
+        );
+    }
+
+    #[test]
+    fn expand_path_rejects_relative_and_unsupported_home_forms() {
+        let ws = Path::new("/home/user/sandbox");
+
+        let relative = expand_path("relative/path", ws).unwrap_err();
+        assert!(relative.contains("must be absolute"));
+
+        let unsupported_home =
+            expand_path_with_home("~other/.ssh", ws, Some(Path::new("/home/user"))).unwrap_err();
+        assert!(unsupported_home.contains("unsupported home path"));
+    }
+
+    #[test]
+    fn expand_path_normalizes_dot_and_parent_components() {
+        let ws = Path::new("/home/user/sandbox");
+
+        assert_eq!(
+            expand_path("{workspace}/a/../b/./c", ws).unwrap(),
+            PathBuf::from("/home/user/sandbox/b/c")
+        );
+    }
+
+    #[test]
+    fn expand_path_canonicalizes_existing_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            expand_path(&link.to_string_lossy(), dir.path()).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn expand_path_canonicalizes_existing_symlink_parent_for_missing_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            expand_path(&link.join("future").to_string_lossy(), dir.path()).unwrap(),
+            target.join("future")
+        );
+    }
+
+    #[test]
+    fn tmpdir_placeholder_marks_path_required() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_write: vec!["{tmpdir}".into()],
+            ..Default::default()
+        };
+
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        assert!(expanded.tmpdir_required);
+        assert!(expanded.read_write[0].required);
+        assert_eq!(
+            expanded.read_write[0].path,
+            PathBuf::from("/home/user/sandbox/.axis-tmp")
+        );
+    }
+
+    #[test]
+    fn deny_outside_allows_is_valid() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_only: vec!["/usr".into()],
+            deny: vec!["/home/user/.ssh".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        validate_deny_paths(&expanded, ws).unwrap();
+    }
+
+    #[test]
+    fn read_write_parent_cannot_widen_read_only_child() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_only: vec!["/home/user/secrets".into()],
+            read_write: vec!["/home/user".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_allow_path_overlaps(&expanded).unwrap_err();
+
+        assert!(err.contains("is under read-write path"));
+    }
+
+    #[test]
+    fn read_write_child_under_read_only_parent_is_rejected_as_ambiguous() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_only: vec!["/home/user".into()],
+            read_write: vec!["/home/user/cache".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_allow_path_overlaps(&expanded).unwrap_err();
+
+        assert!(err.contains("overlapping allow rules"));
+    }
+
+    #[test]
+    fn read_only_child_under_implicit_workspace_is_rejected() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_only: vec!["{workspace}/secrets".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_workspace_read_only_overlaps(&expanded, ws).unwrap_err();
+
+        assert!(err.contains("implicit read-write workspace"));
+    }
+
+    #[test]
+    fn read_only_parent_containing_implicit_workspace_is_rejected() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_only: vec!["/home/user".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_workspace_read_only_overlaps(&expanded, ws).unwrap_err();
+
+        assert!(err.contains("contains the implicit read-write workspace"));
+    }
+
+    #[test]
+    fn deny_under_allowed_path_is_rejected() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_only: vec!["/usr".into()],
+            deny: vec!["/usr/share/secret".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_deny_paths(&expanded, ws).unwrap_err();
+
+        assert!(err.contains("under allowed read-only path"));
+    }
+
+    #[test]
+    fn deny_under_symlink_resolved_allow_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let target = dir.path().join("home-target");
+        let link = dir.path().join("cache-link");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(target.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let policy = FilesystemPolicy {
+            read_write: vec![link.to_string_lossy().into()],
+            deny: vec![target.join(".ssh").to_string_lossy().into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, &workspace).unwrap();
+
+        let err = validate_deny_paths(&expanded, &workspace).unwrap_err();
+
+        assert!(err.contains("under allowed read-write path"));
+    }
+
+    #[test]
+    fn deny_containing_allowed_path_is_rejected() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            read_write: vec!["/opt/project".into()],
+            deny: vec!["/opt".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_deny_paths(&expanded, ws).unwrap_err();
+
+        assert!(err.contains("contains allowed read-write path"));
+    }
+
+    #[test]
+    fn deny_under_symlink_resolved_workspace_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_target = dir.path().join("workspace-target");
+        let workspace_link = dir.path().join("workspace-link");
+        std::fs::create_dir_all(workspace_target.join("secret")).unwrap();
+        std::os::unix::fs::symlink(&workspace_target, &workspace_link).unwrap();
+        let policy = FilesystemPolicy {
+            deny: vec![workspace_target.join("secret").to_string_lossy().into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, &workspace_link).unwrap();
+
+        let err = validate_deny_paths(&expanded, &workspace_link).unwrap_err();
+
+        assert!(err.contains("conflicts with the sandbox workspace"));
+    }
+
+    #[test]
+    fn deny_under_symlink_resolved_workspace_with_missing_leaf_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_target = dir.path().join("workspace-target");
+        let workspace_link = dir.path().join("workspace-link");
+        std::fs::create_dir_all(&workspace_target).unwrap();
+        std::os::unix::fs::symlink(&workspace_target, &workspace_link).unwrap();
+        let policy = FilesystemPolicy {
+            deny: vec![
+                workspace_link
+                    .join("future-secret")
+                    .to_string_lossy()
+                    .into(),
+            ],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, &workspace_link).unwrap();
+
+        let err = validate_deny_paths(&expanded, &workspace_link).unwrap_err();
+
+        assert!(err.contains("conflicts with the sandbox workspace"));
+    }
+
+    #[test]
+    fn deny_workspace_path_is_rejected() {
+        let ws = Path::new("/home/user/sandbox");
+        let policy = FilesystemPolicy {
+            deny: vec!["{workspace}/secret".into()],
+            ..Default::default()
+        };
+        let expanded = expand_filesystem_policy(&policy, ws).unwrap();
+
+        let err = validate_deny_paths(&expanded, ws).unwrap_err();
+
+        assert!(err.contains("conflicts with the sandbox workspace"));
+    }
+
+    #[test]
+    fn cleanup_tmpdir_removes_sandbox_owned_tmpdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+        create_tmpdir(dir.path()).unwrap();
+        std::fs::write(tmpdir.join("scratch"), b"scratch").unwrap();
+
+        cleanup_tmpdir(dir.path()).unwrap();
+
+        assert!(!tmpdir.exists());
+        cleanup_tmpdir(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn create_tmpdir_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+
+        create_tmpdir(dir.path()).unwrap();
+
+        let mode = std::fs::metadata(&tmpdir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn create_tmpdir_rejects_preexisting_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = sandbox_tmpdir(dir.path());
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        let err = create_tmpdir(dir.path()).unwrap_err();
+
+        assert!(err.contains("cannot create exclusive tmpdir"));
+    }
+
+    #[test]
+    fn policy_uses_tmpdir_detects_all_filesystem_sections() {
+        for policy in [
+            FilesystemPolicy {
+                read_only: vec!["{tmpdir}/ro".into()],
+                ..Default::default()
+            },
+            FilesystemPolicy {
+                read_write: vec!["{tmpdir}/rw".into()],
+                ..Default::default()
+            },
+            FilesystemPolicy {
+                deny: vec!["{tmpdir}/deny".into()],
+                ..Default::default()
+            },
+        ] {
+            assert!(policy_uses_tmpdir(&policy));
+        }
+        assert!(!policy_uses_tmpdir(&FilesystemPolicy::default()));
     }
 
     #[test]
@@ -390,8 +1067,7 @@ mod tests {
 
     #[test]
     fn hard_requirement_prepare_fails_when_required_path_missing() {
-        if let Err(e) = detect_abi_version() {
-            eprintln!("Landlock not available: {e} (test skipped)");
+        if !contract_landlock_available() {
             return;
         }
 
@@ -409,8 +1085,7 @@ mod tests {
 
     #[test]
     fn best_effort_prepare_skips_missing_policy_path() {
-        if let Err(e) = detect_abi_version() {
-            eprintln!("Landlock not available: {e} (test skipped)");
+        if !contract_landlock_available() {
             return;
         }
 
@@ -423,5 +1098,46 @@ mod tests {
 
         let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
         drop(ruleset);
+    }
+
+    #[test]
+    fn prepare_landlock_creates_sandbox_tmpdir_when_placeholder_is_used() {
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy = FilesystemPolicy {
+            read_write: vec!["{tmpdir}".into()],
+            compatibility: Compatibility::HardRequirement,
+            ..Default::default()
+        };
+
+        let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+        drop(ruleset);
+
+        assert!(sandbox_tmpdir(dir.path()).is_dir());
+    }
+
+    #[test]
+    fn prepare_landlock_cleans_tmpdir_after_later_rule_failure() {
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy = FilesystemPolicy {
+            read_write: vec![
+                "{tmpdir}".into(),
+                "/axis/definitely/missing/landlock/path".into(),
+            ],
+            compatibility: Compatibility::HardRequirement,
+            ..Default::default()
+        };
+
+        let err = prepare_landlock(&policy, dir.path()).unwrap_err();
+
+        assert!(err.contains("hard-required read-write path"));
+        assert!(!sandbox_tmpdir(dir.path()).exists());
     }
 }
