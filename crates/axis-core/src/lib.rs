@@ -7,4 +7,5 @@ pub mod audit;
 pub mod bench;
 pub mod opa;
 pub mod policy;
+pub mod sandbox_env;
 pub mod types;

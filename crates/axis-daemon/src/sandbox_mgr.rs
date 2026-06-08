@@ -506,6 +506,7 @@ fn start_managed_sandbox(
 ) -> Result<ManagedSandbox, String> {
     let mut all_env = env;
     all_env.extend(extra_env);
+    axis_core::sandbox_env::retain_linux_sandbox_env(&mut all_env);
 
     let timeout_sec = policy.process.timeout_sec;
     tracing::info!("sandbox {id}: spawning: {command} {}", args.join(" "));
@@ -798,63 +799,30 @@ pub struct SandboxInfo {
 /// Collect essential environment variables for sandbox child processes.
 /// Mirrors the logic from axis-cli's env passthrough.
 fn collect_sandbox_env() -> Vec<(String, String)> {
+    collect_sandbox_env_from(std::env::vars())
+}
+
+fn collect_sandbox_env_from<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     let mut env = Vec::new();
-    for (key, val) in std::env::vars() {
+    for (key, val) in vars {
         let key_cmp = if cfg!(windows) {
             key.to_uppercase()
         } else {
             key.clone()
         };
-        // Skip internal session tracking vars but keep all auth vars
-        // (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_ENTRYPOINT, etc.)
+        // Skip internal session tracking vars. Provider credentials are
+        // stripped by the shared sandbox env classifier below.
         if matches!(key_cmp.as_str(), "CLAUDECODE" | "CLAUDE_AGENT_SDK_VERSION") {
             continue;
         }
 
-        if key_cmp.starts_with("ANTHROPIC_")
-            || key_cmp.starts_with("OPENAI_")
-            || key_cmp.starts_with("CLAUDE_")
-            || matches!(
-                key_cmp.as_str(),
-                "HOME"
-                    | "USER"
-                    | "PATH"
-                    | "LANG"
-                    | "TERM"
-                    | "SHELL"
-                    | "TMPDIR"
-                    | "XDG_RUNTIME_DIR"
-                    | "XDG_CONFIG_HOME"
-                    | "XDG_DATA_HOME"
-                    | "XDG_CACHE_HOME"
-                    | "SYSTEMROOT"
-                    | "SYSTEMDRIVE"
-                    | "WINDIR"
-                    | "TEMP"
-                    | "TMP"
-                    | "USERPROFILE"
-                    | "APPDATA"
-                    | "LOCALAPPDATA"
-                    | "PROGRAMDATA"
-                    | "PROGRAMFILES"
-                    | "PROGRAMFILES(X86)"
-                    | "COMPUTERNAME"
-                    | "USERNAME"
-                    | "NUMBER_OF_PROCESSORS"
-                    | "PROCESSOR_ARCHITECTURE"
-                    | "PATHEXT"
-                    | "COMSPEC"
-                    | "OS"
-                    | "HOMEDRIVE"
-                    | "HOMEPATH"
-            )
-        {
+        if axis_core::sandbox_env::is_collected_sandbox_env_key(&key_cmp) {
             env.push((key, val));
         }
     }
-    // Remove empty ANTHROPIC_API_KEY — it overrides valid OAuth auth.
-    env.retain(|(k, v)| !(k.eq_ignore_ascii_case("ANTHROPIC_API_KEY") && v.is_empty()));
-
     env
 }
 
@@ -1403,6 +1371,29 @@ mod tests {
                 "127.0.0.1:3128".parse().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn daemon_env_collection_omits_provider_secrets_and_proxy_vars() {
+        let env = collect_sandbox_env_from(vec![
+            ("PATH".into(), "/bin".into()),
+            ("ANTHROPIC_API_KEY".into(), "secret".into()),
+            ("OPENAI_API_KEY".into(), "secret".into()),
+            ("AZURE_STORAGE_CONNECTION_STRING".into(), "secret".into()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "secret".into()),
+            ("CLAUDE_CODE_ENTRYPOINT".into(), "entrypoint".into()),
+            ("https_proxy".into(), "http://proxy-with-creds".into()),
+            ("FTP_PROXY".into(), "http://ftp-proxy-with-creds".into()),
+            ("UNRELATED".into(), "value".into()),
+        ]);
+
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("CLAUDE_CODE_ENTRYPOINT".into(), "entrypoint".into())
+            ]
+        );
     }
 
     #[test]

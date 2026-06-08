@@ -167,12 +167,15 @@ pub(crate) struct LinuxSandbox {
 
 impl LinuxSandbox {
     pub fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
+        let mut config = config.clone();
+        axis_core::sandbox_env::retain_linux_sandbox_env(&mut config.env);
+
         std::fs::create_dir_all(&config.workspace_dir)?;
-        let plan = strategy::build_isolation_plan(config)
+        let plan = strategy::build_isolation_plan(&config)
             .map_err(|e| SandboxError::IsolationFailed(e.to_string()))?;
 
         Ok(Self {
-            config: config.clone(),
+            config,
             plan,
             child: None,
             exit_code: None,
@@ -1176,9 +1179,23 @@ fn apply_proxy_env_from_strategy(cmd: &mut std::process::Command, proxy: &strate
         sandbox_addr, port, ..
     } = proxy
     {
+        remove_proxy_env_from_command(cmd);
         for (key, value) in proxy_env_vars(sandbox_addr, *port) {
             cmd.env(key, value);
         }
+    }
+}
+
+fn remove_proxy_env_from_command(cmd: &mut std::process::Command) {
+    let keys: Vec<_> = cmd
+        .get_envs()
+        .filter_map(|(key, _)| {
+            let key_str = key.to_string_lossy();
+            axis_core::sandbox_env::is_proxy_env_key(&key_str).then(|| key.to_os_string())
+        })
+        .collect();
+    for key in keys {
+        cmd.env_remove(key);
     }
 }
 
@@ -1199,10 +1216,7 @@ fn retain_non_proxy_env(env: &mut Vec<(String, String)>) {
 }
 
 fn is_proxy_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "HTTP_PROXY" | "HTTPS_PROXY" | "http_proxy" | "https_proxy" | "NO_PROXY" | "no_proxy"
-    )
+    axis_core::sandbox_env::is_proxy_env_key(key)
 }
 
 fn current_errno() -> i32 {
@@ -2501,6 +2515,8 @@ mod tests {
         sandbox.config.env = vec![
             ("PATH".into(), "/bin".into()),
             ("HTTP_PROXY".into(), "http://stale-proxy:1".into()),
+            ("All_Proxy".into(), "http://stale-all-proxy:1".into()),
+            ("ftp_proxy".into(), "http://stale-ftp-proxy:1".into()),
             ("NO_PROXY".into(), "stale-no-proxy".into()),
         ];
         sandbox.plan.proxy = strategy::ProxyStrategy::Required {
@@ -2534,6 +2550,14 @@ mod tests {
                 "{key} should not retain stale inherited values"
             );
         }
+        assert!(
+            env.iter().all(|(env_key, _)| env_key != "All_Proxy"),
+            "mixed-case inherited ALL_PROXY should be stripped"
+        );
+        assert!(
+            env.iter().all(|(env_key, _)| env_key != "ftp_proxy"),
+            "inherited FTP_PROXY should be stripped"
+        );
     }
 
     #[test]
@@ -2549,6 +2573,8 @@ mod tests {
         let mut cmd = Command::new("true");
         cmd.env("PATH", "/bin")
             .env("HTTP_PROXY", "http://stale-proxy:1")
+            .env("All_Proxy", "http://stale-all-proxy:1")
+            .env("ftp_proxy", "http://stale-ftp-proxy:1")
             .env("NO_PROXY", "stale-no-proxy");
 
         apply_proxy_env_from_strategy(&mut cmd, &proxy);
@@ -2576,6 +2602,57 @@ mod tests {
         for key in ["NO_PROXY", "no_proxy"] {
             assert_eq!(env_value(key), Some(NO_PROXY_VALUE), "{key}");
         }
+        assert_eq!(
+            env_value("All_Proxy"),
+            None,
+            "mixed-case inherited ALL_PROXY should be stripped"
+        );
+        assert_eq!(
+            env_value("ftp_proxy"),
+            None,
+            "inherited FTP_PROXY should be stripped"
+        );
+    }
+
+    #[test]
+    fn linux_sandbox_new_strips_secret_and_proxy_env() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = test_policy();
+        policy.process.max_processes = 0;
+        policy.process.max_memory_mb = 0;
+        policy.process.cpu_rate_percent = 0;
+        let config = SandboxConfig {
+            id: SandboxId::from_str("00000000-0000-4000-8000-000000000113").unwrap(),
+            policy,
+            command: "true".into(),
+            args: Vec::new(),
+            working_dir: None,
+            workspace_dir: workspace.path().to_path_buf(),
+            env: vec![
+                ("PATH".into(), "/bin".into()),
+                ("ANTHROPIC_API_KEY".into(), "secret".into()),
+                ("OPENAI_API_KEY".into(), "secret".into()),
+                ("AZURE_STORAGE_CONNECTION_STRING".into(), "secret".into()),
+                ("CLAUDE_CODE_OAUTH_TOKEN".into(), "secret".into()),
+                ("All_Proxy".into(), "http://proxy-with-creds".into()),
+                ("FTP_PROXY".into(), "http://ftp-proxy-with-creds".into()),
+                ("CUSTOM_CONFIG".into(), "value".into()),
+            ],
+            proxy_port: 0,
+            proxy_addr: None,
+            capture_output: false,
+            timeout_sec: None,
+        };
+
+        let sandbox = LinuxSandbox::new(&config).unwrap();
+
+        assert_eq!(
+            sandbox.config.env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("CUSTOM_CONFIG".into(), "value".into())
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

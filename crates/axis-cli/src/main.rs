@@ -707,39 +707,7 @@ async fn main() -> Result<()> {
                     };
                     let proxy_port = proxy_addr.map(|addr| addr.port()).unwrap_or(0);
 
-                    // Pass through env vars from parent.
-                    // All ANTHROPIC_* vars (API key, base URL, etc.) and essential system vars.
-                    // NOTE: Windows env var names are case-insensitive but stored with
-                    // arbitrary casing (e.g., SYSTEMROOT vs SystemRoot). We normalize
-                    // to uppercase for comparison on Windows.
-                    let mut env: Vec<(String, String)> = Vec::new();
-                    for (key, val) in std::env::vars() {
-                        let key_cmp = if cfg!(windows) {
-                            key.to_uppercase()
-                        } else {
-                            key.clone()
-                        };
-                        if key_cmp.starts_with("ANTHROPIC_")
-                            || key_cmp.starts_with("OPENAI_")
-                            || matches!(key_cmp.as_str(),
-                                // Unix
-                                "HOME" | "USER" | "PATH" | "LANG"
-                                | "TERM" | "SHELL" | "TMPDIR" | "XDG_RUNTIME_DIR"
-                                | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
-                                // Windows — required for DLL loading, temp files, and basic APIs
-                                | "SYSTEMROOT" | "SYSTEMDRIVE" | "WINDIR"
-                                | "TEMP" | "TMP"
-                                | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA"
-                                | "PROGRAMDATA" | "PROGRAMFILES" | "PROGRAMFILES(X86)"
-                                | "COMPUTERNAME" | "USERNAME"
-                                | "NUMBER_OF_PROCESSORS" | "PROCESSOR_ARCHITECTURE"
-                                | "PATHEXT" | "COMSPEC" | "OS"
-                                | "HOMEDRIVE" | "HOMEPATH"
-                            )
-                        {
-                            env.push((key, val));
-                        }
-                    }
+                    let mut env = collect_standalone_sandbox_env();
 
                     // Auto-discover runtime directories (Node.js, Python) and
                     // append them to PATH so npm-installed agents and Python
@@ -1082,6 +1050,19 @@ fn standalone_proxy_config_for_sandbox(
     })
 }
 
+fn collect_standalone_sandbox_env() -> Vec<(String, String)> {
+    collect_standalone_sandbox_env_from(std::env::vars())
+}
+
+fn collect_standalone_sandbox_env_from<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter(|(key, _)| axis_core::sandbox_env::is_collected_sandbox_env_key(key))
+        .collect()
+}
+
 /// Discover common runtime directories (Node.js, Python) that may not be
 /// in PATH. Returns directories that exist and contain expected binaries.
 /// This lets npm-installed agents and Python venvs work out-of-the-box
@@ -1199,6 +1180,26 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn standalone_env_collection_omits_provider_secrets_and_proxy_vars() {
+        let env = collect_standalone_sandbox_env_from(vec![
+            ("PATH".into(), "/bin".into()),
+            ("ANTHROPIC_API_KEY".into(), "secret".into()),
+            ("OPENAI_API_KEY".into(), "secret".into()),
+            ("ANTHROPIC_BASE_URL".into(), "https://api.example".into()),
+            ("All_Proxy".into(), "http://proxy-with-creds".into()),
+            ("UNRELATED".into(), "value".into()),
+        ]);
+
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("ANTHROPIC_BASE_URL".into(), "https://api.example".into()),
+            ]
+        );
     }
 
     fn test_policy(network_mode: NetworkMode) -> Policy {
