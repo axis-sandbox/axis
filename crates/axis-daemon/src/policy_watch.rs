@@ -67,14 +67,12 @@ fn reload_policy(path: &Path, state: &ReloadableState) -> Result<String, String>
     let yaml = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
-    let policy = Policy::from_yaml(&yaml)
-        .map_err(|e| format!("invalid policy: {e}"))?;
+    let policy = Policy::from_yaml(&yaml).map_err(|e| format!("invalid policy: {e}"))?;
 
     let name = policy.name.clone();
 
     // Create a new engine with the updated policy.
-    let mut new_engine = PolicyEngine::new()
-        .map_err(|e| format!("OPA engine init: {e}"))?;
+    let mut new_engine = PolicyEngine::new().map_err(|e| format!("OPA engine init: {e}"))?;
     new_engine
         .load_policy(&policy)
         .map_err(|e| format!("OPA policy load: {e}"))?;

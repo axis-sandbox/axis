@@ -716,13 +716,13 @@ fn http_body_length(head: &[u8]) -> std::io::Result<usize> {
                     "credential injection failed closed: invalid Content-Length",
                 )
             })?;
-            if let Some(existing) = length {
-                if existing != parsed {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "credential injection failed closed: conflicting Content-Length values",
-                    ));
-                }
+            if let Some(existing) = length
+                && existing != parsed
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "credential injection failed closed: conflicting Content-Length values",
+                ));
             }
             length = Some(parsed);
         }

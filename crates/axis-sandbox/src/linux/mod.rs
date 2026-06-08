@@ -325,9 +325,7 @@ impl LinuxSandbox {
     where
         F: FnOnce(SandboxId, &str) -> Result<(), String>,
     {
-        let Some(token) = self.netns_helper_destroy_token.clone() else {
-            return None;
-        };
+        let token = self.netns_helper_destroy_token.clone()?;
         let sandbox_id = self.config.id;
 
         match destroy(sandbox_id, &token) {
@@ -365,9 +363,7 @@ impl LinuxSandbox {
     }
 
     fn cleanup_cgroup(&mut self) -> Option<String> {
-        let Some(cgroup) = self.cgroup.clone() else {
-            return None;
-        };
+        let cgroup = self.cgroup.clone()?;
         let path = cgroup.path().to_path_buf();
         if let Err(e) = cgroup.cleanup() {
             tracing::warn!("failed to remove cgroup '{}': {e}", path.display());
@@ -758,14 +754,14 @@ impl LinuxSandbox {
                     }
                     libc::close(fd);
                 }
-                if let Some(limits) = prepared_rlimits {
-                    if let Err(errno) = apply_prepared_rlimits(limits) {
-                        return Err(child_setup_error(
-                            child_error_write_fd,
-                            ChildSetupErrorKind::ApplyResourceLimits,
-                            errno,
-                        ));
-                    }
+                if let Some(limits) = prepared_rlimits
+                    && let Err(errno) = apply_prepared_rlimits(limits)
+                {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::ApplyResourceLimits,
+                        errno,
+                    ));
                 }
                 if let Err(errno) = mark_unexpected_child_fds_close_on_exec() {
                     return Err(child_setup_error(
@@ -1178,8 +1174,8 @@ fn configure_helper_launch_fds_for_spawn(cmd: &mut std::process::Command, fds: H
 fn helper_rlimits_from_prepared(limits: Option<PreparedRlimits>) -> netns::HelperRlimits {
     match limits {
         Some(limits) => netns::HelperRlimits {
-            address_space_bytes: limits.address_space_bytes.map(|value| value as u64),
-            max_processes: limits.max_processes.map(|value| value as u64),
+            address_space_bytes: limits.address_space_bytes,
+            max_processes: limits.max_processes,
         },
         None => netns::HelperRlimits::default(),
     }
@@ -1541,39 +1537,37 @@ impl SandboxImpl for LinuxSandbox {
             identity::prepare_workspace_for_identity(&self.config.workspace_dir, identity)
                 .map_err(|e| SandboxError::IsolationFailed(format!("run_as_user: {e}")))?;
         }
-        let prepared_landlock = if resolved_identity.is_some() && tmpdir_required {
-            let identity = resolved_identity
-                .as_ref()
-                .expect("identity existence checked above");
-            if let Err(e) =
-                identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
-            {
-                return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
-            }
-            self.tmpdir_active = true;
-            match landlock::prepare_landlock_with_tmpdir_setup(
-                &self.config.policy.filesystem,
-                &self.config.workspace_dir,
-                landlock::TmpdirSetup::AlreadyPrepared,
-            ) {
-                Ok(ruleset) => ruleset,
-                Err(e) => {
-                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
-                    return Err(append_cleanup_failure(
-                        SandboxError::IsolationFailed(e),
-                        cleanup_error,
-                    ));
+        let prepared_landlock =
+            if let (Some(identity), true) = (&resolved_identity, tmpdir_required) {
+                if let Err(e) =
+                    identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
+                {
+                    return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
                 }
-            }
-        } else {
-            let ruleset = landlock::prepare_landlock(
-                &self.config.policy.filesystem,
-                &self.config.workspace_dir,
-            )
-            .map_err(SandboxError::IsolationFailed)?;
-            self.tmpdir_active = tmpdir_required;
-            ruleset
-        };
+                self.tmpdir_active = true;
+                match landlock::prepare_landlock_with_tmpdir_setup(
+                    &self.config.policy.filesystem,
+                    &self.config.workspace_dir,
+                    landlock::TmpdirSetup::AlreadyPrepared,
+                ) {
+                    Ok(ruleset) => ruleset,
+                    Err(e) => {
+                        let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                        return Err(append_cleanup_failure(
+                            SandboxError::IsolationFailed(e),
+                            cleanup_error,
+                        ));
+                    }
+                }
+            } else {
+                let ruleset = landlock::prepare_landlock(
+                    &self.config.policy.filesystem,
+                    &self.config.workspace_dir,
+                )
+                .map_err(SandboxError::IsolationFailed)?;
+                self.tmpdir_active = tmpdir_required;
+                ruleset
+            };
         let notify_connect = self.connect_attribution_required_for_native_proxy()?;
         let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect);
         let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
@@ -1874,14 +1868,14 @@ impl SandboxImpl for LinuxSandbox {
                 }
 
                 // 8. Apply rlimit fallback after any UID switch.
-                if let Some(limits) = prepared_rlimits {
-                    if let Err(errno) = apply_prepared_rlimits(limits) {
-                        return Err(child_setup_error(
-                            child_error_write_fd,
-                            ChildSetupErrorKind::ApplyResourceLimits,
-                            errno,
-                        ));
-                    }
+                if let Some(limits) = prepared_rlimits
+                    && let Err(errno) = apply_prepared_rlimits(limits)
+                {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::ApplyResourceLimits,
+                        errno,
+                    ));
                 }
 
                 // 9. Drop Linux capabilities before exec so a privileged parent
@@ -2033,12 +2027,12 @@ impl SandboxImpl for LinuxSandbox {
     {
         Box::pin(async {
             if let Some(code) = self.exit_code {
-                if self.netns_name.is_some() || self.cgroup.is_some() {
-                    if let Some(e) = self.cleanup_after_process_exit() {
-                        return Err(SandboxError::IsolationFailed(format!(
-                            "process cleanup failed: {e}"
-                        )));
-                    }
+                if (self.netns_name.is_some() || self.cgroup.is_some())
+                    && let Some(e) = self.cleanup_after_process_exit()
+                {
+                    return Err(SandboxError::IsolationFailed(format!(
+                        "process cleanup failed: {e}"
+                    )));
                 }
                 return Ok(code);
             }
@@ -2076,12 +2070,12 @@ impl SandboxImpl for LinuxSandbox {
 
     fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
         if let Some(code) = self.exit_code {
-            if self.netns_name.is_some() || self.cgroup.is_some() {
-                if let Some(e) = self.cleanup_after_process_exit() {
-                    return Err(SandboxError::IsolationFailed(format!(
-                        "process cleanup failed: {e}"
-                    )));
-                }
+            if (self.netns_name.is_some() || self.cgroup.is_some())
+                && let Some(e) = self.cleanup_after_process_exit()
+            {
+                return Err(SandboxError::IsolationFailed(format!(
+                    "process cleanup failed: {e}"
+                )));
             }
             return Ok(Some(code));
         }
@@ -2176,7 +2170,7 @@ async fn wait_child_with_timeout(
 fn join_child_wait(
     result: Result<Result<std::process::ExitStatus, io::Error>, tokio::task::JoinError>,
 ) -> Result<std::process::ExitStatus, io::Error> {
-    result.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("wait task: {e}")))?
+    result.map_err(|e| io::Error::other(format!("wait task: {e}")))?
 }
 
 fn wait_for_killed_child(child: &mut Child, pid: i32) -> i32 {
@@ -2300,9 +2294,11 @@ mod tests {
 
     #[test]
     fn prepare_rlimits_converts_rlimit_fallback_policy() {
-        let mut policy = ProcessPolicy::default();
-        policy.max_memory_mb = 64;
-        policy.max_processes = 9;
+        let policy = ProcessPolicy {
+            max_memory_mb: 64,
+            max_processes: 9,
+            ..Default::default()
+        };
         let resources = strategy::ResourceStrategy::RlimitFallback {
             memory_limit: true,
             process_limit: strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser,
@@ -2347,8 +2343,10 @@ mod tests {
 
     #[test]
     fn prepare_rlimits_rejects_memory_byte_overflow() {
-        let mut policy = ProcessPolicy::default();
-        policy.max_memory_mb = u64::MAX;
+        let policy = ProcessPolicy {
+            max_memory_mb: u64::MAX,
+            ..Default::default()
+        };
         let resources = strategy::ResourceStrategy::RlimitFallback {
             memory_limit: true,
             process_limit: strategy::ProcessLimitFallback::NotRequested,

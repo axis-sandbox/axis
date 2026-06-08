@@ -45,7 +45,9 @@ impl WindowsPtyMaster {
         let coord: u32 = (size.cols as u32) | ((size.rows as u32) << 16);
         let hr = unsafe { ResizePseudoConsole(self.hpc, coord) };
         if hr < 0 {
-            Err(PtyError::Resize(format!("ResizePseudoConsole HRESULT: 0x{hr:08X}")))
+            Err(PtyError::Resize(format!(
+                "ResizePseudoConsole HRESULT: 0x{hr:08X}"
+            )))
         } else {
             Ok(())
         }
@@ -69,7 +71,9 @@ impl Drop for WindowsPtyMaster {
         unsafe extern "system" {
             fn ClosePseudoConsole(hPC: isize);
         }
-        unsafe { ClosePseudoConsole(self.hpc); }
+        unsafe {
+            ClosePseudoConsole(self.hpc);
+        }
     }
 }
 
@@ -117,16 +121,18 @@ pub fn create_pty_windows(size: WinSize) -> Result<PtySession, PtyError> {
 
     // Create the pseudoconsole.
     let mut hpc: isize = 0;
-    let hr = unsafe {
-        CreatePseudoConsole(coord, pipe_in_read, pipe_out_write, 0, &mut hpc)
-    };
+    let hr = unsafe { CreatePseudoConsole(coord, pipe_in_read, pipe_out_write, 0, &mut hpc) };
     if hr < 0 {
         return Err(PtyError::Creation(format!(
             "CreatePseudoConsole HRESULT: 0x{hr:08X}"
         )));
     }
 
-    tracing::debug!("ConPTY created: hpc={hpc}, size={}x{}", size.cols, size.rows);
+    tracing::debug!(
+        "ConPTY created: hpc={hpc}, size={}x{}",
+        size.cols,
+        size.rows
+    );
 
     let master = WindowsPtyMaster {
         hpc,

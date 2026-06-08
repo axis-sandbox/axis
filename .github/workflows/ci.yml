@@ -19,7 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --check || true  # advisory
+      - run: cargo fmt --check
 
   clippy:
     name: Clippy
@@ -30,7 +30,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings || true  # advisory, don't block
+      - run: cargo clippy --all-targets -- -D warnings
 
   # Build and test jobs skip on docs-only changes.
   changes:

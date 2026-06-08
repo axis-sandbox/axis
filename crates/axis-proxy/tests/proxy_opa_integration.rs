@@ -312,8 +312,7 @@ async fn send_connect_on_stream(stream: &mut TcpStream, target: &str) -> String 
             break;
         }
     }
-    let response_line = String::from_utf8(response).unwrap();
-    response_line
+    String::from_utf8(response).unwrap()
 }
 
 async fn send_connect_with_attribution(

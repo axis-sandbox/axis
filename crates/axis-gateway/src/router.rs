@@ -5,7 +5,7 @@
 
 use crate::GatewayState;
 use http_body_util::Full;
-use hyper::{body::Bytes, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode, body::Bytes};
 use std::sync::Arc;
 
 type BoxBody = Full<Bytes>;
@@ -23,8 +23,14 @@ pub async fn route(
         let response = Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("access-control-allow-origin", "*")
-            .header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS")
-            .header("access-control-allow-headers", "content-type, authorization")
+            .header(
+                "access-control-allow-methods",
+                "GET, POST, PUT, DELETE, OPTIONS",
+            )
+            .header(
+                "access-control-allow-headers",
+                "content-type, authorization",
+            )
             .header("access-control-max-age", "86400")
             .body(Full::new(Bytes::new()))
             .unwrap();
@@ -36,22 +42,19 @@ pub async fn route(
 
     let response = match (method.as_str(), segments.as_slice()) {
         // GET /api/v1/health
-        ("GET", ["api", "v1", "health"]) => {
-            json_response(StatusCode::OK, serde_json::json!({
+        ("GET", ["api", "v1", "health"]) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
-            }))
-        }
+            }),
+        ),
 
         // GET /api/v1/sandboxes
-        ("GET", ["api", "v1", "sandboxes"]) => {
-            super::handlers::list_sandboxes(state).await
-        }
+        ("GET", ["api", "v1", "sandboxes"]) => super::handlers::list_sandboxes(state).await,
 
         // POST /api/v1/sandboxes
-        ("POST", ["api", "v1", "sandboxes"]) => {
-            super::handlers::create_sandbox(req, state).await
-        }
+        ("POST", ["api", "v1", "sandboxes"]) => super::handlers::create_sandbox(req, state).await,
 
         // DELETE /api/v1/sandboxes/:id
         ("DELETE", ["api", "v1", "sandboxes", id]) => {
@@ -59,9 +62,7 @@ pub async fn route(
         }
 
         // GET /api/v1/agents
-        ("GET", ["api", "v1", "agents"]) => {
-            super::handlers::list_agents(state).await
-        }
+        ("GET", ["api", "v1", "agents"]) => super::handlers::list_agents(state).await,
 
         // POST /api/v1/agents/:name/run
         ("POST", ["api", "v1", "agents", name, "run"]) => {
@@ -79,12 +80,13 @@ pub async fn route(
         }
 
         // 404
-        _ => {
-            json_response(StatusCode::NOT_FOUND, serde_json::json!({
+        _ => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
                 "error": "not found",
                 "path": path,
-            }))
-        }
+            }),
+        ),
     };
 
     Ok(response)
@@ -97,8 +99,14 @@ pub fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Bo
         .status(status)
         .header("content-type", "application/json")
         .header("access-control-allow-origin", "*")
-        .header("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS")
-        .header("access-control-allow-headers", "content-type, authorization")
+        .header(
+            "access-control-allow-methods",
+            "GET, POST, PUT, DELETE, OPTIONS",
+        )
+        .header(
+            "access-control-allow-headers",
+            "content-type, authorization",
+        )
         .body(Full::new(Bytes::from(json)))
         .unwrap()
 }

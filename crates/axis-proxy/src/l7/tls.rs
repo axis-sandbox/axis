@@ -28,15 +28,15 @@ impl SandboxCa {
         let mut params = CertificateParams::new(Vec::<String>::new())
             .map_err(|e| TlsError::CertGenError(e.to_string()))?;
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, format!("AXIS Sandbox CA ({sandbox_name})"));
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!("AXIS Sandbox CA ({sandbox_name})"),
+        );
         params
             .distinguished_name
             .push(rcgen::DnType::OrganizationName, "AXIS");
 
-        let key_pair = KeyPair::generate()
-            .map_err(|e| TlsError::CertGenError(e.to_string()))?;
+        let key_pair = KeyPair::generate().map_err(|e| TlsError::CertGenError(e.to_string()))?;
         let cert = params
             .self_signed(&key_pair)
             .map_err(|e| TlsError::CertGenError(e.to_string()))?;
@@ -58,8 +58,7 @@ impl SandboxCa {
             .distinguished_name
             .push(rcgen::DnType::CommonName, hostname.to_string());
 
-        let key_pair = KeyPair::generate()
-            .map_err(|e| TlsError::CertGenError(e.to_string()))?;
+        let key_pair = KeyPair::generate().map_err(|e| TlsError::CertGenError(e.to_string()))?;
         let cert = params
             .self_signed(&key_pair)
             .map_err(|e| TlsError::CertGenError(e.to_string()))?;

@@ -125,17 +125,32 @@ impl Opcode {
     pub fn category(self) -> ApiCategory {
         match self {
             Self::Init | Self::Shutdown | Self::Ping => ApiCategory::Connection,
-            Self::GetDeviceCount | Self::SetDevice | Self::GetDeviceProperties
-            | Self::DeviceReset | Self::DeviceEnablePeerAccess => ApiCategory::DeviceManagement,
-            Self::Malloc | Self::Free | Self::MallocHost | Self::FreeHost
-            | Self::MallocManaged | Self::MallocAsync | Self::FreeAsync => ApiCategory::MemoryAlloc,
+            Self::GetDeviceCount
+            | Self::SetDevice
+            | Self::GetDeviceProperties
+            | Self::DeviceReset
+            | Self::DeviceEnablePeerAccess => ApiCategory::DeviceManagement,
+            Self::Malloc
+            | Self::Free
+            | Self::MallocHost
+            | Self::FreeHost
+            | Self::MallocManaged
+            | Self::MallocAsync
+            | Self::FreeAsync => ApiCategory::MemoryAlloc,
             Self::Memcpy | Self::MemcpyAsync => ApiCategory::MemoryTransfer,
-            Self::StreamCreate | Self::StreamDestroy | Self::StreamSynchronize => ApiCategory::Streams,
-            Self::EventCreate | Self::EventDestroy | Self::EventRecord
-            | Self::EventSynchronize => ApiCategory::Events,
-            Self::ModuleLoadData | Self::ModuleUnload | Self::ModuleGetFunction => ApiCategory::Modules,
+            Self::StreamCreate | Self::StreamDestroy | Self::StreamSynchronize => {
+                ApiCategory::Streams
+            }
+            Self::EventCreate | Self::EventDestroy | Self::EventRecord | Self::EventSynchronize => {
+                ApiCategory::Events
+            }
+            Self::ModuleLoadData | Self::ModuleUnload | Self::ModuleGetFunction => {
+                ApiCategory::Modules
+            }
             Self::LaunchKernel | Self::ModuleLaunchKernel => ApiCategory::KernelLaunch,
-            Self::IpcGetMemHandle | Self::IpcOpenMemHandle | Self::IpcCloseMemHandle => ApiCategory::Ipc,
+            Self::IpcGetMemHandle | Self::IpcOpenMemHandle | Self::IpcCloseMemHandle => {
+                ApiCategory::Ipc
+            }
         }
     }
 }

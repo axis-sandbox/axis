@@ -86,32 +86,78 @@ fn compute_dimensions(messages: &[Message]) -> ScoreDimensions {
     dims.conversation_depth = (user_turns as f32 / 10.0).min(1.0);
 
     // Code content detection.
-    let code_markers = ["```", "def ", "fn ", "class ", "function ", "import ", "#include",
-                         "SELECT ", "CREATE TABLE", "async ", "await ", "const ", "let ", "var "];
-    let code_count: usize = messages.iter()
-        .map(|m| code_markers.iter().filter(|&&marker| m.content.contains(marker)).count())
+    let code_markers = [
+        "```",
+        "def ",
+        "fn ",
+        "class ",
+        "function ",
+        "import ",
+        "#include",
+        "SELECT ",
+        "CREATE TABLE",
+        "async ",
+        "await ",
+        "const ",
+        "let ",
+        "var ",
+    ];
+    let code_count: usize = messages
+        .iter()
+        .map(|m| {
+            code_markers
+                .iter()
+                .filter(|&&marker| m.content.contains(marker))
+                .count()
+        })
         .sum();
     dims.code_content = (code_count as f32 / 5.0).min(1.0);
 
     // Reasoning markers.
-    let reasoning_markers = ["step by step", "think through", "analyze", "compare",
-                              "evaluate", "trade-off", "pros and cons", "reasoning",
-                              "explain why", "what if", "consider", "implications"];
-    let reasoning_count: usize = messages.iter()
+    let reasoning_markers = [
+        "step by step",
+        "think through",
+        "analyze",
+        "compare",
+        "evaluate",
+        "trade-off",
+        "pros and cons",
+        "reasoning",
+        "explain why",
+        "what if",
+        "consider",
+        "implications",
+    ];
+    let reasoning_count: usize = messages
+        .iter()
         .map(|m| {
             let lower = m.content.to_lowercase();
-            reasoning_markers.iter().filter(|&&marker| lower.contains(marker)).count()
+            reasoning_markers
+                .iter()
+                .filter(|&&marker| lower.contains(marker))
+                .count()
         })
         .sum();
     dims.reasoning_markers = (reasoning_count as f32 / 3.0).min(1.0);
 
     // Tool use indicators.
-    let tool_markers = ["tool_use", "function_call", "tool_result", "<tool>",
-                         "execute", "run this", "call the"];
-    let tool_count: usize = messages.iter()
+    let tool_markers = [
+        "tool_use",
+        "function_call",
+        "tool_result",
+        "<tool>",
+        "execute",
+        "run this",
+        "call the",
+    ];
+    let tool_count: usize = messages
+        .iter()
         .map(|m| {
             let lower = m.content.to_lowercase();
-            tool_markers.iter().filter(|&&marker| lower.contains(marker)).count()
+            tool_markers
+                .iter()
+                .filter(|&&marker| lower.contains(marker))
+                .count()
         })
         .sum();
     dims.tool_use = (tool_count as f32 / 2.0).min(1.0);
@@ -126,22 +172,47 @@ fn compute_dimensions(messages: &[Message]) -> ScoreDimensions {
     if let Some(msg) = last_user {
         let words: Vec<&str> = msg.content.split_whitespace().collect();
         let unique_words: std::collections::HashSet<&str> = words.iter().copied().collect();
-        let diversity = if words.is_empty() { 0.0 } else {
+        let diversity = if words.is_empty() {
+            0.0
+        } else {
             unique_words.len() as f32 / words.len() as f32
         };
-        let avg_word_len = if words.is_empty() { 0.0 } else {
+        let avg_word_len = if words.is_empty() {
+            0.0
+        } else {
             words.iter().map(|w| w.len()).sum::<usize>() as f32 / words.len() as f32
         };
         dims.language_complexity = ((diversity * 0.5) + (avg_word_len / 10.0).min(0.5)).min(1.0);
     }
 
     // Domain specificity markers.
-    let domain_markers = ["API", "endpoint", "schema", "architecture", "deployment",
-                           "kubernetes", "docker", "terraform", "microservice",
-                           "regression", "gradient", "neural", "transformer",
-                           "litigation", "compliance", "HIPAA", "SOC2"];
-    let domain_count: usize = messages.iter()
-        .map(|m| domain_markers.iter().filter(|&&marker| m.content.contains(marker)).count())
+    let domain_markers = [
+        "API",
+        "endpoint",
+        "schema",
+        "architecture",
+        "deployment",
+        "kubernetes",
+        "docker",
+        "terraform",
+        "microservice",
+        "regression",
+        "gradient",
+        "neural",
+        "transformer",
+        "litigation",
+        "compliance",
+        "HIPAA",
+        "SOC2",
+    ];
+    let domain_count: usize = messages
+        .iter()
+        .map(|m| {
+            domain_markers
+                .iter()
+                .filter(|&&marker| m.content.contains(marker))
+                .count()
+        })
         .sum();
     dims.domain_specificity = (domain_count as f32 / 3.0).min(1.0);
 
@@ -177,7 +248,10 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> Message {
-        Message { role: role.into(), content: content.into() }
+        Message {
+            role: role.into(),
+            content: content.into(),
+        }
     }
 
     #[test]
@@ -190,34 +264,59 @@ mod tests {
 
     #[test]
     fn short_question_is_standard() {
-        let messages = vec![
-            msg("user", "What is the capital of France? Can you explain a bit about its history?"),
-        ];
+        let messages = vec![msg(
+            "user",
+            "What is the capital of France? Can you explain a bit about its history?",
+        )];
         let decision = score_request(&messages);
-        assert!(decision.tier <= ComplexityTier::Standard,
-            "expected Flash or Standard, got {:?} (score={})", decision.tier, decision.score);
+        assert!(
+            decision.tier <= ComplexityTier::Standard,
+            "expected Flash or Standard, got {:?} (score={})",
+            decision.tier,
+            decision.score
+        );
     }
 
     #[test]
     fn code_review_is_pro() {
         let messages = vec![
-            msg("system", "You are an expert code reviewer. Analyze code for bugs, security issues, and performance problems."),
-            msg("user", "```rust\nfn process_data(input: &[u8]) -> Result<Vec<u8>, Error> {\n    let mut output = Vec::new();\n    for chunk in input.chunks(1024) {\n        let decoded = base64::decode(chunk)?;\n        output.extend_from_slice(&decoded);\n    }\n    Ok(output)\n}\n```\nPlease analyze this function step by step. Consider edge cases and security implications."),
+            msg(
+                "system",
+                "You are an expert code reviewer. Analyze code for bugs, security issues, and performance problems.",
+            ),
+            msg(
+                "user",
+                "```rust\nfn process_data(input: &[u8]) -> Result<Vec<u8>, Error> {\n    let mut output = Vec::new();\n    for chunk in input.chunks(1024) {\n        let decoded = base64::decode(chunk)?;\n        output.extend_from_slice(&decoded);\n    }\n    Ok(output)\n}\n```\nPlease analyze this function step by step. Consider edge cases and security implications.",
+            ),
         ];
         let decision = score_request(&messages);
-        assert!(decision.tier >= ComplexityTier::Standard,
-            "expected Standard+ for code review, got {:?} (score={})", decision.tier, decision.score);
+        assert!(
+            decision.tier >= ComplexityTier::Standard,
+            "expected Standard+ for code review, got {:?} (score={})",
+            decision.tier,
+            decision.score
+        );
     }
 
     #[test]
     fn complex_reasoning_is_frontier() {
         let messages = vec![
-            msg("system", "You are an expert architect. Evaluate trade-offs carefully and consider all implications."),
-            msg("user", "We need to design a distributed system architecture for a real-time trading platform. Compare microservices vs monolith approaches. Analyze the trade-offs of eventual consistency vs strong consistency for the order book. Consider deployment on Kubernetes with multi-region failover. What are the compliance implications for SOC2 and HIPAA? Think through this step by step and evaluate each option's pros and cons."),
+            msg(
+                "system",
+                "You are an expert architect. Evaluate trade-offs carefully and consider all implications.",
+            ),
+            msg(
+                "user",
+                "We need to design a distributed system architecture for a real-time trading platform. Compare microservices vs monolith approaches. Analyze the trade-offs of eventual consistency vs strong consistency for the order book. Consider deployment on Kubernetes with multi-region failover. What are the compliance implications for SOC2 and HIPAA? Think through this step by step and evaluate each option's pros and cons.",
+            ),
         ];
         let decision = score_request(&messages);
-        assert!(decision.tier >= ComplexityTier::Pro,
-            "expected Pro+ for complex reasoning, got {:?} (score={})", decision.tier, decision.score);
+        assert!(
+            decision.tier >= ComplexityTier::Pro,
+            "expected Pro+ for complex reasoning, got {:?} (score={})",
+            decision.tier,
+            decision.score
+        );
     }
 
     #[test]
@@ -228,14 +327,24 @@ mod tests {
             msg("assistant", "The article discusses..."),
             msg("user", "Can you go deeper into the methodology?"),
             msg("assistant", "The methodology involves..."),
-            msg("user", "Now compare this with the approach in the other paper."),
+            msg(
+                "user",
+                "Now compare this with the approach in the other paper.",
+            ),
             msg("assistant", "Comparing the two..."),
-            msg("user", "What are the implications for our deployment architecture?"),
+            msg(
+                "user",
+                "What are the implications for our deployment architecture?",
+            ),
         ];
 
         let s1 = score_request(&single);
         let s2 = score_request(&multi);
-        assert!(s2.score > s1.score,
-            "multi-turn ({}) should score higher than single ({})", s2.score, s1.score);
+        assert!(
+            s2.score > s1.score,
+            "multi-turn ({}) should score higher than single ({})",
+            s2.score,
+            s1.score
+        );
     }
 }

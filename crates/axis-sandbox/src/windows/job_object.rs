@@ -7,11 +7,11 @@
 //! CPU rate caps, and KILL_ON_JOB_CLOSE (if AXIS crashes, all sandbox
 //! processes die automatically). No admin required.
 
-use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::*;
 use windows::Win32::System::Threading::OpenProcess;
 use windows::Win32::System::Threading::PROCESS_ALL_ACCESS;
+use windows::core::HSTRING;
 
 /// Wrapper around a Win32 Job Object handle.
 pub struct JobHandle {
@@ -24,7 +24,9 @@ unsafe impl Send for JobHandle {}
 impl Drop for JobHandle {
     fn drop(&mut self) {
         if !self.handle.is_invalid() {
-            unsafe { let _ = CloseHandle(self.handle); }
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
         }
     }
 }
@@ -38,15 +40,13 @@ pub fn create_job_object(
 ) -> Result<JobHandle, String> {
     let job_name = HSTRING::from(name);
 
-    let handle = unsafe {
-        CreateJobObjectW(None, &job_name)
-    }.map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
+    let handle = unsafe { CreateJobObjectW(None, &job_name) }
+        .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
 
     // Set extended limit information.
     let mut ext_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     ext_info.BasicLimitInformation.ActiveProcessLimit = max_processes;
-    ext_info.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    ext_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         // NOTE: DIE_ON_UNHANDLED_EXCEPTION removed — V8/Node.js uses SEH for
         // stack guards and GC, so this flag kills Node-based agents immediately.
@@ -61,7 +61,8 @@ pub fn create_job_object(
             &ext_info as *const _ as *const std::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
-    }.map_err(|e| format!("SetInformationJobObject (limits) failed: {e}"))?;
+    }
+    .map_err(|e| format!("SetInformationJobObject (limits) failed: {e}"))?;
 
     // Set CPU rate control.
     if cpu_rate_percent > 0 && cpu_rate_percent < 100 {
@@ -78,7 +79,8 @@ pub fn create_job_object(
                 &cpu_info as *const _ as *const std::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
             )
-        }.map_err(|e| format!("SetInformationJobObject (CPU) failed: {e}"))?;
+        }
+        .map_err(|e| format!("SetInformationJobObject (CPU) failed: {e}"))?;
     }
 
     tracing::info!(
@@ -90,15 +92,14 @@ pub fn create_job_object(
 
 /// Assign a process to a Job Object by PID.
 pub fn assign_process_to_job(job: &JobHandle, pid: u32) -> Result<(), String> {
-    let proc_handle = unsafe {
-        OpenProcess(PROCESS_ALL_ACCESS, false, pid)
-    }.map_err(|e| format!("OpenProcess({pid}) failed: {e}"))?;
+    let proc_handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, pid) }
+        .map_err(|e| format!("OpenProcess({pid}) failed: {e}"))?;
 
-    let result = unsafe {
-        AssignProcessToJobObject(job.handle, proc_handle)
-    };
+    let result = unsafe { AssignProcessToJobObject(job.handle, proc_handle) };
 
-    unsafe { let _ = CloseHandle(proc_handle); }
+    unsafe {
+        let _ = CloseHandle(proc_handle);
+    }
 
     result.map_err(|e| format!("AssignProcessToJobObject failed: {e}"))
 }

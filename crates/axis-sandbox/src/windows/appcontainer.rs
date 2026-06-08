@@ -67,9 +67,7 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
             ppSidAppContainerSid: *mut PSID,
         ) -> i32; // HRESULT
 
-        fn DeleteAppContainerProfile(
-            pszAppContainerName: *const u16,
-        ) -> i32;
+        fn DeleteAppContainerProfile(pszAppContainerName: *const u16) -> i32;
 
         fn DeriveAppContainerSidFromAppContainerName(
             pszAppContainerName: *const u16,
@@ -79,10 +77,7 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
 
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        fn ConvertSidToStringSidW(
-            Sid: PSID,
-            StringSid: *mut *mut u16,
-        ) -> i32; // BOOL
+        fn ConvertSidToStringSidW(Sid: PSID, StringSid: *mut *mut u16) -> i32; // BOOL
     }
 
     #[link(name = "kernel32")]
@@ -91,7 +86,10 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     fn sid_to_string(psid: PSID) -> Result<String, String> {
@@ -104,7 +102,9 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
             let len = (0..).take_while(|&i| *string_sid.add(i) != 0).count();
             String::from_utf16_lossy(std::slice::from_raw_parts(string_sid, len))
         };
-        unsafe { LocalFree(string_sid as *mut _); }
+        unsafe {
+            LocalFree(string_sid as *mut _);
+        }
         Ok(result)
     }
 
@@ -127,7 +127,9 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
     if hr == 0 {
         // Success.
         let sid_str = sid_to_string(psid)?;
-        unsafe { LocalFree(psid); }
+        unsafe {
+            LocalFree(psid);
+        }
         tracing::info!("AppContainer '{name}' created: {sid_str}");
         return Ok(sid_str);
     }
@@ -136,19 +138,21 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
     if hr as u32 == 0x800705B9u32 {
         // Profile exists — derive the SID.
         let mut psid2: PSID = std::ptr::null_mut();
-        let hr2 = unsafe {
-            DeriveAppContainerSidFromAppContainerName(name_w.as_ptr(), &mut psid2)
-        };
+        let hr2 = unsafe { DeriveAppContainerSidFromAppContainerName(name_w.as_ptr(), &mut psid2) };
         if hr2 == 0 {
             let sid_str = sid_to_string(psid2)?;
-            unsafe { LocalFree(psid2); }
+            unsafe {
+                LocalFree(psid2);
+            }
             tracing::info!("AppContainer '{name}' already exists: {sid_str}");
             return Ok(sid_str);
         }
         return Err(format!("DeriveAppContainerSid failed: HRESULT 0x{hr2:08X}"));
     }
 
-    Err(format!("CreateAppContainerProfile failed: HRESULT 0x{hr:08X}"))
+    Err(format!(
+        "CreateAppContainerProfile failed: HRESULT 0x{hr:08X}"
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -161,7 +165,10 @@ fn delete_profile_impl(name: &str) -> Result<(), String> {
         fn DeleteAppContainerProfile(pszAppContainerName: *const u16) -> i32;
     }
 
-    let name_w: Vec<u16> = OsStr::new(name).encode_wide().chain(std::iter::once(0)).collect();
+    let name_w: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let hr = unsafe { DeleteAppContainerProfile(name_w.as_ptr()) };
     if hr == 0 {
         tracing::info!("AppContainer '{name}' deleted");

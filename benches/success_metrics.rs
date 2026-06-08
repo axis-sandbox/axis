@@ -149,7 +149,9 @@ network:
     for _ in 0..n {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
-            .write_all(b"CONNECT denied.example.com:443 HTTP/1.1\r\nHost: denied.example.com\r\n\r\n")
+            .write_all(
+                b"CONNECT denied.example.com:443 HTTP/1.1\r\nHost: denied.example.com\r\n\r\n",
+            )
             .await
             .unwrap();
         let mut reader = BufReader::new(stream);
@@ -195,71 +197,6 @@ fn measure_memory_overhead() -> u64 {
     {
         0
     }
-}
-
-// ── Metric 5: Proxy Allow Path Latency ──────────────────────────────────────
-// Measures the overhead on the ALLOW path (policy eval + TOFU + audit).
-
-async fn measure_proxy_allow_latency() -> Duration {
-    use axis_core::policy::Policy;
-    use axis_core::types::SandboxId;
-    use axis_proxy::proxy::{AxisProxy, ProxyConfig};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
-
-    let policy_yaml = r#"
-version: 1
-name: bench-allow
-network:
-  mode: proxy
-  policies:
-    - name: bench-endpoint
-      endpoints:
-        - host: "bench.example.com"
-          port: 443
-"#;
-    let policy = Policy::from_yaml(policy_yaml).unwrap();
-    let config = ProxyConfig {
-        sandbox_id: SandboxId::new(),
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        policy,
-        enable_l7: false,
-        enable_leak_detection: true,
-        upstream_tls_roots_pem: Vec::new(),
-        inference_endpoint: None,
-        connect_attribution: None,
-    };
-
-    let mut proxy = AxisProxy::new(config).unwrap();
-    let addr = proxy.bind().await.unwrap();
-    tokio::spawn(async move { let _ = proxy.run().await; });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    // For allowed hosts, the proxy attempts upstream connection which will
-    // fail (no server). Measure time to response or connection drop.
-    // Subtract baseline TCP handshake to isolate proxy overhead.
-    let n_baseline = 50;
-    let baseline_start = Instant::now();
-    for _ in 0..n_baseline {
-        let stream = TcpStream::connect(addr).await.unwrap();
-        drop(stream);
-    }
-    let baseline = baseline_start.elapsed() / n_baseline;
-
-    let n = 50;
-    let start = Instant::now();
-    for _ in 0..n {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(b"CONNECT bench.example.com:443 HTTP/1.1\r\nHost: bench.example.com\r\n\r\n")
-            .await
-            .unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).await;
-    }
-    let total = start.elapsed() / n;
-    total.saturating_sub(baseline)
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -314,16 +251,10 @@ async fn main() {
     print!("  Policy eval throughput ............ ");
     let evals_per_sec = measure_policy_throughput();
     if evals_per_sec > 10_000.0 {
-        println!(
-            "PASS  {:.0} evals/sec  (target >10,000)",
-            evals_per_sec
-        );
+        println!("PASS  {:.0} evals/sec  (target >10,000)", evals_per_sec);
         pass_count += 1;
     } else {
-        println!(
-            "FAIL  {:.0} evals/sec  (target >10,000)",
-            evals_per_sec
-        );
+        println!("FAIL  {:.0} evals/sec  (target >10,000)", evals_per_sec);
         fail_count += 1;
     }
 
@@ -331,16 +262,10 @@ async fn main() {
     print!("  OPA eval overhead per request ..... ");
     let opa_us = 1_000_000.0 / evals_per_sec;
     if opa_us < 5000.0 {
-        println!(
-            "PASS  {:.1}µs per eval  (target <5ms = 5000µs)",
-            opa_us
-        );
+        println!("PASS  {:.1}µs per eval  (target <5ms = 5000µs)", opa_us);
         pass_count += 1;
     } else {
-        println!(
-            "FAIL  {:.1}µs per eval  (target <5ms)",
-            opa_us
-        );
+        println!("FAIL  {:.1}µs per eval  (target <5ms)", opa_us);
         fail_count += 1;
     }
 
@@ -384,7 +309,11 @@ async fn main() {
         if rss_before > 0 && rss_after > 0 {
             let delta_mb = (rss_after as f64 - rss_before as f64) / 1024.0;
             // If delta is negative (page cache effects), report the absolute RSS.
-            let report_mb = if delta_mb > 0.0 { delta_mb } else { rss_after as f64 / 1024.0 };
+            let report_mb = if delta_mb > 0.0 {
+                delta_mb
+            } else {
+                rss_after as f64 / 1024.0
+            };
             if report_mb < 50.0 {
                 println!("PASS  {:.1}MB delta  (target <50MB)", report_mb.max(0.0));
                 pass_count += 1;
@@ -401,9 +330,7 @@ async fn main() {
     println!();
     println!("  ─────────────────────────────────────────────────────────");
     let total = pass_count + fail_count;
-    println!(
-        "  Result: {pass_count}/{total} metrics passed, {fail_count} failed"
-    );
+    println!("  Result: {pass_count}/{total} metrics passed, {fail_count} failed");
     if fail_count == 0 {
         println!("  All success metrics validated.");
     }

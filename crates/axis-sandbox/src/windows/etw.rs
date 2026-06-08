@@ -72,9 +72,7 @@ impl BypassDetector {
             remote_port,
             timestamp: std::time::SystemTime::now(),
         };
-        tracing::warn!(
-            "etw: BYPASS — pid={pid} ({exe}) -> {remote_addr}:{remote_port}"
-        );
+        tracing::warn!("etw: BYPASS — pid={pid} ({exe}) -> {remote_addr}:{remote_port}");
         self.events.push(event);
     }
 
@@ -152,7 +150,9 @@ fn poll_tcp_connections(pids: HashSet<u32>, proxy_port: u16) {
     loop {
         let mut size: u32 = 0;
         // First call to get required buffer size.
-        unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, 2, 5, 0); }
+        unsafe {
+            GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, 2, 5, 0);
+        }
 
         if size == 0 {
             std::thread::sleep(Duration::from_secs(1));
@@ -160,9 +160,7 @@ fn poll_tcp_connections(pids: HashSet<u32>, proxy_port: u16) {
         }
 
         let mut buffer = vec![0u8; size as usize];
-        let result = unsafe {
-            GetExtendedTcpTable(buffer.as_mut_ptr(), &mut size, 0, 2, 5, 0)
-        };
+        let result = unsafe { GetExtendedTcpTable(buffer.as_mut_ptr(), &mut size, 0, 2, 5, 0) };
 
         if result != 0 {
             std::thread::sleep(Duration::from_secs(1));
@@ -204,11 +202,12 @@ fn poll_tcp_connections(pids: HashSet<u32>, proxy_port: u16) {
             }
 
             let ip_bytes = remote_ip.to_ne_bytes();
-            let addr_str = format!("{}.{}.{}.{}", ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-
-            tracing::warn!(
-                "etw: BYPASS — pid={pid} -> {addr_str}:{remote_port} (not via proxy)"
+            let addr_str = format!(
+                "{}.{}.{}.{}",
+                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]
             );
+
+            tracing::warn!("etw: BYPASS — pid={pid} -> {addr_str}:{remote_port} (not via proxy)");
         }
 
         std::thread::sleep(Duration::from_millis(500));

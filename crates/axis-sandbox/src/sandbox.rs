@@ -110,25 +110,25 @@ impl Sandbox {
         };
 
         // Prepare scoped SSH if policy has SSH key specs.
-        if manage_agent_workspace && !config.policy.ssh.allowed_keys.is_empty() {
-            if let Ok(Some(ssh_dir)) =
+        if manage_agent_workspace
+            && !config.policy.ssh.allowed_keys.is_empty()
+            && let Ok(Some(ssh_dir)) =
                 crate::workspace::prepare_ssh_workspace(&config.policy.name, &config.policy.ssh)
-            {
-                // Symlink ~/.ssh -> contained ssh dir (only if real ~/.ssh doesn't exist).
-                if let Ok(home) = std::env::var("HOME") {
-                    let ssh_link = PathBuf::from(&home).join(".ssh");
-                    if !ssh_link.exists() || ssh_link.is_symlink() {
-                        let _ = std::fs::remove_file(&ssh_link);
-                        #[cfg(unix)]
-                        {
-                            let _ = std::os::unix::fs::symlink(&ssh_dir, &ssh_link)
-                                .map(|()| agent_symlinks.push((ssh_link, ssh_dir)));
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = std::os::windows::fs::symlink_dir(&ssh_dir, &ssh_link)
-                                .map(|()| agent_symlinks.push((ssh_link, ssh_dir)));
-                        }
+        {
+            // Symlink ~/.ssh -> contained ssh dir (only if real ~/.ssh doesn't exist).
+            if let Ok(home) = std::env::var("HOME") {
+                let ssh_link = PathBuf::from(&home).join(".ssh");
+                if !ssh_link.exists() || ssh_link.is_symlink() {
+                    let _ = std::fs::remove_file(&ssh_link);
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&ssh_dir, &ssh_link)
+                            .map(|()| agent_symlinks.push((ssh_link, ssh_dir)));
+                    }
+                    #[cfg(windows)]
+                    {
+                        let _ = std::os::windows::fs::symlink_dir(&ssh_dir, &ssh_link)
+                            .map(|()| agent_symlinks.push((ssh_link, ssh_dir)));
                     }
                 }
             }

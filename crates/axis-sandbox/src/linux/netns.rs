@@ -500,16 +500,14 @@ fn run_cmd_cleared_env(program: &str, args: &[String]) -> Result<(), String> {
 /// Check which netns creation strategy is available on this system.
 pub fn detect_strategy() -> NetnsStrategy {
     // Check if `ip netns` is available and we have permission.
-    if let Ok(paths) = NetnsCommandPaths::fixed_system_paths() {
-        if let Ok(output) = Command::new(&paths.ip)
+    if let Ok(paths) = NetnsCommandPaths::fixed_system_paths()
+        && let Ok(output) = Command::new(&paths.ip)
             .args(["netns", "list"])
             .env_clear()
             .output()
-        {
-            if output.status.success() {
-                return NetnsStrategy::IpNetns;
-            }
-        }
+        && output.status.success()
+    {
+        return NetnsStrategy::IpNetns;
     }
 
     // Check for bubblewrap.
@@ -1140,36 +1138,70 @@ fn cleanup_helper_allocation_after_target_exit(
     runner: &mut dyn CommandRunner,
 ) -> Result<(), String> {
     cleanup_helper_allocation_after_target_exit_with(
-        sandbox_id,
-        helper_pgid,
-        allocation,
-        paths,
-        runner,
-        kill_helper_process_group_members,
-        kill_helper_network_namespace_members,
-        destroy_with_runner_and_paths,
+        HelperCleanupContext {
+            sandbox_id,
+            helper_pgid,
+            allocation,
+            paths,
+            runner,
+        },
+        DefaultHelperCleanupHooks,
     )
 }
 
-fn cleanup_helper_allocation_after_target_exit_with<P, N, D>(
+struct HelperCleanupContext<'a> {
     sandbox_id: SandboxId,
     helper_pgid: libc::pid_t,
-    allocation: &ProxyNetnsAllocation,
-    paths: &NetnsCommandPaths,
-    runner: &mut dyn CommandRunner,
-    mut kill_process_group: P,
-    mut kill_network_namespace_members: N,
-    mut destroy_namespace: D,
+    allocation: &'a ProxyNetnsAllocation,
+    paths: &'a NetnsCommandPaths,
+    runner: &'a mut dyn CommandRunner,
+}
+
+trait HelperCleanupHooks {
+    fn kill_process_group(&mut self, pgid: libc::pid_t) -> Result<(), String>;
+
+    fn kill_network_namespace_members(&mut self, namespace: &str) -> Result<(), String>;
+
+    fn destroy_namespace(
+        &mut self,
+        namespace: &str,
+        paths: &NetnsCommandPaths,
+        runner: &mut dyn CommandRunner,
+    ) -> Result<(), String>;
+}
+
+struct DefaultHelperCleanupHooks;
+
+impl HelperCleanupHooks for DefaultHelperCleanupHooks {
+    fn kill_process_group(&mut self, pgid: libc::pid_t) -> Result<(), String> {
+        kill_helper_process_group_members(pgid)
+    }
+
+    fn kill_network_namespace_members(&mut self, namespace: &str) -> Result<(), String> {
+        kill_helper_network_namespace_members(namespace)
+    }
+
+    fn destroy_namespace(
+        &mut self,
+        namespace: &str,
+        paths: &NetnsCommandPaths,
+        runner: &mut dyn CommandRunner,
+    ) -> Result<(), String> {
+        destroy_with_runner_and_paths(namespace, paths, runner)
+    }
+}
+
+fn cleanup_helper_allocation_after_target_exit_with<H>(
+    ctx: HelperCleanupContext<'_>,
+    mut hooks: H,
 ) -> Result<(), String>
 where
-    P: FnMut(libc::pid_t) -> Result<(), String>,
-    N: FnMut(&str) -> Result<(), String>,
-    D: FnMut(&str, &NetnsCommandPaths, &mut dyn CommandRunner) -> Result<(), String>,
+    H: HelperCleanupHooks,
 {
-    kill_process_group(helper_pgid)?;
-    kill_network_namespace_members(&allocation.namespace)?;
-    destroy_namespace(&allocation.namespace, paths, runner)?;
-    remove_helper_state(sandbox_id);
+    hooks.kill_process_group(ctx.helper_pgid)?;
+    hooks.kill_network_namespace_members(&ctx.allocation.namespace)?;
+    hooks.destroy_namespace(&ctx.allocation.namespace, ctx.paths, ctx.runner)?;
+    remove_helper_state(ctx.sandbox_id);
     Ok(())
 }
 
@@ -1250,7 +1282,7 @@ fn validate_cgroup_procs_fd(fd: RawFd, sandbox_id: SandboxId) -> Result<(), Stri
         ));
     }
     let statfs = unsafe { statfs.assume_init() };
-    if statfs.f_type as i64 != CGROUP2_SUPER_MAGIC {
+    if statfs.f_type != CGROUP2_SUPER_MAGIC {
         return Err(format!(
             "cgroup procs fd {fd} must reference a cgroup v2 filesystem"
         ));
@@ -1790,6 +1822,7 @@ fn lock_helper_state_dir() -> Result<std::fs::File, String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(&lock_path)
         .map_err(|e| format!("open helper state lock {}: {e}", lock_path.display()))?;
@@ -2340,22 +2373,16 @@ mod tests {
         let events = RefCell::new(Vec::new());
 
         cleanup_helper_allocation_after_target_exit_with(
-            sandbox_id,
-            4242,
-            &allocation,
-            &paths,
-            &mut runner,
-            |pgid| {
-                events.borrow_mut().push(format!("pgroup {pgid}"));
-                Ok(())
+            HelperCleanupContext {
+                sandbox_id,
+                helper_pgid: 4242,
+                allocation: &allocation,
+                paths: &paths,
+                runner: &mut runner,
             },
-            |namespace| {
-                events.borrow_mut().push(format!("netns {namespace}"));
-                Ok(())
-            },
-            |namespace, _, _| {
-                events.borrow_mut().push(format!("destroy {namespace}"));
-                Ok(())
+            RecordingCleanupHooks {
+                events: &events,
+                fail_netns_members: false,
             },
         )
         .unwrap();
@@ -2379,22 +2406,16 @@ mod tests {
         let events = RefCell::new(Vec::new());
 
         let err = cleanup_helper_allocation_after_target_exit_with(
-            sandbox_id,
-            4242,
-            &allocation,
-            &paths,
-            &mut runner,
-            |pgid| {
-                events.borrow_mut().push(format!("pgroup {pgid}"));
-                Ok(())
+            HelperCleanupContext {
+                sandbox_id,
+                helper_pgid: 4242,
+                allocation: &allocation,
+                paths: &paths,
+                runner: &mut runner,
             },
-            |namespace| {
-                events.borrow_mut().push(format!("netns {namespace}"));
-                Err("network namespace still has members".into())
-            },
-            |namespace, _, _| {
-                events.borrow_mut().push(format!("destroy {namespace}"));
-                Ok(())
+            RecordingCleanupHooks {
+                events: &events,
+                fail_netns_members: true,
             },
         )
         .unwrap_err();
@@ -2407,6 +2428,39 @@ mod tests {
                 format!("netns {}", allocation.namespace),
             ]
         );
+    }
+
+    struct RecordingCleanupHooks<'a> {
+        events: &'a RefCell<Vec<String>>,
+        fail_netns_members: bool,
+    }
+
+    impl HelperCleanupHooks for RecordingCleanupHooks<'_> {
+        fn kill_process_group(&mut self, pgid: libc::pid_t) -> Result<(), String> {
+            self.events.borrow_mut().push(format!("pgroup {pgid}"));
+            Ok(())
+        }
+
+        fn kill_network_namespace_members(&mut self, namespace: &str) -> Result<(), String> {
+            self.events.borrow_mut().push(format!("netns {namespace}"));
+            if self.fail_netns_members {
+                Err("network namespace still has members".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn destroy_namespace(
+            &mut self,
+            namespace: &str,
+            _paths: &NetnsCommandPaths,
+            _runner: &mut dyn CommandRunner,
+        ) -> Result<(), String> {
+            self.events
+                .borrow_mut()
+                .push(format!("destroy {namespace}"));
+            Ok(())
+        }
     }
 
     #[test]
@@ -2638,7 +2692,9 @@ mod tests {
         }));
         let bypass_prefix = crate::linux::bypass_audit::bypass_log_prefix(sandbox_id);
         assert!(rendered.iter().any(|cmd| {
-            cmd.contains(&format!("iptables -A OUTPUT -j LOG --log-prefix {bypass_prefix}"))
+            cmd.contains(&format!(
+                "iptables -A OUTPUT -j LOG --log-prefix {bypass_prefix}"
+            ))
         }));
         assert!(
             bypass_prefix.len() <= crate::linux::bypass_audit::IPTABLES_LOG_PREFIX_LIMIT,

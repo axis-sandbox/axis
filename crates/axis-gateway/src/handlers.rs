@@ -3,10 +3,10 @@
 
 //! REST API request handlers.
 
-use crate::router::json_response;
 use crate::GatewayState;
+use crate::router::json_response;
 use http_body_util::Full;
-use hyper::{body::Bytes, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode, body::Bytes};
 use std::sync::Arc;
 
 type BoxBody = Full<Bytes>;
@@ -15,7 +15,10 @@ type BoxBody = Full<Bytes>;
 pub async fn list_sandboxes(state: Arc<GatewayState>) -> Response<BoxBody> {
     if let Some(ref backend) = state.sandbox_backend {
         let sandboxes = backend.list_sandboxes().await;
-        json_response(StatusCode::OK, serde_json::json!({ "sandboxes": sandboxes }))
+        json_response(
+            StatusCode::OK,
+            serde_json::json!({ "sandboxes": sandboxes }),
+        )
     } else {
         json_response(StatusCode::OK, serde_json::json!({ "sandboxes": [] }))
     }
@@ -36,15 +39,15 @@ pub async fn create_sandbox(
 }
 
 /// DELETE /api/v1/sandboxes/:id — destroy a sandbox.
-pub async fn destroy_sandbox(
-    id: &str,
-    state: Arc<GatewayState>,
-) -> Response<BoxBody> {
+pub async fn destroy_sandbox(id: &str, state: Arc<GatewayState>) -> Response<BoxBody> {
     tracing::info!("destroy sandbox requested: {id}");
     if let Some(ref backend) = state.sandbox_backend {
         match backend.destroy_sandbox(id).await {
             Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "destroyed": id })),
-            Err(e) => json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": e })),
+            Err(e) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": e }),
+            ),
         }
     } else {
         json_response(StatusCode::OK, serde_json::json!({ "destroyed": id }))
@@ -54,18 +57,12 @@ pub async fn destroy_sandbox(
 /// GET /api/v1/agents — list installed agents.
 pub async fn list_agents(_state: Arc<GatewayState>) -> Response<BoxBody> {
     let agents = discover_installed_agents();
-    json_response(
-        StatusCode::OK,
-        serde_json::json!({ "agents": agents }),
-    )
+    json_response(StatusCode::OK, serde_json::json!({ "agents": agents }))
 }
 
 /// POST /api/v1/agents/:name/run — one-click agent launch.
 /// Finds the agent binary, resolves its policy, creates a sandbox, returns sandbox_id.
-pub async fn run_agent(
-    name: &str,
-    state: Arc<GatewayState>,
-) -> Response<BoxBody> {
+pub async fn run_agent(name: &str, state: Arc<GatewayState>) -> Response<BoxBody> {
     tracing::info!("run agent requested: {name}");
 
     // Check if agent is installed.
@@ -111,28 +108,36 @@ pub async fn run_agent(
 
     // Create sandbox via backend if available, otherwise return mock.
     if let Some(ref backend) = state.sandbox_backend {
-        match backend.create_sandbox(&policy_yaml, binary, default_args).await {
-            Ok(sandbox_id) => {
-                json_response(StatusCode::OK, serde_json::json!({
+        match backend
+            .create_sandbox(&policy_yaml, binary, default_args)
+            .await
+        {
+            Ok(sandbox_id) => json_response(
+                StatusCode::OK,
+                serde_json::json!({
                     "sandbox_id": sandbox_id,
                     "agent": name,
                     "status": "running"
-                }))
-            }
-            Err(e) => {
-                json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({
+                }),
+            ),
+            Err(e) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
                     "error": format!("sandbox creation failed: {e}")
-                }))
-            }
+                }),
+            ),
         }
     } else {
         // No backend — return mock sandbox_id for UI testing.
         let sandbox_id = uuid::Uuid::new_v4().to_string();
-        json_response(StatusCode::OK, serde_json::json!({
-            "sandbox_id": sandbox_id,
-            "agent": name,
-            "status": "created (mock — no daemon backend)"
-        }))
+        json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "sandbox_id": sandbox_id,
+                "agent": name,
+                "status": "created (mock — no daemon backend)"
+            }),
+        )
     }
 }
 
@@ -146,7 +151,9 @@ fn find_agent_binary(name: &str) -> Option<(String, String)> {
     };
 
     let bin_dir = std::path::Path::new(&axis_root).join("bin");
-    let policies_dir = std::path::Path::new(&axis_root).join("policies").join("agents");
+    let policies_dir = std::path::Path::new(&axis_root)
+        .join("policies")
+        .join("agents");
 
     // Read the .cmd wrapper to extract policy path.
     let wrapper = if cfg!(windows) {
@@ -167,7 +174,11 @@ fn find_agent_binary(name: &str) -> Option<(String, String)> {
         .filter(|p| std::path::Path::new(p).exists())
         .or_else(|| {
             let p = policies_dir.join(format!("{name}.yaml"));
-            if p.exists() { Some(p.to_string_lossy().to_string()) } else { None }
+            if p.exists() {
+                Some(p.to_string_lossy().to_string())
+            } else {
+                None
+            }
         })?;
 
     // Find the real agent binary — NOT our own wrappers.
@@ -185,14 +196,20 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
         // Check well-known install locations first.
         let candidates = [
             // WinGet packages (resolve symlink to real exe)
-            format!("{}\\Microsoft\\WinGet\\Links\\{bin_name}.exe",
-                std::env::var("LOCALAPPDATA").unwrap_or_default()),
+            format!(
+                "{}\\Microsoft\\WinGet\\Links\\{bin_name}.exe",
+                std::env::var("LOCALAPPDATA").unwrap_or_default()
+            ),
             // npm-installed agents in axis tools dir
-            format!("{}\\tools\\{name}\\node_modules\\.bin\\{bin_name}.cmd",
-                std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\axis"),
+            format!(
+                "{}\\tools\\{name}\\node_modules\\.bin\\{bin_name}.cmd",
+                std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\axis"
+            ),
             // Scoop
-            format!("{}\\scoop\\shims\\{bin_name}.exe",
-                std::env::var("USERPROFILE").unwrap_or_default()),
+            format!(
+                "{}\\scoop\\shims\\{bin_name}.exe",
+                std::env::var("USERPROFILE").unwrap_or_default()
+            ),
         ];
 
         for candidate in &candidates {
@@ -223,12 +240,12 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let line = line.trim();
-                if !line.is_empty()
-                    && !line.contains(&axis_bin_dir.to_string_lossy().to_string())
-                {
+                if !line.is_empty() && !line.contains(&axis_bin_dir.to_string_lossy().to_string()) {
                     if let Ok(resolved) = std::fs::canonicalize(line) {
                         let mut s = resolved.to_string_lossy().to_string();
-                        if s.starts_with(r"\\?\") { s = s[4..].to_string(); }
+                        if s.starts_with(r"\\?\") {
+                            s = s[4..].to_string();
+                        }
                         return Some(s);
                     }
                     return Some(line.to_string());
@@ -237,14 +254,9 @@ fn resolve_agent_binary(name: &str, axis_bin_dir: &std::path::Path) -> Option<St
         }
     } else {
         // Unix: use `which` skipping our bin dir.
-        if let Ok(output) = std::process::Command::new("which")
-            .arg(bin_name)
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("which").arg(bin_name).output() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty()
-                && !path.contains(&axis_bin_dir.to_string_lossy().to_string())
-            {
+            if !path.is_empty() && !path.contains(&axis_bin_dir.to_string_lossy().to_string()) {
                 if let Ok(resolved) = std::fs::canonicalize(&path) {
                     return Some(resolved.to_string_lossy().to_string());
                 }
@@ -298,9 +310,7 @@ fn extract_quoted_after(text: &str, marker: &str) -> Option<String> {
 /// Discover installed agents from the filesystem.
 fn discover_installed_agents() -> Vec<serde_json::Value> {
     let axis_root = if cfg!(windows) {
-        std::env::var("LOCALAPPDATA")
-            .unwrap_or_else(|_| "C:\\Users\\Public".into())
-            + "\\axis"
+        std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Users\\Public".into()) + "\\axis"
     } else {
         std::env::var("HOME").unwrap_or("/tmp".into()) + "/.axis"
     };

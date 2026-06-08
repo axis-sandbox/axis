@@ -6,7 +6,7 @@
 //! Scans request and response bodies for known credential patterns.
 //! Two-phase: fast prefix scan with Aho-Corasick, then regex confirmation.
 
-use crate::patterns::{default_patterns, CredentialPattern};
+use crate::patterns::{CredentialPattern, default_patterns};
 use aho_corasick::AhoCorasick;
 use thiserror::Error;
 
@@ -41,8 +41,6 @@ pub struct LeakDetector {
     prefix_scanner: AhoCorasick,
     /// Full regex patterns for confirmation.
     patterns: Vec<CredentialPattern>,
-    /// Prefixes used for fast scan (index-aligned with patterns).
-    prefixes: Vec<String>,
 }
 
 impl LeakDetector {
@@ -51,21 +49,21 @@ impl LeakDetector {
 
         // Extract short prefixes from each pattern for fast Aho-Corasick scanning.
         let prefixes: Vec<String> = vec![
-            "sk-".into(),       // openai
-            "sk-ant-".into(),   // anthropic
-            "AKIA".into(),      // aws access key
-            "aws_secret".into(),// aws secret
-            "ghp_".into(),      // github pat
-            "github_pat_".into(),// github fine-grained
-            "xox".into(),       // slack
-            "sk_live_".into(),  // stripe live
-            "sk_test_".into(),  // stripe test
-            "-----BEGIN".into(),// pem
-            "bearer ".into(),   // bearer token (lowercase)
-            "Bearer ".into(),   // bearer token (capitalized)
-            "x-api-key".into(), // generic api key header
-            "api_key".into(),   // generic api key
-            "api-key".into(),   // generic api key variant
+            "sk-".into(),         // openai
+            "sk-ant-".into(),     // anthropic
+            "AKIA".into(),        // aws access key
+            "aws_secret".into(),  // aws secret
+            "ghp_".into(),        // github pat
+            "github_pat_".into(), // github fine-grained
+            "xox".into(),         // slack
+            "sk_live_".into(),    // stripe live
+            "sk_test_".into(),    // stripe test
+            "-----BEGIN".into(),  // pem
+            "bearer ".into(),     // bearer token (lowercase)
+            "Bearer ".into(),     // bearer token (capitalized)
+            "x-api-key".into(),   // generic api key header
+            "api_key".into(),     // generic api key
+            "api-key".into(),     // generic api key variant
         ];
 
         let prefix_scanner = AhoCorasick::builder()
@@ -76,7 +74,6 @@ impl LeakDetector {
         Ok(Self {
             prefix_scanner,
             patterns,
-            prefixes,
         })
     }
 
@@ -145,7 +142,11 @@ mod tests {
         let data = b"Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz1234567890";
         let findings = detector.scan(data);
         assert!(!findings.is_empty(), "should detect OpenAI key");
-        assert!(findings.iter().any(|f| f.pattern_name == "openai_api_key" || f.pattern_name == "bearer_token"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.pattern_name == "openai_api_key" || f.pattern_name == "bearer_token")
+        );
     }
 
     #[test]
@@ -153,7 +154,11 @@ mod tests {
         let detector = LeakDetector::new().unwrap();
         let data = b"key: sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let findings = detector.scan(data);
-        assert!(findings.iter().any(|f| f.pattern_name == "anthropic_api_key"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.pattern_name == "anthropic_api_key")
+        );
     }
 
     #[test]

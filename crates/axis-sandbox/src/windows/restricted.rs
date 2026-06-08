@@ -16,10 +16,8 @@ use windows::Win32::System::Threading::*;
 /// for closing it via CloseHandle.
 pub fn create_restricted_token() -> Result<HANDLE, String> {
     let mut token = HANDLE::default();
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut token)
-    }
-    .map_err(|e| format!("OpenProcessToken failed: {e}"))?;
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut token) }
+        .map_err(|e| format!("OpenProcessToken failed: {e}"))?;
 
     let mut restricted_token = HANDLE::default();
     unsafe {
@@ -68,7 +66,7 @@ fn set_low_integrity(token: HANDLE) -> Result<(), String> {
         revision: 1,
         sub_authority_count: 1,
         identifier_authority: [0, 0, 0, 0, 0, 16], // SECURITY_MANDATORY_LABEL_AUTHORITY
-        sub_authority: [4096],                       // SECURITY_MANDATORY_LOW_RID
+        sub_authority: [4096],                     // SECURITY_MANDATORY_LOW_RID
     };
 
     #[repr(C)]

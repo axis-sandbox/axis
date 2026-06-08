@@ -107,6 +107,12 @@ impl TofuStore {
     }
 }
 
+impl Default for TofuStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Resolve which binary owns a TCP connection from a peer address.
 ///
 /// Algorithm (Linux-specific):
@@ -146,10 +152,9 @@ fn resolve_peer_identity_in_proc(
     for candidate in candidates {
         if let Some(identity) =
             resolve_inode_owner_identity_in_netns(proc_root, candidate.inode, &candidate.netns)?
+            && !identities.contains(&identity)
         {
-            if !identities.contains(&identity) {
-                identities.push(identity);
-            }
+            identities.push(identity);
         }
     }
 

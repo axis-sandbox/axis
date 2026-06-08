@@ -25,10 +25,10 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
     sb.push_str("(allow process*)\n");
     sb.push_str("(allow signal)\n");
     sb.push_str("(allow sysctl-read)\n");
-    sb.push_str("(allow mach*)\n");       // Mach IPC required for dyld, libsystem
+    sb.push_str("(allow mach*)\n"); // Mach IPC required for dyld, libsystem
     sb.push_str("(allow ipc-posix-shm*)\n");
-    sb.push_str("(allow file-ioctl)\n");   // TTY ioctls (setraw, tcsetattr) for TUI apps
-    sb.push_str("(allow pseudo-tty)\n");  // Allocate/use pseudo-terminals for TUI apps
+    sb.push_str("(allow file-ioctl)\n"); // TTY ioctls (setraw, tcsetattr) for TUI apps
+    sb.push_str("(allow pseudo-tty)\n"); // Allocate/use pseudo-terminals for TUI apps
     sb.push('\n');
 
     // ── Filesystem: read-only ──
@@ -43,7 +43,9 @@ pub fn generate_profile(policy: &Policy, workspace: &Path) -> String {
     // ── Filesystem: read-write (workspace + policy paths) ──
     sb.push_str(";; Filesystem: read-write\n");
     let ws = workspace.to_string_lossy();
-    sb.push_str(&format!("(allow file-read* file-write* (subpath \"{ws}\"))\n"));
+    sb.push_str(&format!(
+        "(allow file-read* file-write* (subpath \"{ws}\"))\n"
+    ));
 
     for path in &policy.filesystem.read_write {
         let expanded = expand_path(path, workspace);

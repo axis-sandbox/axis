@@ -15,8 +15,7 @@ use std::path::Path;
 /// The Low Integrity Level of the sandbox process prevents writes to
 /// any other location.
 pub fn setup_workspace_acls(workspace: &Path, appcontainer_name: &str) -> Result<(), String> {
-    std::fs::create_dir_all(workspace)
-        .map_err(|e| format!("failed to create workspace: {e}"))?;
+    std::fs::create_dir_all(workspace).map_err(|e| format!("failed to create workspace: {e}"))?;
 
     tracing::info!(
         "setting workspace ACLs for AppContainer '{appcontainer_name}' on {}",

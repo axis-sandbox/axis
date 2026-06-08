@@ -17,10 +17,10 @@ pub fn resolve_route<'a>(
     }
 
     // Second: default provider.
-    if let Some(default) = default_provider {
-        if let Some(route) = routes.iter().find(|r| r.name == default) {
-            return Some(route);
-        }
+    if let Some(default) = default_provider
+        && let Some(route) = routes.iter().find(|r| r.name == default)
+    {
+        return Some(route);
     }
 
     // Third: first available route.

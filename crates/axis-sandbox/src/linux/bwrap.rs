@@ -227,26 +227,29 @@ fn push_expanded_bind(
     mounted: &mut HashSet<PathBuf>,
     path: &super::landlock::ExpandedPath,
 ) -> Result<(), String> {
+    let mut state = BindFdState { bind_fds, mounted };
     push_bind_fd(
         args,
-        flag,
-        &path.path,
-        &path.path,
-        required,
-        bind_fds,
-        mounted,
-        &path.original,
+        &mut state,
+        BindFdSpec {
+            flag,
+            source: &path.path,
+            dest: &path.path,
+            required,
+            label: &path.original,
+        },
     )?;
     if path.mount_path != path.path {
         push_bind_fd(
             args,
-            flag,
-            &path.path,
-            &path.mount_path,
-            required,
-            bind_fds,
-            mounted,
-            &path.original,
+            &mut state,
+            BindFdSpec {
+                flag,
+                source: &path.path,
+                dest: &path.mount_path,
+                required,
+                label: &path.original,
+            },
         )?;
     }
     Ok(())
@@ -261,30 +264,49 @@ fn push_required_bind_fd(
     mounted: &mut HashSet<PathBuf>,
     label: &str,
 ) -> Result<(), String> {
-    push_bind_fd(args, flag, source, dest, true, bind_fds, mounted, label)
+    let mut state = BindFdState { bind_fds, mounted };
+    push_bind_fd(
+        args,
+        &mut state,
+        BindFdSpec {
+            flag,
+            source,
+            dest,
+            required: true,
+            label,
+        },
+    )
+}
+
+struct BindFdState<'a> {
+    bind_fds: &'a mut Vec<OwnedFd>,
+    mounted: &'a mut HashSet<PathBuf>,
+}
+
+struct BindFdSpec<'a> {
+    flag: &'a str,
+    source: &'a Path,
+    dest: &'a Path,
+    required: bool,
+    label: &'a str,
 }
 
 fn push_bind_fd(
     args: &mut Vec<String>,
-    flag: &str,
-    source: &Path,
-    dest: &Path,
-    required: bool,
-    bind_fds: &mut Vec<OwnedFd>,
-    mounted: &mut HashSet<PathBuf>,
-    label: &str,
+    state: &mut BindFdState<'_>,
+    spec: BindFdSpec<'_>,
 ) -> Result<(), String> {
-    let dest = dest.to_path_buf();
-    if mounted.insert(dest.clone()) {
-        let Some(fd) = open_bind_fd(source, required, label)? else {
+    let dest = spec.dest.to_path_buf();
+    if state.mounted.insert(dest.clone()) {
+        let Some(fd) = open_bind_fd(spec.source, spec.required, spec.label)? else {
             return Ok(());
         };
         let rendered_fd = fd.as_raw_fd().to_string();
         let rendered_dest = dest.to_string_lossy().into_owned();
-        args.push(flag.into());
+        args.push(spec.flag.into());
         args.push(rendered_fd);
         args.push(rendered_dest);
-        bind_fds.push(fd);
+        state.bind_fds.push(fd);
     }
     Ok(())
 }

@@ -34,7 +34,9 @@ impl BudgetState {
 
     fn remaining(&mut self) -> u64 {
         self.maybe_reset_window();
-        self.config.max_tokens_per_hour.saturating_sub(self.tokens_used)
+        self.config
+            .max_tokens_per_hour
+            .saturating_sub(self.tokens_used)
     }
 }
 
@@ -117,6 +119,12 @@ impl BudgetTracker {
     /// Get remaining tokens for a sandbox.
     pub fn remaining(&mut self, sandbox_id: &SandboxId) -> Option<u64> {
         self.budgets.get_mut(sandbox_id).map(|s| s.remaining())
+    }
+}
+
+impl Default for BudgetTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

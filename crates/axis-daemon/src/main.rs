@@ -5,7 +5,7 @@
 
 mod health;
 mod ipc;
-mod policy_watch;
+pub mod policy_watch;
 mod sandbox_mgr;
 
 use anyhow::Result;
@@ -16,8 +16,11 @@ async fn main() -> Result<()> {
     // Logging: structured JSON, configurable via AXIS_LOG_LEVEL or RUST_LOG.
     // Optional file logging via AXIS_LOG_DIR.
     let log_level = std::env::var("AXIS_LOG_LEVEL").unwrap_or_else(|_| "axis=info".into());
-    let filter = EnvFilter::from_default_env()
-        .add_directive(log_level.parse().unwrap_or_else(|_| "axis=info".parse().unwrap()));
+    let filter = EnvFilter::from_default_env().add_directive(
+        log_level
+            .parse()
+            .unwrap_or_else(|_| "axis=info".parse().unwrap()),
+    );
 
     if let Ok(log_dir) = std::env::var("AXIS_LOG_DIR") {
         // File logging: JSON to file + human-readable to stderr.
@@ -73,15 +76,14 @@ async fn main() -> Result<()> {
 
     // Start HTTP+WebSocket gateway for GUI clients with sandbox backend.
     let gateway_config = axis_gateway::GatewayConfig::default();
-    let backend = std::sync::Arc::new(
-        sandbox_mgr::SandboxManagerBackend::new(shared_mgr.clone())
-    );
-    let gateway_state = std::sync::Arc::new(
-        axis_gateway::GatewayState::with_backend(event_tx, backend)
-    );
+    let backend = std::sync::Arc::new(sandbox_mgr::SandboxManagerBackend::new(shared_mgr.clone()));
+    let gateway_state =
+        std::sync::Arc::new(axis_gateway::GatewayState::with_backend(event_tx, backend));
     let (gw_shutdown_tx, gw_shutdown_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if let Err(e) = axis_gateway::start_gateway(gateway_config, gateway_state, gw_shutdown_rx).await {
+        if let Err(e) =
+            axis_gateway::start_gateway(gateway_config, gateway_state, gw_shutdown_rx).await
+        {
             tracing::error!("gateway error: {e}");
         }
     });
@@ -90,14 +92,11 @@ async fn main() -> Result<()> {
     // If IPC bind fails (port taken), keep running for the gateway.
     tokio::select! {
         result = ipc::serve(&socket_path, shared_mgr.clone()) => {
-            match result {
-                Err(e) => {
-                    tracing::warn!("IPC server unavailable: {e}");
-                    tracing::info!("gateway still running on :18519 — waiting for shutdown signal");
-                    shutdown_signal().await;
-                    tracing::info!("shutdown signal received");
-                }
-                Ok(()) => {}
+            if let Err(e) = result {
+                tracing::warn!("IPC server unavailable: {e}");
+                tracing::info!("gateway still running on :18519 — waiting for shutdown signal");
+                shutdown_signal().await;
+                tracing::info!("shutdown signal received");
             }
         }
         _ = shutdown_signal() => {
@@ -112,8 +111,7 @@ async fn main() -> Result<()> {
     tracing::info!("shutting down — destroying all sandboxes");
 
     let mut mgr = shared_mgr.lock().await;
-    let sandbox_ids: Vec<axis_core::types::SandboxId> =
-        mgr.list().iter().map(|s| s.id).collect();
+    let sandbox_ids: Vec<axis_core::types::SandboxId> = mgr.list().iter().map(|s| s.id).collect();
 
     for id in &sandbox_ids {
         if let Err(e) = mgr.destroy(id) {
@@ -132,7 +130,7 @@ async fn main() -> Result<()> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {

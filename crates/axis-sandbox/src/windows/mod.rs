@@ -133,9 +133,8 @@ impl SandboxImpl for WindowsSandbox {
 
     fn wait(
         &mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>
+    {
         Box::pin(async {
             let child = self
                 .child
@@ -222,7 +221,10 @@ fn create_conpty_child(
     let mut pipe_out_read: isize = 0;
     let mut pipe_out_write: isize = 0;
     if unsafe { CreatePipe(&mut pipe_out_read, &mut pipe_out_write, ptr::null(), 0) } == 0 {
-        unsafe { CloseHandle(pipe_in_read); CloseHandle(pipe_in_write); }
+        unsafe {
+            CloseHandle(pipe_in_read);
+            CloseHandle(pipe_in_write);
+        }
         return Err("CreatePipe (output) failed".into());
     }
 
@@ -231,8 +233,10 @@ fn create_conpty_child(
     let hr = unsafe { CreatePseudoConsole(coord, pipe_in_read, pipe_out_write, 0, &mut hpc) };
     if hr < 0 {
         unsafe {
-            CloseHandle(pipe_in_read); CloseHandle(pipe_in_write);
-            CloseHandle(pipe_out_read); CloseHandle(pipe_out_write);
+            CloseHandle(pipe_in_read);
+            CloseHandle(pipe_in_write);
+            CloseHandle(pipe_out_read);
+            CloseHandle(pipe_out_write);
         }
         return Err(format!("CreatePseudoConsole HRESULT: 0x{hr:08X}"));
     }
@@ -240,7 +244,10 @@ fn create_conpty_child(
     tracing::info!("ConPTY created: hpc={hpc}");
 
     // Close the child-side pipe ends (ConPTY owns them now).
-    unsafe { CloseHandle(pipe_in_read); CloseHandle(pipe_out_write); }
+    unsafe {
+        CloseHandle(pipe_in_read);
+        CloseHandle(pipe_out_write);
+    }
 
     // Spawn the child — it inherits the ConPTY via standard process creation.
     // Note: For full ConPTY integration, we'd use PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
@@ -250,7 +257,10 @@ fn create_conpty_child(
         .stdin(unsafe { std::process::Stdio::from_raw_handle(pipe_in_write as *mut _) })
         .spawn()
         .map_err(|e| {
-            unsafe { ClosePseudoConsole(hpc); CloseHandle(pipe_out_read); }
+            unsafe {
+                ClosePseudoConsole(hpc);
+                CloseHandle(pipe_out_read);
+            }
             format!("spawn with ConPTY: {e}")
         })?;
 

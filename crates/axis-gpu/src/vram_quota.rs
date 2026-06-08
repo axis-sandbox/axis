@@ -57,13 +57,13 @@ impl VramTracker {
 
     /// Remove a sandbox's quota tracker.
     pub fn unregister(&mut self, sandbox_id: &SandboxId) {
-        if let Some(state) = self.sandboxes.remove(sandbox_id) {
-            if state.used_bytes > 0 {
-                tracing::warn!(
-                    "vram quota: sandbox {sandbox_id} unregistered with {}MB still allocated",
-                    state.used_bytes / (1024 * 1024),
-                );
-            }
+        if let Some(state) = self.sandboxes.remove(sandbox_id)
+            && state.used_bytes > 0
+        {
+            tracing::warn!(
+                "vram quota: sandbox {sandbox_id} unregistered with {}MB still allocated",
+                state.used_bytes / (1024 * 1024),
+            );
         }
     }
 
@@ -94,10 +94,10 @@ impl VramTracker {
 
     /// Record a free, reducing the quota usage.
     pub fn record_free(&mut self, sandbox_id: &SandboxId, device_ptr: u64) {
-        if let Some(state) = self.sandboxes.get_mut(sandbox_id) {
-            if let Some(size) = state.allocations.remove(&device_ptr) {
-                state.used_bytes = state.used_bytes.saturating_sub(size);
-            }
+        if let Some(state) = self.sandboxes.get_mut(sandbox_id)
+            && let Some(size) = state.allocations.remove(&device_ptr)
+        {
+            state.used_bytes = state.used_bytes.saturating_sub(size);
         }
     }
 
@@ -106,6 +106,12 @@ impl VramTracker {
         self.sandboxes
             .get(sandbox_id)
             .map(|s| (s.used_bytes, s.limit_bytes))
+    }
+}
+
+impl Default for VramTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -120,7 +126,10 @@ mod tests {
         tracker.register(id, 1024); // 1GB limit
 
         let mb100 = 100 * 1024 * 1024;
-        assert!(matches!(tracker.check_alloc(&id, mb100), VramCheck::Allowed));
+        assert!(matches!(
+            tracker.check_alloc(&id, mb100),
+            VramCheck::Allowed
+        ));
 
         tracker.record_alloc(&id, 0xDEAD0000, mb100);
         let (used, limit) = tracker.usage(&id).unwrap();

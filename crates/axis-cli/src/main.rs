@@ -199,18 +199,17 @@ async fn main() -> Result<()> {
                 if !home.is_empty() {
                     for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
                         let path = entry.path();
-                        if path.is_symlink() {
-                            if let Ok(target) = std::fs::read_link(&path) {
-                                if target.to_string_lossy().contains(".axis") {
-                                    eprintln!("  Removing symlink: {}", path.display());
-                                    let _ = std::fs::remove_file(&path);
-                                    // Restore backup.
-                                    let backup = PathBuf::from(format!("{}.axis-backup", path.display()));
-                                    if backup.exists() {
-                                        let _ = std::fs::rename(&backup, &path);
-                                        eprintln!("  Restored: {}", path.display());
-                                    }
-                                }
+                        if path.is_symlink()
+                            && let Ok(target) = std::fs::read_link(&path)
+                            && target.to_string_lossy().contains(".axis")
+                        {
+                            eprintln!("  Removing symlink: {}", path.display());
+                            let _ = std::fs::remove_file(&path);
+                            // Restore backup.
+                            let backup = PathBuf::from(format!("{}.axis-backup", path.display()));
+                            if backup.exists() {
+                                let _ = std::fs::rename(&backup, &path);
+                                eprintln!("  Restored: {}", path.display());
                             }
                         }
                     }
@@ -238,7 +237,10 @@ async fn main() -> Result<()> {
                     eprintln!("Installed agents:");
                     for entry in std::fs::read_dir(&bin_dir).into_iter().flatten().flatten() {
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        let name = name.strip_suffix(".cmd").or(name.strip_suffix(".ps1")).unwrap_or(&name);
+                        let name = name
+                            .strip_suffix(".cmd")
+                            .or(name.strip_suffix(".ps1"))
+                            .unwrap_or(&name);
                         eprintln!("  {name}");
                     }
                 }
@@ -266,7 +268,9 @@ async fn main() -> Result<()> {
                     }
 
                     // Remove agent state.
-                    let state_dir = axis_root.join("agents").join(format!("agent-{install_name}"));
+                    let state_dir = axis_root
+                        .join("agents")
+                        .join(format!("agent-{install_name}"));
                     if state_dir.exists() {
                         let _ = std::fs::remove_dir_all(&state_dir);
                         eprintln!("  Removed: {}", state_dir.display());
@@ -277,20 +281,22 @@ async fn main() -> Result<()> {
                         .or_else(|_| std::env::var("USERPROFILE"))
                         .unwrap_or_default();
                     if !home.is_empty() {
-                        let agent_state = axis_root.join("agents").join(format!("agent-{install_name}"));
+                        let agent_state = axis_root
+                            .join("agents")
+                            .join(format!("agent-{install_name}"));
                         for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
                             let path = entry.path();
-                            if path.is_symlink() {
-                                if let Ok(target) = std::fs::read_link(&path) {
-                                    if target.starts_with(&agent_state) {
-                                        let _ = std::fs::remove_file(&path);
-                                        eprintln!("  Removed symlink: {}", path.display());
-                                        let backup = PathBuf::from(format!("{}.axis-backup", path.display()));
-                                        if backup.exists() {
-                                            let _ = std::fs::rename(&backup, &path);
-                                            eprintln!("  Restored: {}", path.display());
-                                        }
-                                    }
+                            if path.is_symlink()
+                                && let Ok(target) = std::fs::read_link(&path)
+                                && target.starts_with(&agent_state)
+                            {
+                                let _ = std::fs::remove_file(&path);
+                                eprintln!("  Removed symlink: {}", path.display());
+                                let backup =
+                                    PathBuf::from(format!("{}.axis-backup", path.display()));
+                                if backup.exists() {
+                                    let _ = std::fs::rename(&backup, &path);
+                                    eprintln!("  Restored: {}", path.display());
                                 }
                             }
                         }
@@ -300,37 +306,78 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Install { agents, all, list, use_system } => {
+        Commands::Install {
+            agents,
+            all,
+            list,
+            use_system,
+        } => {
             // Install bundled policies.
             // On Windows: %LOCALAPPDATA%\axis (matches PS1 installer).
             // On Unix: ~/.axis
             let axis_root = if cfg!(windows) {
-                PathBuf::from(
-                    std::env::var("LOCALAPPDATA").unwrap_or_else(|_|
-                        std::env::var("USERPROFILE").unwrap_or("C:\\Users\\Public".into())
-                    )
-                ).join("axis")
+                PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
+                    std::env::var("USERPROFILE").unwrap_or("C:\\Users\\Public".into())
+                }))
+                .join("axis")
             } else {
-                PathBuf::from(
-                    std::env::var("HOME").unwrap_or("/tmp".into())
-                ).join(".axis")
+                PathBuf::from(std::env::var("HOME").unwrap_or("/tmp".into())).join(".axis")
             };
             let pol_dir = axis_root.join("policies").join("agents");
             std::fs::create_dir_all(&pol_dir)?;
             for (name, content) in [
-                ("base-deny.yaml", include_str!("../../../policies/agents/base-deny.yaml")),
-                ("claude-code.yaml", include_str!("../../../policies/agents/claude-code.yaml")),
-                ("claude-code-ssh.yaml", include_str!("../../../policies/agents/claude-code-ssh.yaml")),
-                ("codex.yaml", include_str!("../../../policies/agents/codex.yaml")),
-                ("openclaw.yaml", include_str!("../../../policies/agents/openclaw.yaml")),
-                ("ironclaw.yaml", include_str!("../../../policies/agents/ironclaw.yaml")),
-                ("nanoclaw.yaml", include_str!("../../../policies/agents/nanoclaw.yaml")),
-                ("zeroclaw.yaml", include_str!("../../../policies/agents/zeroclaw.yaml")),
-                ("hermes.yaml", include_str!("../../../policies/agents/hermes.yaml")),
-                ("gemini-cli.yaml", include_str!("../../../policies/agents/gemini-cli.yaml")),
-                ("opencode.yaml", include_str!("../../../policies/agents/opencode.yaml")),
-                ("gemini-cli.yaml", include_str!("../../../policies/agents/gemini-cli.yaml")),
-                ("opencode.yaml", include_str!("../../../policies/agents/opencode.yaml")),
+                (
+                    "base-deny.yaml",
+                    include_str!("../../../policies/agents/base-deny.yaml"),
+                ),
+                (
+                    "claude-code.yaml",
+                    include_str!("../../../policies/agents/claude-code.yaml"),
+                ),
+                (
+                    "claude-code-ssh.yaml",
+                    include_str!("../../../policies/agents/claude-code-ssh.yaml"),
+                ),
+                (
+                    "codex.yaml",
+                    include_str!("../../../policies/agents/codex.yaml"),
+                ),
+                (
+                    "openclaw.yaml",
+                    include_str!("../../../policies/agents/openclaw.yaml"),
+                ),
+                (
+                    "ironclaw.yaml",
+                    include_str!("../../../policies/agents/ironclaw.yaml"),
+                ),
+                (
+                    "nanoclaw.yaml",
+                    include_str!("../../../policies/agents/nanoclaw.yaml"),
+                ),
+                (
+                    "zeroclaw.yaml",
+                    include_str!("../../../policies/agents/zeroclaw.yaml"),
+                ),
+                (
+                    "hermes.yaml",
+                    include_str!("../../../policies/agents/hermes.yaml"),
+                ),
+                (
+                    "gemini-cli.yaml",
+                    include_str!("../../../policies/agents/gemini-cli.yaml"),
+                ),
+                (
+                    "opencode.yaml",
+                    include_str!("../../../policies/agents/opencode.yaml"),
+                ),
+                (
+                    "gemini-cli.yaml",
+                    include_str!("../../../policies/agents/gemini-cli.yaml"),
+                ),
+                (
+                    "opencode.yaml",
+                    include_str!("../../../policies/agents/opencode.yaml"),
+                ),
             ] {
                 let _ = std::fs::write(pol_dir.join(name), content);
             }
@@ -343,11 +390,18 @@ async fn main() -> Result<()> {
 
                 let mut cmd = std::process::Command::new("bash");
                 cmd.arg(&script_path);
-                if use_system { cmd.arg("--use-system"); }
-                if list { cmd.arg("--list"); }
-                else if all { cmd.arg("--all"); }
-                else if agents.is_empty() { cmd.arg("--help"); }
-                else { cmd.args(&agents); }
+                if use_system {
+                    cmd.arg("--use-system");
+                }
+                if list {
+                    cmd.arg("--list");
+                } else if all {
+                    cmd.arg("--all");
+                } else if agents.is_empty() {
+                    cmd.arg("--help");
+                } else {
+                    cmd.args(&agents);
+                }
 
                 let status = cmd.status()?;
                 let _ = std::fs::remove_file(&script_path);
@@ -365,9 +419,11 @@ async fn main() -> Result<()> {
 
                 // Build the PowerShell command string.
                 let mut ps_cmd = format!("& '{}'", script_path.display());
-                if list { ps_cmd.push_str(" -List"); }
-                else if all { ps_cmd.push_str(" -All"); }
-                else if !agents.is_empty() {
+                if list {
+                    ps_cmd.push_str(" -List");
+                } else if all {
+                    ps_cmd.push_str(" -All");
+                } else if !agents.is_empty() {
                     ps_cmd.push_str(&format!(" -Agents @('{}')", agents.join("','")));
                 }
                 cmd.arg(&ps_cmd);
@@ -406,18 +462,28 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Logs { sandbox, follow, tail } => {
+        Commands::Logs {
+            sandbox,
+            follow,
+            tail,
+        } => {
             // Read stdout/stderr logs from the sandbox workspace.
             let request = serde_json::json!({ "type": "list" });
             let response = send_ipc(&cli.socket, &request).await?;
 
             // Find sandbox workspace from the list.
-            let workspace = response["data"].as_array()
-                .and_then(|arr| arr.iter().find(|s| {
-                    s["id"].as_str().map(|id| id.starts_with(&sandbox)).unwrap_or(false)
-                }))
+            let workspace = response["data"]
+                .as_array()
+                .and_then(|arr| {
+                    arr.iter().find(|s| {
+                        s["id"]
+                            .as_str()
+                            .map(|id| id.starts_with(&sandbox))
+                            .unwrap_or(false)
+                    })
+                })
                 .and_then(|s| s["workspace"].as_str())
-                .map(|s| PathBuf::from(s));
+                .map(PathBuf::from);
 
             let workspace = match workspace {
                 Some(ws) => ws,
@@ -528,13 +594,16 @@ async fn main() -> Result<()> {
                     if arr.is_empty() {
                         println!("No running sandboxes.");
                     } else {
-                        println!("{:<38} {:<10} {:<8} {}", "ID", "STATUS", "PID", "WORKSPACE");
+                        println!("{:<38} {:<10} {:<8} WORKSPACE", "ID", "STATUS", "PID");
                         for s in arr {
                             println!(
                                 "{:<38} {:<10} {:<8} {}",
                                 s["id"].as_str().unwrap_or("-"),
                                 s["status"].as_str().unwrap_or("-"),
-                                s["pid"].as_u64().map(|p| p.to_string()).unwrap_or("-".into()),
+                                s["pid"]
+                                    .as_u64()
+                                    .map(|p| p.to_string())
+                                    .unwrap_or("-".into()),
                                 s["workspace"].as_str().unwrap_or("-"),
                             );
                         }
@@ -549,26 +618,32 @@ async fn main() -> Result<()> {
                 match axis_core::policy::Policy::from_yaml(&yaml) {
                     Ok(policy) => {
                         println!("Policy '{}' is valid.", policy.name);
-                        println!("  Filesystem: {} read-only, {} read-write, {} deny paths",
+                        println!(
+                            "  Filesystem: {} read-only, {} read-write, {} deny paths",
                             policy.filesystem.read_only.len(),
                             policy.filesystem.read_write.len(),
                             policy.filesystem.deny.len(),
                         );
-                        println!("  Process: max {} processes, {}MB memory, {}% CPU",
+                        println!(
+                            "  Process: max {} processes, {}MB memory, {}% CPU",
                             policy.process.max_processes,
                             policy.process.max_memory_mb,
                             policy.process.cpu_rate_percent,
                         );
-                        println!("  Network: {:?} mode, {} endpoint policies",
+                        println!(
+                            "  Network: {:?} mode, {} endpoint policies",
                             policy.network.mode,
                             policy.network.policies.len(),
                         );
                         println!("  Inference: {} routes", policy.inference.routes.len());
                         if policy.gpu.enabled {
-                            println!("  GPU: device={}, transport={:?}, vram_limit={}",
+                            println!(
+                                "  GPU: device={}, transport={:?}, vram_limit={}",
                                 policy.gpu.device,
                                 policy.gpu.transport,
-                                policy.gpu.vram_limit_mb
+                                policy
+                                    .gpu
+                                    .vram_limit_mb
                                     .map(|m| format!("{m}MB"))
                                     .unwrap_or("unlimited".into()),
                             );
@@ -589,13 +664,19 @@ async fn main() -> Result<()> {
                 if models.is_empty() {
                     println!("No models registered. Use `axis model pull` to download one.");
                 } else {
-                    println!("{:<30} {:<12} {:<10} {}", "NAME", "FORMAT", "VRAM", "PATH");
+                    println!("{:<30} {:<12} {:<10} PATH", "NAME", "FORMAT", "VRAM");
                     for m in models {
-                        println!("{:<30} {:<12} {:<10} {}",
+                        println!(
+                            "{:<30} {:<12} {:<10} {}",
                             m.name,
                             format!("{:?}", m.format).to_lowercase(),
-                            m.vram_required_mb.map(|v| format!("{v}MB")).unwrap_or("-".into()),
-                            m.local_path.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into()),
+                            m.vram_required_mb
+                                .map(|v| format!("{v}MB"))
+                                .unwrap_or("-".into()),
+                            m.local_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or("-".into()),
                         );
                     }
                 }
@@ -631,10 +712,14 @@ async fn main() -> Result<()> {
                 // Built-in policies.
                 match policy.as_str() {
                     "minimal" => include_str!("../../../policies/minimal.yaml").to_string(),
-                    "coding-agent" => include_str!("../../../policies/coding-agent.yaml").to_string(),
+                    "coding-agent" => {
+                        include_str!("../../../policies/coding-agent.yaml").to_string()
+                    }
                     "gpu-agent" => include_str!("../../../policies/gpu-agent.yaml").to_string(),
                     _ => {
-                        eprintln!("Policy '{policy}' not found. Use a file path or: minimal, coding-agent, gpu-agent");
+                        eprintln!(
+                            "Policy '{policy}' not found. Use a file path or: minimal, coding-agent, gpu-agent"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -683,7 +768,9 @@ async fn main() -> Result<()> {
                 Err(_) => {
                     // Daemon not running — run sandbox directly (standalone mode).
                     let quiet = std::io::IsTerminal::is_terminal(&std::io::stdin());
-                    if !quiet { eprintln!("AXIS: daemon not running, using standalone mode"); }
+                    if !quiet {
+                        eprintln!("AXIS: daemon not running, using standalone mode");
+                    }
 
                     let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
                     let sandbox_id = axis_core::types::SandboxId::new();
@@ -706,10 +793,16 @@ async fn main() -> Result<()> {
                         Some(proxy_config) => {
                             let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
                                 .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
-                            let addr = proxy.bind().await
+                            let addr = proxy
+                                .bind()
+                                .await
                                 .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
-                            if !quiet { eprintln!("AXIS: proxy on {addr}"); }
-                            tokio::spawn(async move { let _ = proxy.run().await; });
+                            if !quiet {
+                                eprintln!("AXIS: proxy on {addr}");
+                            }
+                            tokio::spawn(async move {
+                                let _ = proxy.run().await;
+                            });
                             Some(addr)
                         }
                         None => None,
@@ -723,13 +816,14 @@ async fn main() -> Result<()> {
                     // venvs work without users needing to configure PATH.
                     if cfg!(windows) {
                         let extra_dirs = discover_runtime_dirs();
-                        if !extra_dirs.is_empty() {
-                            if let Some(path_entry) = env.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PATH")) {
-                                for dir in &extra_dirs {
-                                    if !path_entry.1.to_lowercase().contains(&dir.to_lowercase()) {
-                                        path_entry.1.push(';');
-                                        path_entry.1.push_str(dir);
-                                    }
+                        if !extra_dirs.is_empty()
+                            && let Some(path_entry) =
+                                env.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                        {
+                            for dir in &extra_dirs {
+                                if !path_entry.1.to_lowercase().contains(&dir.to_lowercase()) {
+                                    path_entry.1.push(';');
+                                    path_entry.1.push_str(dir);
                                 }
                             }
                         }
@@ -756,8 +850,10 @@ async fn main() -> Result<()> {
                     sandbox.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
                     if !quiet {
-                        eprintln!("AXIS: sandbox running (pid={}), Ctrl+C to stop",
-                            sandbox.pid.unwrap_or(0));
+                        eprintln!(
+                            "AXIS: sandbox running (pid={}), Ctrl+C to stop",
+                            sandbox.pid.unwrap_or(0)
+                        );
                     }
 
                     if quiet {
@@ -765,8 +861,7 @@ async fn main() -> Result<()> {
                         // Don't install tokio signal handlers — they steal the
                         // TTY from the child process and break TUI apps like
                         // Claude Code (setRawMode fails).
-                        let code = sandbox.wait().await
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let code = sandbox.wait().await.map_err(|e| anyhow::anyhow!("{e}"))?;
                         sandbox.destroy().ok();
                         std::process::exit(code);
                     } else {
@@ -816,8 +911,17 @@ fn try_agent_subcommand() -> Option<i32> {
         return None;
     }
     let builtins = [
-        "create", "exec", "destroy", "list", "logs", "run", "install",
-        "policy", "model", "inference", "help",
+        "create",
+        "exec",
+        "destroy",
+        "list",
+        "logs",
+        "run",
+        "install",
+        "policy",
+        "model",
+        "inference",
+        "help",
     ];
     if builtins.contains(&subcmd.as_str()) {
         return None;
@@ -866,28 +970,30 @@ fn axis_bin_dir() -> std::path::PathBuf {
     if cfg!(windows) {
         // Windows: %LOCALAPPDATA%\axis\bin
         std::path::PathBuf::from(
-            std::env::var("LOCALAPPDATA").unwrap_or_else(|_|
+            std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
                 std::env::var("USERPROFILE").unwrap_or("C:\\Users\\Public".into())
-            )
-        ).join("axis").join("bin")
+            }),
+        )
+        .join("axis")
+        .join("bin")
     } else {
         // Unix: ~/.axis/bin
-        std::path::PathBuf::from(
-            std::env::var("HOME").unwrap_or("/tmp".into())
-        ).join(".axis").join("bin")
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or("/tmp".into()))
+            .join(".axis")
+            .join("bin")
     }
 }
 
 /// Known agent binary names → install names.
 fn known_agent(binary_name: &str) -> Option<&'static str> {
     match binary_name {
-        "claude"   => Some("claude-code"),
-        "codex"    => Some("codex"),
+        "claude" => Some("claude-code"),
+        "codex" => Some("codex"),
         "openclaw" => Some("openclaw"),
         "ironclaw" => Some("ironclaw"),
-        "aider"    => Some("aider"),
-        "goose"    => Some("goose"),
-        "gemini"   => Some("gemini-cli"),
+        "aider" => Some("aider"),
+        "goose" => Some("goose"),
+        "gemini" => Some("gemini-cli"),
         "opencode" => Some("opencode"),
         _ => None,
     }
@@ -924,7 +1030,10 @@ fn try_prompt_install(subcmd: &str) -> Option<i32> {
         }
 
         // After install, retry the original command.
-        eprintln!("\nRunning: {subcmd} {}", std::env::args().skip(2).collect::<Vec<_>>().join(" "));
+        eprintln!(
+            "\nRunning: {subcmd} {}",
+            std::env::args().skip(2).collect::<Vec<_>>().join(" ")
+        );
         let args: Vec<String> = std::env::args().collect();
         let agent_args: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
 
@@ -952,7 +1061,10 @@ fn try_prompt_install(subcmd: &str) -> Option<i32> {
             };
             Some(status.code().unwrap_or(1))
         } else {
-            eprintln!("Install succeeded but wrapper not found at {}", wrapper.display());
+            eprintln!(
+                "Install succeeded but wrapper not found at {}",
+                wrapper.display()
+            );
             Some(1)
         }
     } else {
@@ -1150,7 +1262,10 @@ mod tests {
         let bind_addr = proxy_bind_addr_for_sandbox(id, 0, &policy);
 
         #[cfg(target_os = "linux")]
-        assert_eq!(bind_addr, axis_sandbox::linux::netns::proxy_bind_addr(id, 0));
+        assert_eq!(
+            bind_addr,
+            axis_sandbox::linux::netns::proxy_bind_addr(id, 0)
+        );
 
         #[cfg(not(target_os = "linux"))]
         assert_eq!(bind_addr, "127.0.0.1:0".parse().unwrap());
@@ -1175,7 +1290,10 @@ mod tests {
             .expect("proxy mode should plan an inline proxy");
 
         assert_eq!(config.sandbox_id, id);
-        assert_eq!(config.bind_addr, proxy_bind_addr_for_sandbox(id, 0, &policy));
+        assert_eq!(
+            config.bind_addr,
+            proxy_bind_addr_for_sandbox(id, 0, &policy)
+        );
         assert!(!config.enable_l7);
         assert!(config.enable_leak_detection);
         assert!(config.inference_endpoint.is_none());

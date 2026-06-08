@@ -63,7 +63,7 @@ impl WorkerManager {
         &mut self,
         sandbox_id: SandboxId,
         policy: &GpuPolicy,
-        workspace: &std::path::Path,
+        _workspace: &std::path::Path,
     ) -> Result<WorkerEndpoint, WorkerError> {
         // Determine transport and endpoint.
         // Currently hip-worker only supports TCP (-p PORT).
@@ -96,12 +96,12 @@ impl WorkerManager {
             cmd.arg("-v"); // verbose for debugging
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| WorkerError::StartFailed(format!(
+        let child = cmd.spawn().map_err(|e| {
+            WorkerError::StartFailed(format!(
                 "cannot spawn {}: {e}",
                 self.worker_binary.display(),
-            )))?;
+            ))
+        })?;
 
         let pid = child.id();
         tracing::info!(
@@ -109,13 +109,16 @@ impl WorkerManager {
             policy.device,
         );
 
-        self.workers.insert(sandbox_id, ManagedWorker {
+        self.workers.insert(
             sandbox_id,
-            endpoint: endpoint.clone(),
-            pid: Some(pid),
-            api_filter,
-            gpu_device: policy.device,
-        });
+            ManagedWorker {
+                sandbox_id,
+                endpoint: endpoint.clone(),
+                pid: Some(pid),
+                api_filter,
+                gpu_device: policy.device,
+            },
+        );
 
         Ok(endpoint)
     }
@@ -176,10 +179,7 @@ impl WorkerManager {
         self.workers
             .values()
             .map(|w| {
-                let (used, limit) = self
-                    .vram_tracker
-                    .usage(&w.sandbox_id)
-                    .unwrap_or((0, 0));
+                let (used, limit) = self.vram_tracker.usage(&w.sandbox_id).unwrap_or((0, 0));
                 WorkerInfo {
                     sandbox_id: w.sandbox_id,
                     endpoint: w.endpoint.to_string(),

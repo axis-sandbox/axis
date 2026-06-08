@@ -6,17 +6,20 @@
 use crate::GatewayState;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
-use hyper::{body::Bytes, Request, Response};
+use hyper::{Request, Response, body::Bytes};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
-use tokio_tungstenite::tungstenite::{
-    handshake::derive_accept_key,
-    protocol::Role,
-    Message,
-};
+use tokio_tungstenite::tungstenite::{Message, handshake::derive_accept_key, protocol::Role};
 
-fn ws_upgrade_response(req: &Request<hyper::body::Incoming>) -> Option<(Response<Full<Bytes>>, String)> {
-    let key = req.headers().get("sec-websocket-key")?.to_str().ok()?.to_string();
+fn ws_upgrade_response(
+    req: &Request<hyper::body::Incoming>,
+) -> Option<(Response<Full<Bytes>>, String)> {
+    let key = req
+        .headers()
+        .get("sec-websocket-key")?
+        .to_str()
+        .ok()?
+        .to_string();
     let accept = derive_accept_key(key.as_bytes());
 
     let resp = Response::builder()
@@ -48,12 +51,18 @@ pub async fn handle_ws_upgrade(
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(&mut req).await {
             Ok(u) => u,
-            Err(e) => { tracing::warn!("ws upgrade failed: {e}"); return; }
+            Err(e) => {
+                tracing::warn!("ws upgrade failed: {e}");
+                return;
+            }
         };
 
         let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            TokioIo::new(upgraded), Role::Server, None,
-        ).await;
+            TokioIo::new(upgraded),
+            Role::Server,
+            None,
+        )
+        .await;
         let (mut ws_tx, mut ws_rx) = ws.split();
         let mut event_rx = state.subscribe_events();
 
@@ -115,16 +124,25 @@ pub async fn handle_pty_upgrade(
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(&mut req).await {
             Ok(u) => u,
-            Err(e) => { tracing::warn!("pty ws upgrade failed: {e}"); return; }
+            Err(e) => {
+                tracing::warn!("pty ws upgrade failed: {e}");
+                return;
+            }
         };
 
         let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            TokioIo::new(upgraded), Role::Server, None,
-        ).await;
+            TokioIo::new(upgraded),
+            Role::Server,
+            None,
+        )
+        .await;
         let (mut ws_tx, mut ws_rx) = ws.split();
 
         if let Some((buffer, mut output_rx)) = output_sub {
-            tracing::info!("pty ws connected for sandbox {sandbox_id}, replaying {} buffered chunks", buffer.len());
+            tracing::info!(
+                "pty ws connected for sandbox {sandbox_id}, replaying {} buffered chunks",
+                buffer.len()
+            );
 
             // Replay buffered output first.
             for chunk in &buffer {
@@ -174,9 +192,11 @@ pub async fn handle_pty_upgrade(
                 }
             }
         } else {
-            let _ = ws_tx.send(Message::Text(
-                format!("\r\nSandbox {sandbox_id} not found or output not captured.\r\n")
-            )).await;
+            let _ = ws_tx
+                .send(Message::Text(format!(
+                    "\r\nSandbox {sandbox_id} not found or output not captured.\r\n"
+                )))
+                .await;
         }
         tracing::debug!("pty ws disconnected for {sandbox_id}");
     });

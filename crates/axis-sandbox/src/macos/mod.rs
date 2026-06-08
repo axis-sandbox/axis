@@ -35,10 +35,8 @@ impl SandboxImpl for MacosSandbox {
         let sandbox_id = self.config.id;
 
         // Generate Seatbelt profile from policy.
-        let seatbelt_profile = profile::generate_profile(
-            &self.config.policy,
-            &self.config.workspace_dir,
-        );
+        let seatbelt_profile =
+            profile::generate_profile(&self.config.policy, &self.config.workspace_dir);
 
         // Write profile to a temp file and use sandbox-exec -f.
         let profile_path = self.config.workspace_dir.join(".axis-sandbox.sb");
@@ -98,9 +96,8 @@ impl SandboxImpl for MacosSandbox {
 
     fn wait(
         &mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>
+    {
         Box::pin(async {
             let child = self
                 .child

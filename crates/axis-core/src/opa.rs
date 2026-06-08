@@ -64,21 +64,15 @@ impl PolicyEngine {
     }
 
     /// Evaluate inference routing for a request.
-    pub fn eval_inference(
-        &mut self,
-        action: &InferenceAction,
-    ) -> Result<PolicyDecision, OpaError> {
+    pub fn eval_inference(&mut self, action: &InferenceAction) -> Result<PolicyDecision, OpaError> {
         let input_json = serde_json::to_string(action)?;
         self.eval_query("data.axis.inference.decision", &input_json)
     }
 
     /// Run a Rego query and return the policy decision.
-    fn eval_query(
-        &mut self,
-        query: &str,
-        input_json: &str,
-    ) -> Result<PolicyDecision, OpaError> {
-        self.engine.set_input_json(input_json)
+    fn eval_query(&mut self, query: &str, input_json: &str) -> Result<PolicyDecision, OpaError> {
+        self.engine
+            .set_input_json(input_json)
             .map_err(|e| OpaError::EvalError(format!("failed to set input: {e}")))?;
 
         let results = self
@@ -89,14 +83,14 @@ impl PolicyEngine {
         // Extract the decision from the query result.
         // The Rego rules return an object with `allowed`, `matched_policy`, and `reason`.
         // regorus returns its own Value type — convert via JSON round-trip.
-        if let Some(result) = results.result.first() {
-            if let Some(expr) = result.expressions.first() {
-                let json_str = serde_json::to_string(&expr.value)
-                    .map_err(|e| OpaError::EvalError(format!("failed to serialize result: {e}")))?;
-                let decision: PolicyDecision = serde_json::from_str(&json_str)
-                    .map_err(|e| OpaError::EvalError(format!("failed to parse decision: {e}")))?;
-                return Ok(decision);
-            }
+        if let Some(result) = results.result.first()
+            && let Some(expr) = result.expressions.first()
+        {
+            let json_str = serde_json::to_string(&expr.value)
+                .map_err(|e| OpaError::EvalError(format!("failed to serialize result: {e}")))?;
+            let decision: PolicyDecision = serde_json::from_str(&json_str)
+                .map_err(|e| OpaError::EvalError(format!("failed to parse decision: {e}")))?;
+            return Ok(decision);
         }
 
         // Default deny if no result.
@@ -154,7 +148,11 @@ inference:
     #[test]
     fn create_engine() {
         let engine = PolicyEngine::new();
-        assert!(engine.is_ok(), "failed to create OPA engine: {:?}", engine.err());
+        assert!(
+            engine.is_ok(),
+            "failed to create OPA engine: {:?}",
+            engine.err()
+        );
     }
 
     #[test]
@@ -197,7 +195,10 @@ inference:
             sandbox_id: SandboxId::new(),
         };
         let decision = engine.eval_network(&action).unwrap();
-        assert!(!decision.allowed, "expected deny for wrong binary, got: {decision:?}");
+        assert!(
+            !decision.allowed,
+            "expected deny for wrong binary, got: {decision:?}"
+        );
     }
 
     #[test]
@@ -212,7 +213,10 @@ inference:
             sandbox_id: SandboxId::new(),
         };
         let decision = engine.eval_network(&action).unwrap();
-        assert!(decision.allowed, "expected allow for pypi (no binary restriction), got: {decision:?}");
+        assert!(
+            decision.allowed,
+            "expected allow for pypi (no binary restriction), got: {decision:?}"
+        );
         assert_eq!(decision.matched_policy.as_deref(), Some("pypi"));
     }
 
@@ -227,7 +231,10 @@ inference:
             sandbox_id: SandboxId::new(),
         };
         let decision = engine.eval_network(&action).unwrap();
-        assert!(!decision.allowed, "expected deny for wrong port, got: {decision:?}");
+        assert!(
+            !decision.allowed,
+            "expected deny for wrong port, got: {decision:?}"
+        );
     }
 
     #[test]
@@ -240,7 +247,10 @@ inference:
             sandbox_id: SandboxId::new(),
         };
         let decision = engine.eval_inference(&action).unwrap();
-        assert!(decision.allowed, "expected allow for known model, got: {decision:?}");
+        assert!(
+            decision.allowed,
+            "expected allow for known model, got: {decision:?}"
+        );
         assert_eq!(decision.matched_policy.as_deref(), Some("local-rocm"));
     }
 
@@ -255,6 +265,9 @@ inference:
         };
         let decision = engine.eval_inference(&action).unwrap();
         // Should fall back to default provider
-        assert!(decision.allowed, "expected allow via default provider, got: {decision:?}");
+        assert!(
+            decision.allowed,
+            "expected allow via default provider, got: {decision:?}"
+        );
     }
 }

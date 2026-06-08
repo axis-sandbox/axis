@@ -138,7 +138,11 @@ impl AuditLog {
         } else {
             Severity::Medium
         };
-        let action = if decision.allowed { "allowed" } else { "denied" };
+        let action = if decision.allowed {
+            "allowed"
+        } else {
+            "denied"
+        };
         self.emit(
             &AuditEvent::new(
                 EventCategory::NetworkActivity,
@@ -150,11 +154,7 @@ impl AuditLog {
         );
     }
 
-    pub fn network_bypass_detected(
-        &self,
-        sandbox_id: SandboxId,
-        details: NetworkBypassDetails,
-    ) {
+    pub fn network_bypass_detected(&self, sandbox_id: SandboxId, details: NetworkBypassDetails) {
         let event = AuditEvent {
             id: Uuid::new_v4(),
             timestamp: details.observed_at,
@@ -177,6 +177,12 @@ impl AuditLog {
             Some(sandbox_id),
             format!("credential leak detected: {pattern}"),
         ));
+    }
+}
+
+impl Default for AuditLog {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -284,9 +290,8 @@ mod tests {
         log.add_sink(Box::new(CapturingSink {
             events: events.clone(),
         }));
-        let sandbox_id = SandboxId(
-            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
-        );
+        let sandbox_id =
+            SandboxId(uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap());
         let observed_at = Utc::now();
 
         log.network_bypass_detected(

@@ -36,6 +36,16 @@ const BYPASS_AUDIT_POLL_INTERVAL_MS: u64 = 250;
 
 #[cfg(target_os = "linux")]
 type BypassAuditTokens = std::sync::Arc<std::sync::Mutex<HashMap<String, SandboxId>>>;
+type SandboxEnv = Vec<(String, String)>;
+type ExecContext = (Policy, PathBuf, SandboxEnv);
+type OutputSubscription = (Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>);
+type ProxyStart = (
+    Option<SocketAddr>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+    Option<axis_core::connect_attribution::ConnectAttributionStore>,
+);
+type DaemonBackendFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Atomic counter for allocating unique proxy ports.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(PROXY_PORT_BASE);
@@ -44,7 +54,7 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(PROXY_PORT_BASE);
 struct ManagedSandbox {
     sandbox: Sandbox,
     policy: Policy,
-    env: Vec<(String, String)>,
+    env: SandboxEnv,
     proxy_addr: Option<SocketAddr>,
     proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     gpu_enabled: bool,
@@ -68,10 +78,6 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    pub fn new() -> Self {
-        Self::with_event_broadcast(None)
-    }
-
     /// Create a SandboxManager with an optional broadcast channel for streaming
     /// audit events to the gateway (GUI/WebSocket clients).
     pub fn with_event_broadcast(
@@ -155,20 +161,20 @@ impl SandboxManager {
         }
 
         // 4. Create and start the sandbox process.
-        let managed = match start_managed_sandbox(
+        let managed = match start_managed_sandbox(StartManagedSandboxArgs {
             id,
             policy,
-            policy_name.clone(),
+            policy_name: policy_name.clone(),
             gpu_enabled,
             command,
             args,
             env,
             extra_env,
-            workspace_dir.clone(),
+            workspace_dir: workspace_dir.clone(),
             proxy_addr,
             connect_attribution,
             proxy_shutdown,
-        ) {
+        }) {
             Ok(managed) => managed,
             Err(e) => {
                 #[cfg(target_os = "linux")]
@@ -227,10 +233,7 @@ impl SandboxManager {
         .await
     }
 
-    fn exec_context(
-        &self,
-        id: &SandboxId,
-    ) -> Result<(Policy, PathBuf, Vec<(String, String)>), String> {
+    fn exec_context(&self, id: &SandboxId) -> Result<ExecContext, String> {
         let managed = self
             .sandboxes
             .get(id)
@@ -414,10 +417,7 @@ impl SandboxManager {
     /// Subscribe to a sandbox's stdout/stderr output stream.
     /// Returns (buffered_output, live_receiver) — caller should send the buffer first,
     /// then stream from the receiver for new data.
-    pub fn subscribe_output(
-        &self,
-        id: &SandboxId,
-    ) -> Option<(Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
+    pub fn subscribe_output(&self, id: &SandboxId) -> Option<OutputSubscription> {
         self.sandboxes.get(id).and_then(|m| {
             let rx = m.output_tx.as_ref()?.subscribe();
             let buffer = m.output_buffer.lock().ok()?.clone();
@@ -437,9 +437,7 @@ async fn ensure_inference_server_from_shared(
         }
     }
 
-    let Some((server, addr)) = start_inference_server_for_policy(policy).await else {
-        return None;
-    };
+    let (server, addr) = start_inference_server_for_policy(policy).await?;
 
     let mut manager = mgr.lock().await;
     if let Some(existing_addr) = current_inference_endpoint(&manager) {
@@ -460,9 +458,7 @@ fn current_inference_endpoint(manager: &SandboxManager) -> Option<SocketAddr> {
 async fn start_inference_server_for_policy(
     policy: &Policy,
 ) -> Option<(InferenceServer, SocketAddr)> {
-    let Some((model_path, mode)) = inference_server_start_plan(policy) else {
-        return None;
-    };
+    let (model_path, mode) = inference_server_start_plan(policy)?;
 
     let mut server = InferenceServer::new(mode);
     match server.start(&model_path).await {
@@ -578,20 +574,37 @@ async fn stop_gpu_worker_from_shared(
     }
 }
 
-fn start_managed_sandbox(
+struct StartManagedSandboxArgs {
     id: SandboxId,
     policy: Policy,
     policy_name: String,
     gpu_enabled: bool,
     command: String,
     args: Vec<String>,
-    env: Vec<(String, String)>,
-    extra_env: Vec<(String, String)>,
+    env: SandboxEnv,
+    extra_env: SandboxEnv,
     workspace_dir: PathBuf,
     proxy_addr: Option<SocketAddr>,
     connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
     proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<ManagedSandbox, String> {
+}
+
+fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbox, String> {
+    let StartManagedSandboxArgs {
+        id,
+        policy,
+        policy_name,
+        gpu_enabled,
+        command,
+        args,
+        env,
+        extra_env,
+        workspace_dir,
+        proxy_addr,
+        connect_attribution,
+        proxy_shutdown,
+    } = input;
+
     let mut all_env = env;
     all_env.extend(extra_env);
     apply_platform_sandbox_env_filter(&mut all_env);
@@ -815,7 +828,7 @@ fn managed_sandbox_from_started(
 async fn run_contained_exec(
     policy: Policy,
     workspace: PathBuf,
-    env: Vec<(String, String)>,
+    env: SandboxEnv,
     inference_endpoint: Option<SocketAddr>,
     #[cfg(target_os = "linux")] bypass_audit_tokens: BypassAuditTokens,
     command: String,
@@ -830,16 +843,16 @@ async fn run_contained_exec(
     );
     let (exec_proxy_addr, mut exec_proxy_shutdown, exec_connect_attribution) =
         start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
-    let config = contained_exec_config_from(
-        &policy,
-        &workspace,
-        &env,
+    let config = contained_exec_config_from(ContainedExecConfigInput {
+        policy: &policy,
+        workspace_dir: &workspace,
+        env: &env,
         exec_id,
-        exec_proxy_addr,
-        exec_connect_attribution,
-        command.clone(),
-        args.clone(),
-    );
+        proxy_addr: exec_proxy_addr,
+        connect_attribution: exec_connect_attribution,
+        command: command.clone(),
+        args: args.clone(),
+    });
     let exec_workspace = config.workspace_dir.clone();
 
     tracing::info!(
@@ -951,14 +964,7 @@ async fn start_proxy_for_sandbox(
     id: SandboxId,
     policy: &Policy,
     inference_endpoint: Option<SocketAddr>,
-) -> Result<
-    (
-        Option<SocketAddr>,
-        Option<tokio::sync::oneshot::Sender<()>>,
-        Option<axis_core::connect_attribution::ConnectAttributionStore>,
-    ),
-    String,
-> {
+) -> Result<ProxyStart, String> {
     if !policy_uses_proxy(policy) {
         tracing::info!(
             "sandbox {id}: network proxy disabled for {:?} mode",
@@ -1147,10 +1153,9 @@ fn run_linux_bypass_audit_collector(
             &mut reader,
             &token_snapshot,
             &audit,
-        ) {
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                tracing::warn!("linux bypass audit collector read failed: {e}");
-            }
+        ) && e.kind() != std::io::ErrorKind::Interrupted
+        {
+            tracing::warn!("linux bypass audit collector read failed: {e}");
         }
 
         std::thread::sleep(std::time::Duration::from_millis(
@@ -1269,16 +1274,28 @@ async fn destroy_sandbox_after_timeout_with<D, Fut>(
     }
 }
 
-fn contained_exec_config_from(
-    policy: &Policy,
-    workspace_dir: &Path,
-    env: &[(String, String)],
+struct ContainedExecConfigInput<'a> {
+    policy: &'a Policy,
+    workspace_dir: &'a Path,
+    env: &'a [(String, String)],
     exec_id: SandboxId,
     proxy_addr: Option<SocketAddr>,
     connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
     command: String,
     args: Vec<String>,
-) -> SandboxConfig {
+}
+
+fn contained_exec_config_from(input: ContainedExecConfigInput<'_>) -> SandboxConfig {
+    let ContainedExecConfigInput {
+        policy,
+        workspace_dir,
+        env,
+        exec_id,
+        proxy_addr,
+        connect_attribution,
+        command,
+        args,
+    } = input;
     let exec_workspace = contained_exec_workspace_dir(workspace_dir, exec_id);
     let mut policy = policy.clone();
     let workspace_policy_path = workspace_dir.to_string_lossy().into_owned();
@@ -1410,8 +1427,7 @@ impl SandboxBackend for SandboxManagerBackend {
         policy_yaml: &str,
         command: String,
         args: Vec<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
-    {
+    ) -> DaemonBackendFuture<'_, Result<String, String>> {
         let policy_yaml = policy_yaml.to_string();
         let mgr_handle = self.mgr.clone();
         // Collect essential env vars for the sandbox (same logic as axis-cli).
@@ -1438,10 +1454,7 @@ impl SandboxBackend for SandboxManagerBackend {
         })
     }
 
-    fn destroy_sandbox(
-        &self,
-        id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+    fn destroy_sandbox(&self, id: &str) -> DaemonBackendFuture<'_, Result<(), String>> {
         let id = id.to_string();
         Box::pin(async move {
             let sandbox_id: axis_core::types::SandboxId = id
@@ -1452,10 +1465,7 @@ impl SandboxBackend for SandboxManagerBackend {
         })
     }
 
-    fn list_sandboxes(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + '_>>
-    {
+    fn list_sandboxes(&self) -> DaemonBackendFuture<'_, Vec<serde_json::Value>> {
         Box::pin(async move {
             let mgr = self.mgr.lock().await;
             mgr.list()
@@ -1474,17 +1484,7 @@ impl SandboxBackend for SandboxManagerBackend {
         })
     }
 
-    fn subscribe_output(
-        &self,
-        id: &str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Option<(Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>)>,
-                > + Send
-                + '_,
-        >,
-    > {
+    fn subscribe_output(&self, id: &str) -> DaemonBackendFuture<'_, Option<OutputSubscription>> {
         let id = id.to_string();
         Box::pin(async move {
             let sandbox_id: axis_core::types::SandboxId = id.parse().ok()?;
@@ -1493,11 +1493,7 @@ impl SandboxBackend for SandboxManagerBackend {
         })
     }
 
-    fn send_input(
-        &self,
-        id: &str,
-        data: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+    fn send_input(&self, id: &str, data: Vec<u8>) -> DaemonBackendFuture<'_, Result<(), String>> {
         let id = id.to_string();
         Box::pin(async move {
             let sandbox_id: axis_core::types::SandboxId = id
@@ -1721,16 +1717,17 @@ mod tests {
         let policy = test_policy(NetworkMode::Block);
         let exec_id = SandboxId::from_str("00000000-0000-4000-8000-000000000101").unwrap();
 
-        let config = contained_exec_config_from(
-            &policy,
-            &workspace,
-            &[("PATH".into(), "/bin".into())],
+        let env = vec![("PATH".into(), "/bin".into())];
+        let config = contained_exec_config_from(ContainedExecConfigInput {
+            policy: &policy,
+            workspace_dir: &workspace,
+            env: &env,
             exec_id,
-            None,
-            None,
-            "true".into(),
-            Vec::new(),
-        );
+            proxy_addr: None,
+            connect_attribution: None,
+            command: "true".into(),
+            args: Vec::new(),
+        });
 
         assert_eq!(config.id, exec_id);
         assert!(matches!(config.policy.network.mode, NetworkMode::Block));
@@ -1760,16 +1757,17 @@ mod tests {
         let exec_id = SandboxId::from_str("00000000-0000-4000-8000-000000000102").unwrap();
         let proxy_addr = proxy_bind_addr_for_sandbox(exec_id, 3128, &policy);
 
-        let config = contained_exec_config_from(
-            &policy,
-            &workspace,
-            &[("PATH".into(), "/bin".into())],
+        let env = vec![("PATH".into(), "/bin".into())];
+        let config = contained_exec_config_from(ContainedExecConfigInput {
+            policy: &policy,
+            workspace_dir: &workspace,
+            env: &env,
             exec_id,
-            Some(proxy_addr),
-            None,
-            "true".into(),
-            Vec::new(),
-        );
+            proxy_addr: Some(proxy_addr),
+            connect_attribution: None,
+            command: "true".into(),
+            args: Vec::new(),
+        });
 
         assert_eq!(config.id, exec_id);
         assert!(matches!(config.policy.network.mode, NetworkMode::Proxy));
@@ -1800,16 +1798,16 @@ mod tests {
             .push(workspace_policy_path.clone());
         let exec_id = SandboxId::from_str("00000000-0000-4000-8000-000000000103").unwrap();
 
-        let config = contained_exec_config_from(
-            &policy,
-            &workspace,
-            &[],
+        let config = contained_exec_config_from(ContainedExecConfigInput {
+            policy: &policy,
+            workspace_dir: &workspace,
+            env: &[],
             exec_id,
-            None,
-            None,
-            "true".into(),
-            Vec::new(),
-        );
+            proxy_addr: None,
+            connect_attribution: None,
+            command: "true".into(),
+            args: Vec::new(),
+        });
 
         assert_eq!(
             config
@@ -2117,7 +2115,7 @@ mod tests {
         let base_dir = std::env::temp_dir().join(format!("{name}-{}", SandboxId::new()));
         let _ = std::fs::remove_dir_all(&base_dir);
         std::fs::create_dir_all(&base_dir).unwrap();
-        let mut manager = SandboxManager::new();
+        let mut manager = SandboxManager::with_event_broadcast(None);
         manager.sandbox_base_dir = base_dir.clone();
         (
             std::sync::Arc::new(tokio::sync::Mutex::new(manager)),

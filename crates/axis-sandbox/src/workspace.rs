@@ -24,9 +24,9 @@ const AGENT_DIR_MAPPINGS: &[(&str, &str)] = &[
 
 /// Paths that should NEVER be symlinked — too large or contain circular links.
 const NEVER_SYMLINK: &[&str] = &[
-    "Library",          // macOS ~/Library is huge and has circular revlinks
-    ".local",           // Too broad — contains many unrelated things
-    "AppData",          // Windows equivalent of ~/Library
+    "Library", // macOS ~/Library is huge and has circular revlinks
+    ".local",  // Too broad — contains many unrelated things
+    "AppData", // Windows equivalent of ~/Library
     "Documents",
     "Desktop",
     "Downloads",
@@ -57,7 +57,7 @@ pub fn prepare_agent_workspace(
         let expanded = rw_path.replace('~', &home.to_string_lossy());
 
         // Skip non-home paths (workspace, tmpdir, etc.).
-        if !expanded.starts_with(&home.to_string_lossy().as_ref()) {
+        if !expanded.starts_with(home.to_string_lossy().as_ref()) {
             continue;
         }
 
@@ -67,9 +67,13 @@ pub fn prepare_agent_workspace(
         }
 
         // Never symlink large/dangerous directories.
-        let rel_check = expanded.trim_start_matches(&*home.to_string_lossy())
+        let rel_check = expanded
+            .trim_start_matches(&*home.to_string_lossy())
             .trim_start_matches('/');
-        if NEVER_SYMLINK.iter().any(|&blocked| rel_check == blocked || rel_check.starts_with(&format!("{blocked}/"))) {
+        if NEVER_SYMLINK
+            .iter()
+            .any(|&blocked| rel_check == blocked || rel_check.starts_with(&format!("{blocked}/")))
+        {
             continue;
         }
 
@@ -113,7 +117,11 @@ pub fn prepare_agent_workspace(
                     contained_dir.display()
                 );
                 // Only move if contained dir is empty (first run).
-                if contained_dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(true) {
+                if contained_dir
+                    .read_dir()
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true)
+                {
                     // Copy contents recursively.
                     copy_dir_contents(&symlink_path, &contained_dir)?;
                 }
@@ -135,15 +143,23 @@ pub fn prepare_agent_workspace(
         // Create symlink: ~/.claude -> ~/.axis/agents/<policy>/claude
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&contained_dir, &symlink_path)
-                .map_err(|e| format!("symlink {} -> {}: {e}",
-                    symlink_path.display(), contained_dir.display()))?;
+            std::os::unix::fs::symlink(&contained_dir, &symlink_path).map_err(|e| {
+                format!(
+                    "symlink {} -> {}: {e}",
+                    symlink_path.display(),
+                    contained_dir.display()
+                )
+            })?;
         }
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_dir(&contained_dir, &symlink_path)
-                .map_err(|e| format!("symlink {} -> {}: {e}",
-                    symlink_path.display(), contained_dir.display()))?;
+            std::os::windows::fs::symlink_dir(&contained_dir, &symlink_path).map_err(|e| {
+                format!(
+                    "symlink {} -> {}: {e}",
+                    symlink_path.display(),
+                    contained_dir.display()
+                )
+            })?;
         }
 
         tracing::info!(
@@ -176,7 +192,10 @@ pub fn agent_state_root(policy_name: &str) -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".axis").join("agents").join(policy_name)
+    PathBuf::from(home)
+        .join(".axis")
+        .join("agents")
+        .join(policy_name)
 }
 
 /// Prepare a scoped SSH directory for the sandbox.
@@ -201,8 +220,7 @@ pub fn prepare_ssh_workspace(
     let home = PathBuf::from(&home);
 
     let ssh_dir = agent_state_root(policy_name).join("ssh");
-    std::fs::create_dir_all(&ssh_dir)
-        .map_err(|e| format!("create ssh dir: {e}"))?;
+    std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create ssh dir: {e}"))?;
 
     // Set restrictive permissions on the ssh directory.
     #[cfg(unix)]
@@ -217,12 +235,17 @@ pub fn prepare_ssh_workspace(
         let src_path = PathBuf::from(key_spec.private_key.replace('~', &home.to_string_lossy()));
 
         if !src_path.exists() {
-            tracing::warn!("ssh: key '{}' not found at {}", key_spec.name, src_path.display());
+            tracing::warn!(
+                "ssh: key '{}' not found at {}",
+                key_spec.name,
+                src_path.display()
+            );
             continue;
         }
 
         // Copy private key to sandbox ssh dir.
-        let key_filename = src_path.file_name()
+        let key_filename = src_path
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("key_{}", key_spec.name));
 
@@ -244,7 +267,11 @@ pub fn prepare_ssh_workspace(
             let _ = std::fs::copy(&pub_src, &pub_dst);
         }
 
-        tracing::info!("ssh: exposed key '{}' for hosts {:?}", key_spec.name, key_spec.allowed_hosts);
+        tracing::info!(
+            "ssh: exposed key '{}' for hosts {:?}",
+            key_spec.name,
+            key_spec.allowed_hosts
+        );
 
         // Build SSH config entry.
         let hosts = if key_spec.allowed_hosts.is_empty() {
@@ -280,7 +307,8 @@ pub fn prepare_ssh_workspace(
 
     // Generate known_hosts via ssh-keyscan for allowed hosts.
     if ssh_policy.generate_known_hosts {
-        let mut all_hosts: Vec<String> = ssh_policy.allowed_keys
+        let mut all_hosts: Vec<String> = ssh_policy
+            .allowed_keys
             .iter()
             .flat_map(|k| k.allowed_hosts.iter().cloned())
             .filter(|h| !h.contains('*')) // skip wildcards
@@ -293,25 +321,28 @@ pub fn prepare_ssh_workspace(
                 .args(&all_hosts)
                 .output();
 
-            if let Ok(output) = output {
-                if output.status.success() {
-                    std::fs::write(ssh_dir.join("known_hosts"), &output.stdout)
-                        .map_err(|e| format!("write known_hosts: {e}"))?;
-                    tracing::info!("ssh: generated known_hosts for {} hosts", all_hosts.len());
-                }
+            if let Ok(output) = output
+                && output.status.success()
+            {
+                std::fs::write(ssh_dir.join("known_hosts"), &output.stdout)
+                    .map_err(|e| format!("write known_hosts: {e}"))?;
+                tracing::info!("ssh: generated known_hosts for {} hosts", all_hosts.len());
             }
         }
     }
 
     // Create marker file.
-    std::fs::write(ssh_dir.join(".axis-managed"), "This SSH directory is managed by AXIS.\n").ok();
+    std::fs::write(
+        ssh_dir.join(".axis-managed"),
+        "This SSH directory is managed by AXIS.\n",
+    )
+    .ok();
 
     Ok(Some(ssh_dir))
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
-    let entries = std::fs::read_dir(src)
-        .map_err(|e| format!("read {}: {e}", src.display()))?;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries.flatten() {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
@@ -333,13 +364,17 @@ mod tests {
     fn agent_state_root_is_under_home() {
         let root = agent_state_root("test-policy");
         let root_str = root.to_string_lossy().replace('\\', "/");
-        assert!(root_str.contains(".axis/agents/test-policy"),
-            "expected .axis/agents/test-policy in {root_str}");
+        assert!(
+            root_str.contains(".axis/agents/test-policy"),
+            "expected .axis/agents/test-policy in {root_str}"
+        );
     }
 
     #[test]
     fn mapping_covers_known_agents() {
-        let agents = ["claude", "codex", "openclaw", "ironclaw", "hermes", "config"];
+        let agents = [
+            "claude", "codex", "openclaw", "ironclaw", "hermes", "config",
+        ];
         for agent in agents {
             assert!(
                 AGENT_DIR_MAPPINGS.iter().any(|(_, name)| *name == agent),

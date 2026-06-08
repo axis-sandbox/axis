@@ -599,7 +599,7 @@ fn syscall_number(name: &str) -> Option<u32> {
         .iter()
         .find(|(_, n)| *n == name)
         .map(|(nr, _)| *nr)
-        .or_else(|| {
+        .or({
             // Also map commonly-blocked names that aren't in the whitelist.
             match name {
                 "ptrace" => Some(101),
@@ -1289,7 +1289,7 @@ mod tests {
             libc::syscall(
                 SYS_EXECVEAT as libc::c_long,
                 -1,
-                b"\0".as_ptr() as *const libc::c_char,
+                c"".as_ptr(),
                 std::ptr::null::<*const libc::c_char>(),
                 std::ptr::null::<*const libc::c_char>(),
                 AT_EMPTY_PATH,

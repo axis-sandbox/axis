@@ -187,15 +187,14 @@ impl CredentialRule {
     ) -> Result<Option<Self>, SecretError> {
         let raw_endpoint = route.endpoint.as_deref();
         let endpoint = raw_endpoint.and_then(parse_endpoint);
-        if let Some(raw_endpoint) = raw_endpoint {
-            if endpoint.is_none()
-                && (route.api_key_env.is_some() || raw_endpoint.contains("axis:resolve:"))
-            {
-                return Err(SecretError::InvalidRoute {
-                    route: route.name.clone(),
-                    reason: "credential routes require an http:// or https:// endpoint".into(),
-                });
-            }
+        if let Some(raw_endpoint) = raw_endpoint
+            && endpoint.is_none()
+            && (route.api_key_env.is_some() || raw_endpoint.contains("axis:resolve:"))
+        {
+            return Err(SecretError::InvalidRoute {
+                route: route.name.clone(),
+                reason: "credential routes require an http:// or https:// endpoint".into(),
+            });
         }
         let query = endpoint
             .as_ref()
@@ -256,15 +255,15 @@ impl CredentialRule {
         if self.host != host {
             return false;
         }
-        if let Some(rule_port) = self.port {
-            if rule_port != port {
-                return false;
-            }
+        if let Some(rule_port) = self.port
+            && rule_port != port
+        {
+            return false;
         }
-        if let Some(scheme) = self.scheme {
-            if scheme.is_tls() != is_tls {
-                return false;
-            }
+        if let Some(scheme) = self.scheme
+            && scheme.is_tls() != is_tls
+        {
+            return false;
         }
         true
     }
@@ -309,10 +308,10 @@ impl CredentialRule {
         );
 
         for (name, value) in &request.headers {
-            if let Some((inject_name, _)) = &header {
-                if name.eq_ignore_ascii_case(inject_name) {
-                    continue;
-                }
+            if let Some((inject_name, _)) = &header
+                && name.eq_ignore_ascii_case(inject_name)
+            {
+                continue;
             }
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
@@ -366,7 +365,9 @@ impl ParsedHttpHead {
                 break;
             }
             let (name, value) = line.split_once(':').ok_or_else(|| {
-                SecretError::InvalidHttpRequest(format!("malformed header in route-scoped request"))
+                SecretError::InvalidHttpRequest(
+                    "malformed header in route-scoped request".to_string(),
+                )
             })?;
             headers.push((name.trim().to_string(), value.trim().to_string()));
         }
@@ -478,7 +479,7 @@ fn parse_endpoint(endpoint: &str) -> Option<EndpointParts> {
         ))
     })?;
     let authority_end = after_scheme
-        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
     let authority = after_scheme[..authority_end].rsplit('@').next()?.trim();
     if authority.is_empty() {
@@ -508,7 +509,7 @@ fn parse_endpoint(endpoint: &str) -> Option<EndpointParts> {
     }
     let path_and_more = &after_scheme[authority_end..];
     let path = path_and_more
-        .find(|ch| matches!(ch, '?' | '#'))
+        .find(['?', '#'])
         .map(|idx| &path_and_more[..idx])
         .unwrap_or(path_and_more);
 

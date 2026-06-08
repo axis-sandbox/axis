@@ -93,13 +93,17 @@ impl ModelRegistry {
     pub async fn pull(&mut self, source: &str) -> Result<PathBuf, String> {
         let (repo_id, filename) = parse_hf_source(source)?;
 
-        let model_dir = self.cache_dir.join(&repo_id.replace('/', "--"));
+        let model_dir = self.cache_dir.join(repo_id.replace('/', "--"));
         std::fs::create_dir_all(&model_dir).map_err(|e| e.to_string())?;
 
         let local_path = model_dir.join(&filename);
 
         if local_path.exists() {
-            tracing::info!("model: {} already cached at {}", source, local_path.display());
+            tracing::info!(
+                "model: {} already cached at {}",
+                source,
+                local_path.display()
+            );
             return Ok(local_path);
         }
 
@@ -190,7 +194,10 @@ async fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> 
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
-    let resp = client.get(url).send().await
+    let resp = client
+        .get(url)
+        .send()
+        .await
         .map_err(|e| format!("download failed: {e}"))?;
 
     if !resp.status().is_success() {
@@ -199,18 +206,21 @@ async fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> 
 
     let total_size = resp.content_length().unwrap_or(0);
 
-    let mut file = tokio::fs::File::create(dest).await
+    let mut file = tokio::fs::File::create(dest)
+        .await
         .map_err(|e| format!("create file: {e}"))?;
 
     let mut downloaded: u64 = 0;
     let mut stream = resp.bytes_stream();
 
-    use tokio::io::AsyncWriteExt;
     use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("download: {e}"))?;
-        file.write_all(&chunk).await.map_err(|e| format!("write: {e}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
         downloaded += chunk.len() as u64;
 
         if total_size > 0 && downloaded % (10 * 1024 * 1024) < chunk.len() as u64 {
@@ -230,9 +240,15 @@ async fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> 
 
 fn default_cache_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache").join("axis").join("models")
+        PathBuf::from(home)
+            .join(".cache")
+            .join("axis")
+            .join("models")
     } else if let Ok(home) = std::env::var("USERPROFILE") {
-        PathBuf::from(home).join(".cache").join("axis").join("models")
+        PathBuf::from(home)
+            .join(".cache")
+            .join("axis")
+            .join("models")
     } else {
         PathBuf::from("/tmp/axis/models")
     }
@@ -244,14 +260,16 @@ mod tests {
 
     #[test]
     fn parse_hf_source_full() {
-        let (repo, file) = parse_hf_source("huggingface://Qwen/Qwen3-0.6B-GGUF/qwen3-0.6b-q4_k_m.gguf").unwrap();
+        let (repo, file) =
+            parse_hf_source("huggingface://Qwen/Qwen3-0.6B-GGUF/qwen3-0.6b-q4_k_m.gguf").unwrap();
         assert_eq!(repo, "Qwen/Qwen3-0.6B-GGUF");
         assert_eq!(file, "qwen3-0.6b-q4_k_m.gguf");
     }
 
     #[test]
     fn parse_hf_source_bare() {
-        let (repo, file) = parse_hf_source("microsoft/phi-4-mini-instruct-gguf/phi-4-mini.Q4_K_M.gguf").unwrap();
+        let (repo, file) =
+            parse_hf_source("microsoft/phi-4-mini-instruct-gguf/phi-4-mini.Q4_K_M.gguf").unwrap();
         assert_eq!(repo, "microsoft/phi-4-mini-instruct-gguf");
         assert_eq!(file, "phi-4-mini.Q4_K_M.gguf");
     }

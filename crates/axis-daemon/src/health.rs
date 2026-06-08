@@ -6,7 +6,10 @@
 //! Runs a minimal HTTP server on a configurable port (default 18517).
 //! Returns JSON with daemon status for monitoring/alerting.
 
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -43,20 +46,28 @@ pub async fn serve_health(state: Arc<HealthState>) {
     tracing::info!("health endpoint on http://127.0.0.1:{port}/health");
 
     loop {
-        let Ok((stream, _)) = listener.accept().await else { break };
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
         let state = state.clone();
 
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
             let mut request_line = String::new();
-            if reader.read_line(&mut request_line).await.is_err() { return; }
+            if reader.read_line(&mut request_line).await.is_err() {
+                return;
+            }
 
             // Consume headers.
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).await.is_err() { return; }
-                if line.trim().is_empty() { break; }
+                if reader.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
             }
 
             let body = serde_json::json!({

@@ -3,7 +3,7 @@
 //
 // Run with: cargo test -p axis-gateway --test api_integration
 
-use axis_gateway::{start_gateway, GatewayConfig, GatewayState};
+use axis_gateway::{GatewayConfig, GatewayState, start_gateway};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -47,7 +47,8 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
 async fn post(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
     let url = format!("http://{addr}{path}");
     let client = reqwest::Client::new();
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .header("content-type", "application/json")
         .body("{}")
         .send()
@@ -87,7 +88,7 @@ async fn health_returns_ok_with_version() {
     let (status, body) = get(addr, "/api/v1/health").await;
     assert_eq!(status, 200);
     assert_eq!(body["status"], "ok");
-    assert!(body["version"].as_str().unwrap().len() > 0);
+    assert!(!body["version"].as_str().unwrap().is_empty());
 }
 
 // ── CORS ────────────────────────────────────────────────────────────────
@@ -165,7 +166,7 @@ async fn run_installed_agent_returns_sandbox_id() {
     // On CI without agents, it returns 404 which is also valid.
     let (status, body) = post(addr, "/api/v1/agents/claude-code/run").await;
     if status == 200 {
-        assert!(body["sandbox_id"].as_str().unwrap().len() > 0);
+        assert!(!body["sandbox_id"].as_str().unwrap().is_empty());
         assert_eq!(body["agent"], "claude-code");
     } else {
         assert_eq!(status, 404);

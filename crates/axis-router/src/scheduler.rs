@@ -93,10 +93,10 @@ impl RequestScheduler {
             if sq.queue.is_empty() {
                 continue;
             }
-            if let Some(max) = sq.max_concurrent {
-                if sq.active_count >= max {
-                    continue;
-                }
+            if let Some(max) = sq.max_concurrent
+                && sq.active_count >= max
+            {
+                continue;
             }
             // Add weight to deficit for this round.
             let effective_deficit = sq.deficit + sq.weight;
@@ -129,8 +129,13 @@ impl RequestScheduler {
 
     /// Number of pending requests across all queues.
     pub fn pending_count(&self) -> usize {
-        self.interactive_queue.len()
-            + self.queues.values().map(|sq| sq.queue.len()).sum::<usize>()
+        self.interactive_queue.len() + self.queues.values().map(|sq| sq.queue.len()).sum::<usize>()
+    }
+}
+
+impl Default for RequestScheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -22,7 +22,9 @@ impl UnixPtyMaster {
         };
         let ret = unsafe { libc::ioctl(self.fd, libc::TIOCSWINSZ, &ws) };
         if ret < 0 {
-            Err(PtyError::Resize(std::io::Error::last_os_error().to_string()))
+            Err(PtyError::Resize(
+                std::io::Error::last_os_error().to_string(),
+            ))
         } else {
             Ok(())
         }
@@ -43,7 +45,7 @@ impl Drop for UnixPtyMaster {
 
 /// Create a PTY pair on Unix using openpty(2).
 pub fn create_pty_unix(size: WinSize) -> Result<PtySession, PtyError> {
-    let mut ws = libc::winsize {
+    let ws = libc::winsize {
         ws_col: size.cols,
         ws_row: size.rows,
         ws_xpixel: 0,
@@ -59,7 +61,7 @@ pub fn create_pty_unix(size: WinSize) -> Result<PtySession, PtyError> {
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut ws,
+            &ws,
         )
     };
 

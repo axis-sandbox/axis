@@ -43,7 +43,10 @@ pub enum ServerMode {
     /// Connect to user-specified endpoint.
     External { endpoint: String },
     /// Load model directly via llama-cpp-rs (in-process).
-    Embedded { n_gpu_layers: i32, context_size: u32 },
+    Embedded {
+        n_gpu_layers: i32,
+        context_size: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -86,19 +89,29 @@ impl InferenceServer {
 
         let mode = self.mode.clone();
         match mode {
-            ServerMode::Managed { backend, binary, extra_args } => {
-                self.start_managed(backend, &binary, &extra_args, model_path).await
+            ServerMode::Managed {
+                backend,
+                binary,
+                extra_args,
+            } => {
+                self.start_managed(backend, &binary, &extra_args, model_path)
+                    .await
             }
             ServerMode::External { endpoint } => {
-                let addr: SocketAddr = endpoint.parse()
+                let addr: SocketAddr = endpoint
+                    .parse()
                     .map_err(|e| ServerError::StartFailed(format!("bad endpoint: {e}")))?;
                 self.endpoint = Some(addr);
                 self.health_check().await?;
                 self.healthy = true;
                 Ok(addr)
             }
-            ServerMode::Embedded { n_gpu_layers, context_size } => {
-                self.start_embedded(model_path, n_gpu_layers, context_size).await
+            ServerMode::Embedded {
+                n_gpu_layers,
+                context_size,
+            } => {
+                self.start_embedded(model_path, n_gpu_layers, context_size)
+                    .await
             }
         }
     }
@@ -123,17 +136,23 @@ impl InferenceServer {
         match backend {
             ManagedBackend::LlamaServer => {
                 cmd.args([
-                    "-m", &model_path.to_string_lossy(),
-                    "--port", &port.to_string(),
-                    "--host", "127.0.0.1",
+                    "-m",
+                    &model_path.to_string_lossy(),
+                    "--port",
+                    &port.to_string(),
+                    "--host",
+                    "127.0.0.1",
                     "-cb", // continuous batching
                 ]);
             }
             ManagedBackend::Vllm => {
                 cmd.args([
-                    "--model", &model_path.to_string_lossy(),
-                    "--port", &port.to_string(),
-                    "--host", "127.0.0.1",
+                    "--model",
+                    &model_path.to_string_lossy(),
+                    "--port",
+                    &port.to_string(),
+                    "--host",
+                    "127.0.0.1",
                 ]);
             }
         }
@@ -143,7 +162,8 @@ impl InferenceServer {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn()
+        let child = cmd
+            .spawn()
             .map_err(|e| ServerError::StartFailed(format!("{}: {e}", binary.display())))?;
 
         let pid = child.id();
@@ -164,7 +184,9 @@ impl InferenceServer {
             }
         }
 
-        Err(ServerError::StartFailed("health check timeout after 60s".into()))
+        Err(ServerError::StartFailed(
+            "health check timeout after 60s".into(),
+        ))
     }
 
     /// Start embedded inference via llama-cpp-rs.
@@ -224,7 +246,10 @@ impl InferenceServer {
             .build()
             .map_err(|e| ServerError::HealthCheckFailed(e.to_string()))?;
 
-        client.get(&url).send().await
+        client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| ServerError::HealthCheckFailed(e.to_string()))?;
         Ok(())
     }
@@ -274,15 +299,14 @@ impl EmbeddedLlm {
         context_size: u32,
     ) -> Result<Self, ServerError> {
         use llama_cpp_2::llama_backend::LlamaBackend;
-        use llama_cpp_2::model::params::LlamaModelParams;
         use llama_cpp_2::model::LlamaModel;
+        use llama_cpp_2::model::params::LlamaModelParams;
         use std::pin::pin;
 
         let backend = LlamaBackend::init()
             .map_err(|e| ServerError::StartFailed(format!("llama backend init: {e}")))?;
 
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(n_gpu_layers as u32);
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers as u32);
         let model_params = pin!(model_params);
 
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
@@ -308,28 +332,31 @@ impl EmbeddedLlm {
         use llama_cpp_2::sampling::LlamaSampler;
         use std::num::NonZeroU32;
 
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(self.context_size));
-        let mut ctx = self.model.new_context(&self.backend, ctx_params)
+        let ctx_params =
+            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.context_size));
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params)
             .map_err(|e| ServerError::StartFailed(format!("context: {e}")))?;
 
-        let tokens = self.model.str_to_token(prompt, AddBos::Always)
+        let tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
             .map_err(|e| ServerError::StartFailed(format!("tokenize: {e}")))?;
 
         let mut batch = LlamaBatch::new(self.context_size as usize, 1);
         let last_idx = tokens.len() - 1;
         for (i, tok) in tokens.iter().enumerate() {
-            batch.add(*tok, i as i32, &[0], i == last_idx)
+            batch
+                .add(*tok, i as i32, &[0], i == last_idx)
                 .map_err(|e| ServerError::StartFailed(format!("batch: {e}")))?;
         }
 
         ctx.decode(&mut batch)
             .map_err(|e| ServerError::StartFailed(format!("decode prompt: {e}")))?;
 
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::dist(42),
-            LlamaSampler::greedy(),
-        ]);
+        let mut sampler =
+            LlamaSampler::chain_simple([LlamaSampler::dist(42), LlamaSampler::greedy()]);
 
         let mut output = String::new();
         let mut n_cur = tokens.len() as i32;
@@ -348,7 +375,8 @@ impl EmbeddedLlm {
             }
 
             batch.clear();
-            batch.add(token, n_cur, &[0], true)
+            batch
+                .add(token, n_cur, &[0], true)
                 .map_err(|e| ServerError::StartFailed(format!("batch add: {e}")))?;
             ctx.decode(&mut batch)
                 .map_err(|e| ServerError::StartFailed(format!("decode: {e}")))?;
@@ -371,7 +399,9 @@ async fn embedded_http_server(
     let llm = std::sync::Arc::new(std::sync::Mutex::new(llm));
 
     loop {
-        let Ok((stream, _)) = listener.accept().await else { break };
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
         let llm = llm.clone();
         let model_name = model_name.clone();
 
@@ -381,14 +411,20 @@ async fn embedded_http_server(
 
             // Read HTTP request.
             let mut request_line = String::new();
-            if reader.read_line(&mut request_line).await.is_err() { return; }
+            if reader.read_line(&mut request_line).await.is_err() {
+                return;
+            }
 
             // Read headers.
             let mut content_length = 0usize;
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).await.is_err() { return; }
-                if line.trim().is_empty() { break; }
+                if reader.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
                 if let Some(cl) = line.strip_prefix("Content-Length: ") {
                     content_length = cl.trim().parse().unwrap_or(0);
                 }
@@ -411,19 +447,17 @@ async fn embedded_http_server(
             };
 
             let response_body = match (method, path) {
-                ("GET", "/v1/models") => {
-                    serde_json::json!({
-                        "object": "list",
-                        "data": [{
-                            "id": model_name,
-                            "object": "model",
-                            "owned_by": "axis-local",
-                        }]
-                    }).to_string()
-                }
+                ("GET", "/v1/models") => serde_json::json!({
+                    "object": "list",
+                    "data": [{
+                        "id": model_name,
+                        "object": "model",
+                        "owned_by": "axis-local",
+                    }]
+                })
+                .to_string(),
                 ("POST", "/v1/chat/completions") => {
-                    let req: serde_json::Value = serde_json::from_slice(&body)
-                        .unwrap_or_default();
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
 
                     // Build prompt from messages.
                     let messages = req["messages"].as_array();
@@ -446,39 +480,35 @@ async fn embedded_http_server(
                     };
 
                     match result {
-                        Ok(text) => {
-                            serde_json::json!({
-                                "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                                "object": "chat.completion",
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": text,
-                                    },
-                                    "finish_reason": "stop",
-                                }],
-                                "usage": {
-                                    "prompt_tokens": prompt.len() / 4,
-                                    "completion_tokens": text.len() / 4,
-                                    "total_tokens": (prompt.len() + text.len()) / 4,
-                                }
-                            }).to_string()
-                        }
-                        Err(e) => {
-                            serde_json::json!({
-                                "error": {
-                                    "message": format!("{e}"),
-                                    "type": "server_error",
-                                }
-                            }).to_string()
-                        }
+                        Ok(text) => serde_json::json!({
+                            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                            "object": "chat.completion",
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": text,
+                                },
+                                "finish_reason": "stop",
+                            }],
+                            "usage": {
+                                "prompt_tokens": prompt.len() / 4,
+                                "completion_tokens": text.len() / 4,
+                                "total_tokens": (prompt.len() + text.len()) / 4,
+                            }
+                        })
+                        .to_string(),
+                        Err(e) => serde_json::json!({
+                            "error": {
+                                "message": format!("{e}"),
+                                "type": "server_error",
+                            }
+                        })
+                        .to_string(),
                     }
                 }
-                ("GET", "/health") => {
-                    r#"{"status":"ok"}"#.to_string()
-                }
+                ("GET", "/health") => r#"{"status":"ok"}"#.to_string(),
                 _ => {
                     let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                     let _ = writer.write_all(resp.as_bytes()).await;

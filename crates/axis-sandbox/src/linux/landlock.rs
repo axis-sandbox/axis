@@ -252,10 +252,10 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
     match build_ruleset(policy, workspace, &expanded, handled) {
         Ok(ruleset) => Ok(ruleset),
         Err(e) => {
-            if expanded.tmpdir_required {
-                if let Err(cleanup) = cleanup_tmpdir(workspace) {
-                    return Err(format!("{e}; tmpdir cleanup failed: {cleanup}"));
-                }
+            if expanded.tmpdir_required
+                && let Err(cleanup) = cleanup_tmpdir(workspace)
+            {
+                return Err(format!("{e}; tmpdir cleanup failed: {cleanup}"));
             }
             Err(e)
         }

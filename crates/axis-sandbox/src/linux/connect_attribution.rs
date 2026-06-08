@@ -146,7 +146,7 @@ impl ConnectAttributionSupervisor {
         let join = std::thread::Builder::new()
             .name(format!("axis-connect-attribution-{}", config.sandbox_id))
             .spawn(move || supervisor_loop(listener_fd, thread_stop_fd, config))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         Ok(Self {
             stop_fd: Some(stop_fd),
             join: Some(join),

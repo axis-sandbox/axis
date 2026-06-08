@@ -7,11 +7,13 @@
 //! real-time event streaming and PTY terminal access. This is the primary
 //! interface for GUI applications.
 
-pub mod router;
 pub mod events;
 pub mod handlers;
+pub mod router;
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -38,36 +40,27 @@ impl Default for GatewayConfig {
 ///
 /// All methods take `&self` and use interior mutability (Arc<Mutex<>>) since
 /// the gateway serves concurrent requests.
+type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type OutputSubscription = (Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>);
+
 pub trait SandboxBackend: Send + Sync {
     fn create_sandbox(
         &self,
         policy_yaml: &str,
         command: String,
         args: Vec<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>;
+    ) -> BackendFuture<'_, Result<String, String>>;
 
-    fn destroy_sandbox(
-        &self,
-        id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
+    fn destroy_sandbox(&self, id: &str) -> BackendFuture<'_, Result<(), String>>;
 
-    fn list_sandboxes(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + '_>>;
+    fn list_sandboxes(&self) -> BackendFuture<'_, Vec<serde_json::Value>>;
 
     /// Subscribe to a sandbox's stdout/stderr output stream.
     /// Returns (buffered_past_output, live_receiver).
-    fn subscribe_output(
-        &self,
-        id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(Vec<Vec<u8>>, tokio::sync::broadcast::Receiver<Vec<u8>>)>> + Send + '_>>;
+    fn subscribe_output(&self, id: &str) -> BackendFuture<'_, Option<OutputSubscription>>;
 
     /// Send input data to a sandbox's stdin.
-    fn send_input(
-        &self,
-        id: &str,
-        data: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
+    fn send_input(&self, id: &str, data: Vec<u8>) -> BackendFuture<'_, Result<(), String>>;
 }
 
 /// Shared gateway state passed to all handlers.
@@ -117,7 +110,9 @@ pub async fn start_gateway(
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!("gateway listening on {}", config.bind_addr);
 
-    let shutdown_fut = async { let _ = shutdown.await; };
+    let shutdown_fut = async {
+        let _ = shutdown.await;
+    };
     tokio::pin!(shutdown_fut);
 
     loop {
@@ -135,10 +130,9 @@ pub async fn start_gateway(
                         .serve_connection(io, service)
                         .with_upgrades()
                         .await
+                        && !e.is_incomplete_message()
                     {
-                        if !e.is_incomplete_message() {
-                            tracing::debug!("gateway connection error from {addr}: {e}");
-                        }
+                        tracing::debug!("gateway connection error from {addr}: {e}");
                     }
                 });
             }

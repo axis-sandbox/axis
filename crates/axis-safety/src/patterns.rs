@@ -70,7 +70,8 @@ pub fn default_patterns() -> Vec<CredentialPattern> {
         },
         CredentialPattern {
             name: "generic_api_key_header",
-            regex: Regex::new(r"(?i)(?:x-api-key|api[_-]?key)\s*[=:]\s*[A-Za-z0-9_-]{16,}").unwrap(),
+            regex: Regex::new(r"(?i)(?:x-api-key|api[_-]?key)\s*[=:]\s*[A-Za-z0-9_-]{16,}")
+                .unwrap(),
             description: "Generic API key in header/config",
         },
     ]
