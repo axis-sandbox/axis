@@ -187,12 +187,22 @@ impl SandboxManager {
             workspace_dir,
             env: all_env,
             proxy_port: proxy_addr.port(),
+            proxy_addr: Some(proxy_addr),
             capture_output: true,
             timeout_sec,
         };
 
-        let mut sandbox = Sandbox::create(config).map_err(|e| e.to_string())?;
-        sandbox.start().map_err(|e| format!("sandbox start: {e}"))?;
+        let mut sandbox = match Sandbox::create(config) {
+            Ok(sandbox) => sandbox,
+            Err(e) => {
+                let _ = shutdown_tx.send(());
+                return Err(e.to_string());
+            }
+        };
+        if let Err(e) = sandbox.start() {
+            let _ = shutdown_tx.send(());
+            return Err(format!("sandbox start: {e}"));
+        }
 
         let gpu_label = if gpu_enabled { ", gpu=on" } else { "" };
         tracing::info!(

@@ -15,7 +15,6 @@ fn measure_sandbox_startup() -> Duration {
     use axis_core::policy::Policy;
     use axis_core::types::SandboxId;
     use axis_sandbox::SandboxConfig;
-    use std::path::PathBuf;
 
     let policy_yaml = if cfg!(target_os = "windows") {
         r#"
@@ -42,6 +41,8 @@ filesystem:
 process:
   max_processes: 4
   cpu_rate_percent: 50
+network:
+  mode: allow
 "#
     };
     let policy = Policy::from_yaml(policy_yaml).unwrap();
@@ -67,7 +68,8 @@ process:
         working_dir: None,
         workspace_dir: workspace.path().to_path_buf(),
         env: vec![],
-        proxy_port: 13128,
+        proxy_port: 0,
+        proxy_addr: None,
         capture_output: false,
         timeout_sec: None,
     };

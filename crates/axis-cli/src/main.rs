@@ -690,7 +690,7 @@ async fn main() -> Result<()> {
                     let workspace = tempfile::tempdir()?;
 
                     // Start an inline proxy if policy uses proxy mode.
-                    let proxy_port = match policy.network.mode {
+                    let proxy_addr = match policy.network.mode {
                         axis_core::policy::NetworkMode::Proxy => {
                             let proxy_config = axis_proxy::proxy::ProxyConfig {
                                 sandbox_id,
@@ -706,10 +706,11 @@ async fn main() -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!("proxy bind: {e}"))?;
                             if !quiet { eprintln!("AXIS: proxy on {addr}"); }
                             tokio::spawn(async move { let _ = proxy.run().await; });
-                            addr.port()
+                            Some(addr)
                         }
-                        _ => 0,
+                        _ => None,
                     };
+                    let proxy_port = proxy_addr.map(|addr| addr.port()).unwrap_or(0);
 
                     // Pass through env vars from parent.
                     // All ANTHROPIC_* vars (API key, base URL, etc.) and essential system vars.
@@ -771,6 +772,7 @@ async fn main() -> Result<()> {
                         workspace_dir: workspace.path().to_path_buf(),
                         env,
                         proxy_port,
+                        proxy_addr,
                         capture_output: false,
                         timeout_sec: None,
                     };

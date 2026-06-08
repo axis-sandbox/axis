@@ -6,6 +6,7 @@
 pub mod landlock;
 pub mod netns;
 pub mod seccomp;
+pub mod strategy;
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
 use std::process::Child;
@@ -13,6 +14,7 @@ use std::process::Child;
 /// Linux sandbox using native isolation primitives.
 pub(crate) struct LinuxSandbox {
     config: SandboxConfig,
+    plan: strategy::LinuxIsolationPlan,
     child: Option<Child>,
     netns_name: Option<String>,
 }
@@ -20,12 +22,23 @@ pub(crate) struct LinuxSandbox {
 impl LinuxSandbox {
     pub fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
         std::fs::create_dir_all(&config.workspace_dir)?;
+        let plan = strategy::build_isolation_plan(config)
+            .map_err(|e| SandboxError::IsolationFailed(e.to_string()))?;
 
         Ok(Self {
             config: config.clone(),
+            plan,
             child: None,
             netns_name: None,
         })
+    }
+
+    fn cleanup_netns(&mut self) {
+        if let Some(ns_name) = self.netns_name.take() {
+            if let Err(e) = netns::destroy_netns(&ns_name) {
+                tracing::warn!("failed to destroy netns '{ns_name}': {e}");
+            }
+        }
     }
 }
 
@@ -35,29 +48,37 @@ impl SandboxImpl for LinuxSandbox {
         use std::process::Command;
 
         let sandbox_id = self.config.id;
-        let proxy_port = self.config.proxy_port;
+        tracing::debug!("sandbox {sandbox_id}: linux isolation plan: {:?}", self.plan);
 
         // ── Step 1: Create network namespace (parent side) ──
         // This creates the netns, veth pair, and iptables rules.
         // The child will enter this namespace via setns() in pre_exec.
-        let netns_fd: Option<i32> = match self.config.policy.network.mode {
-            axis_core::policy::NetworkMode::Proxy => {
+        let netns_fd: Option<i32> = match &self.plan.network {
+            strategy::NetworkStrategy::Proxy {
+                setup: strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
+                proxy_port,
+                ..
+            } => {
                 let ns_name = format!("{sandbox_id}");
-                match netns::create_netns(&ns_name, proxy_port) {
+                match netns::create_netns(&ns_name, *proxy_port) {
                     Ok(name) => {
                         self.netns_name = Some(name.clone());
                         // Open the netns fd for the child to setns() into.
                         match netns::enter_netns(&name) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                tracing::warn!("netns: cannot open fd for '{name}': {e}");
-                                None
+                                let _ = netns::destroy_netns(&name);
+                                self.netns_name = None;
+                                return Err(SandboxError::IsolationFailed(format!(
+                                    "netns: cannot open fd for '{name}': {e}"
+                                )));
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("netns: creation failed: {e} (sandbox will run without network isolation)");
-                        None
+                        return Err(SandboxError::IsolationFailed(format!(
+                            "netns: creation failed: {e}"
+                        )));
                     }
                 }
             }
@@ -79,10 +100,20 @@ impl SandboxImpl for LinuxSandbox {
 
         // Capture output to workspace files (daemon mode) or inherit stdio (standalone).
         if self.config.capture_output {
-            let stdout_file = std::fs::File::create(self.config.workspace_dir.join("stdout.log"))
-                .map_err(|e| SandboxError::SpawnFailed(format!("stdout log: {e}")))?;
-            let stderr_file = std::fs::File::create(self.config.workspace_dir.join("stderr.log"))
-                .map_err(|e| SandboxError::SpawnFailed(format!("stderr log: {e}")))?;
+            let stdout_file = match std::fs::File::create(self.config.workspace_dir.join("stdout.log")) {
+                Ok(file) => file,
+                Err(e) => {
+                    self.cleanup_netns();
+                    return Err(SandboxError::SpawnFailed(format!("stdout log: {e}")));
+                }
+            };
+            let stderr_file = match std::fs::File::create(self.config.workspace_dir.join("stderr.log")) {
+                Ok(file) => file,
+                Err(e) => {
+                    self.cleanup_netns();
+                    return Err(SandboxError::SpawnFailed(format!("stderr log: {e}")));
+                }
+            };
             cmd.stdout(std::process::Stdio::from(stdout_file));
             cmd.stderr(std::process::Stdio::from(stderr_file));
         }
@@ -94,10 +125,12 @@ impl SandboxImpl for LinuxSandbox {
             cmd.env(k, v);
         }
 
-        // Inject proxy env vars (only when proxy is active).
-        if proxy_port > 0 {
-            let proxy_host = if netns_fd.is_some() { "10.200.0.1" } else { "127.0.0.1" };
-            let proxy_url = format!("http://{proxy_host}:{proxy_port}");
+        // Inject proxy env vars only when the plan requires a proxy.
+        if let strategy::ProxyStrategy::Required {
+            sandbox_addr, port, ..
+        } = &self.plan.proxy
+        {
+            let proxy_url = format!("http://{sandbox_addr}:{port}");
             cmd.env("HTTP_PROXY", &proxy_url);
             cmd.env("HTTPS_PROXY", &proxy_url);
             cmd.env("http_proxy", &proxy_url);
@@ -119,8 +152,10 @@ impl SandboxImpl for LinuxSandbox {
                     libc::close(fd);
                     if ret < 0 {
                         let err = std::io::Error::last_os_error();
-                        tracing::warn!("setns(CLONE_NEWNET) failed: {err}");
-                        // Continue without netns — best-effort.
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("setns(CLONE_NEWNET) failed: {err}"),
+                        ));
                     } else {
                         tracing::info!("entered network namespace");
                     }
@@ -131,22 +166,24 @@ impl SandboxImpl for LinuxSandbox {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
                 // 4. Apply Landlock filesystem policy.
-                if let Err(e) = landlock::apply_landlock(&policy.filesystem, &workspace) {
-                    tracing::warn!("landlock not applied: {e}");
-                }
+                landlock::apply_landlock(&policy.filesystem, &workspace)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
                 // 5. seccomp-BPF syscall filter (must be last — it restricts further syscalls).
-                if let Err(e) = seccomp::apply_seccomp(&policy.process) {
-                    tracing::warn!("seccomp not applied: {e}");
-                }
+                seccomp::apply_seccomp(&policy.process)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
                 Ok(())
             });
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.cleanup_netns();
+                return Err(SandboxError::SpawnFailed(e.to_string()));
+            }
+        };
 
         let pid = child.id();
         self.child = Some(child);
@@ -179,11 +216,7 @@ impl SandboxImpl for LinuxSandbox {
             unsafe { libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG); }
         }
 
-        if let Some(ref ns_name) = self.netns_name {
-            if let Err(e) = netns::destroy_netns(ns_name) {
-                tracing::warn!("failed to destroy netns '{ns_name}': {e}");
-            }
-        }
+        self.cleanup_netns();
 
         tracing::info!("sandbox {} destroyed", self.config.id);
         Ok(())

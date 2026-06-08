@@ -40,6 +40,7 @@ pub struct SandboxConfig {
     pub workspace_dir: PathBuf,
     pub env: Vec<(String, String)>,
     pub proxy_port: u16,
+    pub proxy_addr: Option<std::net::SocketAddr>,
     /// Capture stdout/stderr to files in workspace (for daemon mode).
     /// When false, child inherits parent's stdio (for standalone/run mode).
     pub capture_output: bool,

@@ -85,7 +85,7 @@ unsafe fn landlock_create_ruleset(
     size: usize,
     flags: u32,
 ) -> libc::c_long {
-    libc::syscall(SYS_LANDLOCK_CREATE_RULESET, attr, size, flags)
+    unsafe { libc::syscall(SYS_LANDLOCK_CREATE_RULESET, attr, size, flags) }
 }
 
 unsafe fn landlock_add_rule(
@@ -94,15 +94,15 @@ unsafe fn landlock_add_rule(
     rule_attr: *const LandlockPathBeneathAttr,
     flags: u32,
 ) -> libc::c_long {
-    libc::syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags)
+    unsafe { libc::syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags) }
 }
 
 unsafe fn landlock_restrict_self(ruleset_fd: RawFd, flags: u32) -> libc::c_long {
-    libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags)
+    unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags) }
 }
 
 /// Detect the highest supported Landlock ABI version.
-fn detect_abi_version() -> Result<i32, String> {
+pub(crate) fn detect_abi_version() -> Result<i32, String> {
     let ret = unsafe {
         landlock_create_ruleset(
             std::ptr::null(),
