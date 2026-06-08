@@ -43,9 +43,8 @@ const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 
 /// Read-only access rights.
-const ACCESS_READ: u64 = LANDLOCK_ACCESS_FS_EXECUTE
-    | LANDLOCK_ACCESS_FS_READ_FILE
-    | LANDLOCK_ACCESS_FS_READ_DIR;
+const ACCESS_READ: u64 =
+    LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
 /// Full read-write access rights.
 const ACCESS_READ_WRITE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
@@ -94,22 +93,49 @@ unsafe fn landlock_add_rule(
     rule_attr: *const LandlockPathBeneathAttr,
     flags: u32,
 ) -> libc::c_long {
-    unsafe { libc::syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags) }
+    unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_ADD_RULE,
+            ruleset_fd,
+            rule_type,
+            rule_attr,
+            flags,
+        )
+    }
 }
 
 unsafe fn landlock_restrict_self(ruleset_fd: RawFd, flags: u32) -> libc::c_long {
     unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags) }
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedLandlockRuleset {
+    fd: RawFd,
+}
+
+impl PreparedLandlockRuleset {
+    pub(crate) fn restrict_current_process(&self) -> Result<(), i32> {
+        let ret = unsafe { landlock_restrict_self(self.fd, 0) };
+        if ret < 0 {
+            Err(current_errno())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PreparedLandlockRuleset {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
 /// Detect the highest supported Landlock ABI version.
 pub(crate) fn detect_abi_version() -> Result<i32, String> {
-    let ret = unsafe {
-        landlock_create_ruleset(
-            std::ptr::null(),
-            0,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
+    let ret =
+        unsafe { landlock_create_ruleset(std::ptr::null(), 0, LANDLOCK_CREATE_RULESET_VERSION) };
     if ret < 0 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() == Some(libc::ENOSYS) {
@@ -123,15 +149,10 @@ pub(crate) fn detect_abi_version() -> Result<i32, String> {
     Ok(ret as i32)
 }
 
-/// Apply Landlock filesystem restrictions to the current process.
-///
-/// This must be called from a `pre_exec` hook (after fork, before exec).
-/// On kernels without Landlock support, returns an error that callers
-/// can handle in best-effort mode.
-pub fn apply_landlock(
+pub(crate) fn prepare_landlock(
     policy: &FilesystemPolicy,
     workspace: &Path,
-) -> Result<(), String> {
+) -> Result<PreparedLandlockRuleset, String> {
     // Verify workspace exists.
     if !workspace.exists() {
         return Err(format!(
@@ -158,59 +179,106 @@ pub fn apply_landlock(
         handled_access_fs: handled,
         handled_access_net: 0,
     };
-    let ruleset_fd = unsafe {
-        landlock_create_ruleset(
-            &attr,
-            std::mem::size_of::<LandlockRulesetAttr>(),
-            0,
-        )
-    };
+    let ruleset_fd =
+        unsafe { landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0) };
     if ruleset_fd < 0 {
         return Err(format!(
             "landlock_create_ruleset failed: {}",
             std::io::Error::last_os_error()
         ));
     }
-    let ruleset_fd = ruleset_fd as RawFd;
+    let ruleset = PreparedLandlockRuleset {
+        fd: ruleset_fd as RawFd,
+    };
+    if let Err(e) = set_close_on_exec(ruleset.fd) {
+        unsafe {
+            libc::close(ruleset.fd);
+        }
+        std::mem::forget(ruleset);
+        return Err(e);
+    }
 
     // 2. Add rules for read-only paths.
     let read_access = ACCESS_READ & handled;
     for path_str in &policy.read_only {
-        if let Err(e) = add_path_rule(ruleset_fd, path_str, read_access, &policy.compatibility) {
-            tracing::warn!("landlock: skipping read-only path '{path_str}': {e}");
-        }
+        add_policy_path_rule(
+            ruleset.fd,
+            path_str,
+            read_access,
+            &policy.compatibility,
+            "read-only",
+        )?;
     }
 
     // 3. Add rules for read-write paths (including workspace).
     let write_access = handled; // all handled rights
     for path_str in &policy.read_write {
         let expanded = expand_path(path_str, workspace);
-        if let Err(e) = add_path_rule(ruleset_fd, &expanded, write_access, &policy.compatibility) {
-            tracing::warn!("landlock: skipping read-write path '{expanded}': {e}");
-        }
+        add_policy_path_rule(
+            ruleset.fd,
+            &expanded,
+            write_access,
+            &policy.compatibility,
+            "read-write",
+        )?;
     }
 
     // Always add workspace as read-write.
     let ws_str = workspace.to_string_lossy().to_string();
-    if let Err(e) = add_path_rule(ruleset_fd, &ws_str, write_access, &policy.compatibility) {
-        tracing::warn!("landlock: failed to add workspace: {e}");
-    }
-
-    // 4. Restrict self.
-    let ret = unsafe { landlock_restrict_self(ruleset_fd, 0) };
-    unsafe { libc::close(ruleset_fd) };
-
-    if ret < 0 {
-        return Err(format!(
-            "landlock_restrict_self failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    add_required_path_rule(ruleset.fd, &ws_str, write_access, "workspace")?;
 
     let ro = policy.read_only.len();
     let rw = policy.read_write.len() + 1; // +1 for workspace
-    tracing::info!("landlock: applied — {ro} read-only, {rw} read-write paths");
+    tracing::info!("landlock: prepared ruleset — {ro} read-only, {rw} read-write paths");
+    Ok(ruleset)
+}
+
+/// Apply Landlock filesystem restrictions to the current process.
+pub fn apply_landlock(policy: &FilesystemPolicy, workspace: &Path) -> Result<(), String> {
+    let ruleset = prepare_landlock(policy, workspace)?;
+    ruleset.restrict_current_process().map_err(|errno| {
+        format!(
+            "landlock_restrict_self failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        )
+    })?;
+    tracing::info!("landlock: applied");
     Ok(())
+}
+
+fn current_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+fn add_policy_path_rule(
+    ruleset_fd: RawFd,
+    path: &str,
+    access: u64,
+    compat: &Compatibility,
+    label: &str,
+) -> Result<(), String> {
+    match add_path_rule(ruleset_fd, path, access, compat) {
+        Ok(()) => Ok(()),
+        Err(e) => match compat {
+            Compatibility::BestEffort => {
+                tracing::warn!("landlock: skipping {label} path '{path}': {e}");
+                Ok(())
+            }
+            Compatibility::HardRequirement => Err(format!(
+                "landlock: hard-required {label} path '{path}' cannot be added: {e}"
+            )),
+        },
+    }
+}
+
+fn add_required_path_rule(
+    ruleset_fd: RawFd,
+    path: &str,
+    access: u64,
+    label: &str,
+) -> Result<(), String> {
+    add_path_rule(ruleset_fd, path, access, &Compatibility::HardRequirement)
+        .map_err(|e| format!("landlock: required {label} path '{path}' cannot be added: {e}"))
 }
 
 /// Add a path-beneath rule to the ruleset.
@@ -220,22 +288,16 @@ fn add_path_rule(
     access: u64,
     compat: &Compatibility,
 ) -> Result<(), String> {
-    let c_path = std::ffi::CString::new(path)
-        .map_err(|e| format!("invalid path '{path}': {e}"))?;
+    let c_path = std::ffi::CString::new(path).map_err(|e| format!("invalid path '{path}': {e}"))?;
 
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_PATH | libc::O_CLOEXEC,
-        )
-    };
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
 
     if fd < 0 {
         let err = std::io::Error::last_os_error();
         return match compat {
-            Compatibility::BestEffort => {
-                Err(format!("cannot open '{path}': {err} (skipped, best-effort)"))
-            }
+            Compatibility::BestEffort => Err(format!(
+                "cannot open '{path}': {err} (skipped, best-effort)"
+            )),
             Compatibility::HardRequirement => {
                 Err(format!("cannot open '{path}': {err} (hard requirement)"))
             }
@@ -247,14 +309,7 @@ fn add_path_rule(
         parent_fd: fd,
     };
 
-    let ret = unsafe {
-        landlock_add_rule(
-            ruleset_fd,
-            LANDLOCK_RULE_PATH_BENEATH,
-            &rule,
-            0,
-        )
-    };
+    let ret = unsafe { landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0) };
 
     unsafe { libc::close(fd) };
 
@@ -268,6 +323,18 @@ fn add_path_rule(
     }
 
     Ok(())
+}
+
+fn set_close_on_exec(fd: RawFd) -> Result<(), String> {
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if ret < 0 {
+        Err(format!(
+            "fcntl(FD_CLOEXEC) failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Expand policy path placeholders.
@@ -296,7 +363,10 @@ mod tests {
     #[test]
     fn expand_path_placeholders() {
         let ws = Path::new("/home/user/sandbox");
-        assert_eq!(expand_path("{workspace}/data", ws), "/home/user/sandbox/data");
+        assert_eq!(
+            expand_path("{workspace}/data", ws),
+            "/home/user/sandbox/data"
+        );
         assert_eq!(expand_path("{tmpdir}/axis", ws), "/tmp/axis");
     }
 
@@ -316,5 +386,42 @@ mod tests {
             Ok(()) => eprintln!("Landlock applied successfully"),
             Err(e) => eprintln!("Landlock not applied (expected in some CI): {e}"),
         }
+    }
+
+    #[test]
+    fn hard_requirement_prepare_fails_when_required_path_missing() {
+        if let Err(e) = detect_abi_version() {
+            eprintln!("Landlock not available: {e} (test skipped)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy = FilesystemPolicy {
+            read_only: vec!["/axis/definitely/missing/landlock/path".into()],
+            compatibility: Compatibility::HardRequirement,
+            ..Default::default()
+        };
+
+        let err = prepare_landlock(&policy, dir.path()).unwrap_err();
+
+        assert!(err.contains("hard-required read-only path"));
+    }
+
+    #[test]
+    fn best_effort_prepare_skips_missing_policy_path() {
+        if let Err(e) = detect_abi_version() {
+            eprintln!("Landlock not available: {e} (test skipped)");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy = FilesystemPolicy {
+            read_only: vec!["/axis/definitely/missing/landlock/path".into()],
+            compatibility: Compatibility::BestEffort,
+            ..Default::default()
+        };
+
+        let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+        drop(ruleset);
     }
 }

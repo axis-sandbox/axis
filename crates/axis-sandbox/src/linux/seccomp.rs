@@ -83,13 +83,13 @@ const WHITELIST: &[(u32, &str)] = &[
     (53, "socketpair"),
     (54, "setsockopt"),
     (55, "getsockopt"),
-    (56, "clone"),       // needed for threads (fork filtering done separately)
+    (56, "clone"), // needed for threads (fork filtering done separately)
     (57, "fork"),
     (58, "vfork"),
     (59, "execve"),
     (60, "exit"),
     (61, "wait4"),
-    (62, "kill"),        // only for sending signals to own process group
+    (62, "kill"), // only for sending signals to own process group
     (63, "uname"),
     (72, "fcntl"),
     (73, "flock"),
@@ -180,7 +180,7 @@ const WHITELIST: &[(u32, &str)] = &[
 
 /// BPF instruction.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct BpfInsn {
     code: u16,
     jt: u8,
@@ -194,19 +194,49 @@ struct BpfProg {
     filter: *const BpfInsn,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedSeccompFilter {
+    insns: Vec<BpfInsn>,
+}
+
+impl PreparedSeccompFilter {
+    pub(crate) fn apply_current_process(&self) -> Result<(), i32> {
+        let prog = BpfProg {
+            len: self.insns.len() as u16,
+            filter: self.insns.as_ptr(),
+        };
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                1 as libc::c_long, // SECCOMP_SET_MODE_FILTER
+                1 as libc::c_long, // SECCOMP_FILTER_FLAG_TSYNC
+                &prog as *const BpfProg as libc::c_long,
+            )
+        };
+
+        if ret < 0 {
+            Err(current_errno())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn bpf_stmt(code: u16, k: u32) -> BpfInsn {
-    BpfInsn { code, jt: 0, jf: 0, k }
+    BpfInsn {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> BpfInsn {
     BpfInsn { code, jt, jf, k }
 }
 
-/// Apply seccomp-BPF in default-deny whitelist mode.
-///
-/// Only syscalls in the whitelist are allowed. Everything else returns EPERM.
-/// Must be called from a `pre_exec` hook after PR_SET_NO_NEW_PRIVS.
-pub fn apply_seccomp(policy: &ProcessPolicy) -> Result<(), String> {
+pub(crate) fn prepare_seccomp(policy: &ProcessPolicy) -> PreparedSeccompFilter {
     // Build the complete allowlist.
     let mut allowed: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
 
@@ -246,65 +276,72 @@ pub fn apply_seccomp(policy: &ProcessPolicy) -> Result<(), String> {
             BPF_JMP | BPF_JEQ | BPF_K,
             *nr,
             (remaining + 1) as u8, // jump to ALLOW (skip remaining + DENY)
-            0,                      // fall through
+            0,                     // fall through
         ));
     }
 
     // Default: DENY with EPERM.
-    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0xFFFF)));
+    insns.push(bpf_stmt(
+        BPF_RET | BPF_K,
+        SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0xFFFF),
+    ));
 
     // ALLOW.
     insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
-    let prog = BpfProg {
-        len: insns.len() as u16,
-        filter: insns.as_ptr(),
-    };
-
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            1 as libc::c_long, // SECCOMP_SET_MODE_FILTER
-            1 as libc::c_long, // SECCOMP_FILTER_FLAG_TSYNC
-            &prog as *const BpfProg as libc::c_long,
-        )
-    };
-
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(format!("seccomp(SET_MODE_FILTER) failed: {err}"));
-    }
-
     tracing::info!(
-        "seccomp: default-deny mode — {} syscalls whitelisted, {} BPF instructions",
+        "seccomp: prepared default-deny mode — {} syscalls whitelisted, {} BPF instructions",
         allowed.len(),
         insns.len(),
     );
+    PreparedSeccompFilter { insns }
+}
+
+/// Apply seccomp-BPF in default-deny whitelist mode.
+///
+/// Only syscalls in the whitelist are allowed. Everything else returns EPERM.
+pub fn apply_seccomp(policy: &ProcessPolicy) -> Result<(), String> {
+    let filter = prepare_seccomp(policy);
+    filter.apply_current_process().map_err(|errno| {
+        format!(
+            "seccomp(SET_MODE_FILTER) failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        )
+    })?;
+    tracing::info!("seccomp: applied default-deny mode");
     Ok(())
+}
+
+fn current_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
 }
 
 /// Map syscall name to x86_64 number.
 fn syscall_number(name: &str) -> Option<u32> {
-    WHITELIST.iter().find(|(_, n)| *n == name).map(|(nr, _)| *nr).or_else(|| {
-        // Also map commonly-blocked names that aren't in the whitelist.
-        match name {
-            "ptrace" => Some(101),
-            "mount" => Some(165),
-            "umount2" => Some(166),
-            "bpf" => Some(321),
-            "io_uring_setup" => Some(425),
-            "memfd_create" => Some(319),
-            "process_vm_readv" => Some(310),
-            "process_vm_writev" => Some(311),
-            "userfaultfd" => Some(323),
-            "kexec_load" => Some(246),
-            "reboot" => Some(169),
-            "pivot_root" => Some(155),
-            "chroot" => Some(161),
-            "unshare" => Some(272),
-            _ => None,
-        }
-    })
+    WHITELIST
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(nr, _)| *nr)
+        .or_else(|| {
+            // Also map commonly-blocked names that aren't in the whitelist.
+            match name {
+                "ptrace" => Some(101),
+                "mount" => Some(165),
+                "umount2" => Some(166),
+                "bpf" => Some(321),
+                "io_uring_setup" => Some(425),
+                "memfd_create" => Some(319),
+                "process_vm_readv" => Some(310),
+                "process_vm_writev" => Some(311),
+                "userfaultfd" => Some(323),
+                "kexec_load" => Some(246),
+                "reboot" => Some(169),
+                "pivot_root" => Some(155),
+                "chroot" => Some(161),
+                "unshare" => Some(272),
+                _ => None,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -328,7 +365,10 @@ mod tests {
         assert!(!nrs.contains(&101), "ptrace should not be in whitelist");
         assert!(!nrs.contains(&165), "mount should not be in whitelist");
         assert!(!nrs.contains(&321), "bpf should not be in whitelist");
-        assert!(!nrs.contains(&425), "io_uring_setup should not be in whitelist");
+        assert!(
+            !nrs.contains(&425),
+            "io_uring_setup should not be in whitelist"
+        );
         assert!(!nrs.contains(&169), "reboot should not be in whitelist");
     }
 

@@ -46,9 +46,6 @@ pub(crate) enum SeccompStrategy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NetworkStrategy {
-    Block {
-        mechanism: BlockNetworkMechanism,
-    },
     Proxy {
         setup: ProxyNetworkSetup,
         firewall: Option<FirewallTool>,
@@ -57,11 +54,6 @@ pub(crate) enum NetworkStrategy {
         proxy_port: u16,
     },
     AllowHost,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlockNetworkMechanism {
-    SeccompSocketDomains,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,19 +298,10 @@ fn plan_network(
     match policy.network.mode {
         NetworkMode::Block => {
             reject_endpoint_policies_for_non_proxy(policy, "block")?;
-            if caps.seccomp {
-                Ok((
-                    NetworkStrategy::Block {
-                        mechanism: BlockNetworkMechanism::SeccompSocketDomains,
-                    },
-                    ProxyStrategy::None,
-                ))
-            } else {
-                Err(StrategyError::new(
-                    "network",
-                    "network block mode requires seccomp socket-domain filtering",
-                ))
-            }
+            Err(StrategyError::new(
+                "network",
+                "network block mode requires the policy-aware socket-domain filter that is not implemented yet",
+            ))
         }
         NetworkMode::Allow => {
             reject_endpoint_policies_for_non_proxy(policy, "allow")?;
@@ -383,16 +366,13 @@ fn validate_proxy_bind(
         ));
     }
 
-    let proxy_addr = proxy_addr.ok_or_else(|| {
-        StrategyError::new("network", "proxy mode requires a proxy bind address")
-    })?;
+    let proxy_addr = proxy_addr
+        .ok_or_else(|| StrategyError::new("network", "proxy mode requires a proxy bind address"))?;
 
     if proxy_addr.port() != proxy_port {
         return Err(StrategyError::new(
             "network",
-            format!(
-                "proxy port {proxy_port} does not match proxy bind address {proxy_addr}"
-            ),
+            format!("proxy port {proxy_port} does not match proxy bind address {proxy_addr}"),
         ));
     }
 
@@ -891,20 +871,25 @@ mod tests {
     }
 
     #[test]
-    fn block_mode_uses_seccomp_socket_domains() {
-        let plan = plan(&policy(NetworkMode::Block), full_caps(), 0);
+    fn block_mode_rejects_until_socket_domain_filter_exists() {
+        let err = plan_with_probe(
+            &policy(NetworkMode::Block),
+            SandboxId::new(),
+            tempfile::tempdir().unwrap().path(),
+            0,
+            None,
+            &FakeProbe {
+                snapshot: full_caps(),
+            },
+        )
+        .unwrap_err();
 
-        assert_eq!(
-            plan.network,
-            NetworkStrategy::Block {
-                mechanism: BlockNetworkMechanism::SeccompSocketDomains,
-            }
-        );
-        assert_eq!(plan.proxy, ProxyStrategy::None);
+        assert_eq!(err.area, "network");
+        assert!(err.message.contains("socket-domain filter"));
     }
 
     #[test]
-    fn block_mode_without_seccomp_is_fatal_even_if_bubblewrap_exists() {
+    fn block_mode_without_global_seccomp_is_seccomp_fatal() {
         let caps = CapabilitySnapshot {
             landlock_abi: Some(7),
             seccomp: false,
@@ -1003,7 +988,7 @@ mod tests {
         caps.bubblewrap = true;
 
         let err = plan_with_probe(
-            &policy(NetworkMode::Block),
+            &policy(NetworkMode::Allow),
             SandboxId::new(),
             tempfile::tempdir().unwrap().path(),
             0,
@@ -1045,7 +1030,7 @@ mod tests {
         caps.landlock_abi = None;
 
         let err = plan_with_probe(
-            &policy(NetworkMode::Block),
+            &policy(NetworkMode::Allow),
             SandboxId::new(),
             tempfile::tempdir().unwrap().path(),
             0,
