@@ -36,6 +36,7 @@ pub(crate) struct LinuxIsolationPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FilesystemStrategy {
     Landlock { abi: u32 },
+    Bubblewrap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub(crate) enum NetworkStrategy {
         proxy_port: u16,
     },
     BlockedBySeccomp,
+    BlockedByBubblewrap,
     AllowHost,
 }
 
@@ -192,7 +194,7 @@ impl CapabilityProbe for DefaultCapabilityProbe {
             cap_net_admin: detect_cap_net_admin(),
             netns_helper: command_available("axis-netns-helper"),
             unprivileged_userns: detect_unprivileged_userns(),
-            bubblewrap: command_available("bwrap"),
+            bubblewrap: super::bwrap::available(),
         }
     }
 }
@@ -263,14 +265,15 @@ fn plan_filesystem(
     });
 
     if caps.bubblewrap {
-        let message = match uid_dac_error {
-            Some(reason) => format!(
-                "Landlock unavailable; bubblewrap filesystem fallback is not implemented yet; {reason}"
-            ),
-            None => "Landlock unavailable; bubblewrap filesystem fallback is not implemented yet"
-                .to_string(),
-        };
-        return Err(StrategyError::new("filesystem", message));
+        if let Some(reason) = uid_dac_error {
+            return Err(StrategyError::new(
+                "filesystem",
+                format!(
+                    "Landlock unavailable; bubblewrap fallback does not support run_as_user yet; {reason}"
+                ),
+            ));
+        }
+        return Ok(FilesystemStrategy::Bubblewrap);
     }
 
     if let Some(reason) = uid_dac_error {
@@ -304,7 +307,11 @@ fn plan_network(
     match policy.network.mode {
         NetworkMode::Block => {
             reject_endpoint_policies_for_non_proxy(policy, "block")?;
-            Ok((NetworkStrategy::BlockedBySeccomp, ProxyStrategy::None))
+            if caps.landlock_abi.is_none() && caps.bubblewrap {
+                Ok((NetworkStrategy::BlockedByBubblewrap, ProxyStrategy::None))
+            } else {
+                Ok((NetworkStrategy::BlockedBySeccomp, ProxyStrategy::None))
+            }
         }
         NetworkMode::Allow => {
             reject_endpoint_policies_for_non_proxy(policy, "allow")?;
@@ -312,6 +319,13 @@ fn plan_network(
         }
         NetworkMode::Proxy => {
             let proxy_addr = validate_proxy_bind(sandbox_id, proxy_port, proxy_addr)?;
+
+            if caps.landlock_abi.is_none() && caps.bubblewrap {
+                return Err(StrategyError::new(
+                    "network",
+                    "bubblewrap filesystem fallback cannot preserve proxy network semantics",
+                ));
+            }
 
             let firewall = selected_firewall(caps);
             if caps.cap_net_admin && caps.ip && firewall.is_some() {
@@ -854,6 +868,27 @@ mod tests {
     }
 
     #[test]
+    fn proxy_mode_rejects_bubblewrap_filesystem_fallback_even_with_native_proxy_caps() {
+        let mut caps = full_caps();
+        caps.landlock_abi = None;
+        caps.bubblewrap = true;
+        let sandbox_id = test_sandbox_id();
+
+        let err = plan_with_probe(
+            &policy(NetworkMode::Proxy),
+            sandbox_id,
+            tempfile::tempdir().unwrap().path(),
+            3128,
+            proxy_bind(sandbox_id, 3128),
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.area, "network");
+        assert!(err.message.contains("cannot preserve proxy"));
+    }
+
+    #[test]
     fn proxy_mode_rejects_nft_until_runtime_support_exists() {
         let mut caps = full_caps();
         caps.iptables = false;
@@ -1008,12 +1043,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_landlock_rejects_bubblewrap_until_runtime_support_exists() {
+    fn missing_landlock_uses_bubblewrap_filesystem_fallback() {
         let mut caps = full_caps();
         caps.landlock_abi = None;
         caps.bubblewrap = true;
 
-        let err = plan_with_probe(
+        let plan = plan_with_probe(
             &policy(NetworkMode::Allow),
             SandboxId::new(),
             tempfile::tempdir().unwrap().path(),
@@ -1021,10 +1056,30 @@ mod tests {
             None,
             &FakeProbe { snapshot: caps },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(err.area, "filesystem");
-        assert!(err.message.contains("not implemented yet"));
+        assert_eq!(plan.filesystem, FilesystemStrategy::Bubblewrap);
+        assert_eq!(plan.network, NetworkStrategy::AllowHost);
+    }
+
+    #[test]
+    fn missing_landlock_block_mode_uses_bubblewrap_network_fallback() {
+        let mut caps = full_caps();
+        caps.landlock_abi = None;
+        caps.bubblewrap = true;
+
+        let plan = plan_with_probe(
+            &policy(NetworkMode::Block),
+            SandboxId::new(),
+            tempfile::tempdir().unwrap().path(),
+            0,
+            None,
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap();
+
+        assert_eq!(plan.filesystem, FilesystemStrategy::Bubblewrap);
+        assert_eq!(plan.network, NetworkStrategy::BlockedByBubblewrap);
     }
 
     #[test]

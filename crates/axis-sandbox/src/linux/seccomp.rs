@@ -242,6 +242,17 @@ impl PreparedSeccompFilter {
             Ok(())
         }
     }
+
+    pub(crate) fn export_bpf_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.insns.len() * std::mem::size_of::<BpfInsn>());
+        for insn in &self.insns {
+            bytes.extend_from_slice(&insn.code.to_ne_bytes());
+            bytes.push(insn.jt);
+            bytes.push(insn.jf);
+            bytes.extend_from_slice(&insn.k.to_ne_bytes());
+        }
+        bytes
+    }
 }
 
 fn bpf_stmt(code: u16, k: u32) -> BpfInsn {

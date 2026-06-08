@@ -143,18 +143,19 @@ pub(crate) enum TmpdirSetup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpandedPath {
-    original: String,
-    path: PathBuf,
-    required: bool,
+pub(crate) struct ExpandedPath {
+    pub(crate) original: String,
+    pub(crate) path: PathBuf,
+    pub(crate) mount_path: PathBuf,
+    pub(crate) required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpandedFilesystemPolicy {
-    read_only: Vec<ExpandedPath>,
-    read_write: Vec<ExpandedPath>,
-    deny: Vec<ExpandedPath>,
-    tmpdir_required: bool,
+pub(crate) struct ExpandedFilesystemPolicy {
+    pub(crate) read_only: Vec<ExpandedPath>,
+    pub(crate) read_write: Vec<ExpandedPath>,
+    pub(crate) deny: Vec<ExpandedPath>,
+    pub(crate) tmpdir_required: bool,
 }
 
 pub(crate) fn sandbox_tmpdir(workspace: &Path) -> PathBuf {
@@ -170,7 +171,7 @@ pub(crate) fn policy_uses_tmpdir(policy: &FilesystemPolicy) -> bool {
         .any(|path| path.contains(TMPDIR_PLACEHOLDER))
 }
 
-fn create_tmpdir(workspace: &Path) -> Result<(), String> {
+pub(crate) fn create_tmpdir(workspace: &Path) -> Result<(), String> {
     let tmpdir = sandbox_tmpdir(workspace);
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700);
@@ -186,6 +187,23 @@ pub(crate) fn cleanup_tmpdir(workspace: &Path) -> Result<(), String> {
             .map_err(|e| format!("cannot remove tmpdir {}: {e}", tmpdir.display()))?;
     }
     Ok(())
+}
+
+pub(crate) fn expand_and_validate_filesystem_policy(
+    policy: &FilesystemPolicy,
+    workspace: &Path,
+) -> Result<ExpandedFilesystemPolicy, String> {
+    if !workspace.exists() {
+        return Err(format!(
+            "workspace directory does not exist: {}",
+            workspace.display()
+        ));
+    }
+    let expanded = expand_filesystem_policy(policy, workspace)?;
+    validate_allow_path_overlaps(&expanded)?;
+    validate_workspace_read_only_overlaps(&expanded, workspace)?;
+    validate_deny_paths(&expanded, workspace)?;
+    Ok(expanded)
 }
 
 /// Detect the highest supported Landlock ABI version.
@@ -217,17 +235,7 @@ pub(crate) fn prepare_landlock_with_tmpdir_setup(
     workspace: &Path,
     tmpdir_setup: TmpdirSetup,
 ) -> Result<PreparedLandlockRuleset, String> {
-    // Verify workspace exists.
-    if !workspace.exists() {
-        return Err(format!(
-            "workspace directory does not exist: {}",
-            workspace.display()
-        ));
-    }
-    let expanded = expand_filesystem_policy(policy, workspace)?;
-    validate_allow_path_overlaps(&expanded)?;
-    validate_workspace_read_only_overlaps(&expanded, workspace)?;
-    validate_deny_paths(&expanded, workspace)?;
+    let expanded = expand_and_validate_filesystem_policy(policy, workspace)?;
 
     // Detect ABI version.
     let abi = detect_abi_version()?;
@@ -486,10 +494,12 @@ fn expand_policy_paths(paths: &[String], workspace: &Path) -> Result<Vec<Expande
 
 fn expand_policy_path(path: &str, workspace: &Path) -> Result<ExpandedPath, String> {
     let required = path.contains(TMPDIR_PLACEHOLDER);
-    let expanded = expand_path(path, workspace)?;
+    let mount_path = expand_mount_path(path, workspace)?;
+    let expanded = normalize_existing_or_absolute_path(&mount_path)?;
     Ok(ExpandedPath {
         original: path.to_string(),
         path: expanded,
+        mount_path,
         required,
     })
 }
@@ -595,11 +605,26 @@ fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
 }
 
 /// Expand Linux policy paths to absolute sandbox host paths.
+#[cfg(test)]
 fn expand_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
     expand_path_with_home(path, workspace, None)
 }
 
+#[cfg(test)]
 fn expand_path_with_home(
+    path: &str,
+    workspace: &Path,
+    home_override: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let mount_path = expand_mount_path_with_home(path, workspace, home_override)?;
+    normalize_existing_or_absolute_path(&mount_path)
+}
+
+fn expand_mount_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
+    expand_mount_path_with_home(path, workspace, None)
+}
+
+fn expand_mount_path_with_home(
     path: &str,
     workspace: &Path,
     home_override: Option<&Path>,
@@ -626,7 +651,7 @@ fn expand_path_with_home(
     );
 
     let expanded = PathBuf::from(expanded);
-    normalize_existing_or_absolute_path(&expanded)
+    normalize_absolute_path(&expanded)
 }
 
 fn home_path(home_override: Option<&Path>) -> Result<PathBuf, String> {
@@ -812,6 +837,24 @@ mod tests {
             expand_path(&link.to_string_lossy(), dir.path()).unwrap(),
             target
         );
+    }
+
+    #[test]
+    fn expanded_policy_preserves_mount_alias_for_symlink_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let policy = FilesystemPolicy {
+            read_only: vec![link.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        let expanded = expand_filesystem_policy(&policy, dir.path()).unwrap();
+
+        assert_eq!(expanded.read_only[0].path, target);
+        assert_eq!(expanded.read_only[0].mount_path, link);
     }
 
     #[test]

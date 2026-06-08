@@ -3,6 +3,7 @@
 
 //! Linux sandbox implementation using Landlock, seccomp-BPF, and network namespaces.
 
+mod bwrap;
 mod identity;
 pub mod landlock;
 pub mod netns;
@@ -265,6 +266,257 @@ impl LinuxSandbox {
         }
     }
 
+    fn start_with_bwrap(&mut self) -> Result<u32, SandboxError> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        if self.config.policy.process.run_as_user.is_some() {
+            return Err(SandboxError::IsolationFailed(
+                "bubblewrap fallback with run_as_user is not implemented yet".into(),
+            ));
+        }
+        if matches!(self.plan.network, strategy::NetworkStrategy::Proxy { .. }) {
+            return Err(SandboxError::IsolationFailed(
+                "bubblewrap fallback cannot preserve proxy network semantics".into(),
+            ));
+        }
+
+        let sandbox_id = self.config.id;
+        let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
+        if tmpdir_required {
+            match landlock::create_tmpdir(&self.config.workspace_dir) {
+                Ok(()) => self.tmpdir_active = true,
+                Err(e) => return Err(SandboxError::IsolationFailed(e)),
+            }
+        }
+
+        let seccomp_options = seccomp_options_for_network(&self.plan.network);
+        let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
+            &self.config.policy.process,
+            seccomp_options,
+        ) {
+            Ok(filter) => filter,
+            Err(e) => {
+                let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                return Err(append_cleanup_failure(
+                    SandboxError::IsolationFailed(e),
+                    cleanup_error,
+                ));
+            }
+        };
+        let seccomp_fd = match bwrap::create_seccomp_fd(&prepared_seccomp) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                return Err(append_cleanup_failure(
+                    SandboxError::IsolationFailed(e),
+                    cleanup_error,
+                ));
+            }
+        };
+
+        let prepared_rlimits =
+            match prepare_rlimits_for_plan(&self.config.policy.process, &self.plan.resources) {
+                Ok(limits) => limits,
+                Err(e) => {
+                    close_fd(Some(seccomp_fd));
+                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(format!("resource limits: {e}")),
+                        cleanup_error,
+                    ));
+                }
+            };
+
+        if matches!(
+            self.plan.resources,
+            strategy::ResourceStrategy::CgroupsV2 { .. }
+        ) {
+            match resources::create_cgroup(sandbox_id, &self.config.policy.process) {
+                Ok(cgroup) => self.cgroup = Some(cgroup),
+                Err(e) => {
+                    close_fd(Some(seccomp_fd));
+                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(format!("cgroup: creation failed: {e}")),
+                        cleanup_error,
+                    ));
+                }
+            }
+        }
+
+        let cgroup_procs_fd = match &self.cgroup {
+            Some(cgroup) => match cgroup.open_procs_fd() {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    close_fd(Some(seccomp_fd));
+                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(format!("cgroup: cannot open procs: {e}")),
+                        cleanup_error,
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        let network = match self.plan.network {
+            strategy::NetworkStrategy::BlockedBySeccomp
+            | strategy::NetworkStrategy::BlockedByBubblewrap => bwrap::BubblewrapNetwork::Block,
+            strategy::NetworkStrategy::AllowHost => bwrap::BubblewrapNetwork::AllowHost,
+            strategy::NetworkStrategy::Proxy { .. } => unreachable!("proxy rejected above"),
+        };
+        let plan = match bwrap::build_plan(bwrap::BubblewrapPlanInput {
+            filesystem: &self.config.policy.filesystem,
+            workspace: &self.config.workspace_dir,
+            working_dir: self.config.working_dir.as_deref(),
+            network,
+            env: &self.config.env,
+            command: &self.config.command,
+            command_args: &self.config.args,
+            seccomp_fd,
+        }) {
+            Ok(plan) => plan,
+            Err(e) => {
+                close_fd(Some(seccomp_fd));
+                close_fd(cgroup_procs_fd);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                return Err(append_cleanup_failure(
+                    SandboxError::IsolationFailed(format!("bubblewrap plan: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
+
+        let mut cmd = Command::new(&plan.program);
+        cmd.args(&plan.args);
+        cmd.env_clear();
+        let bwrap_bind_fds = plan.inherited_fds();
+        if self.config.capture_output {
+            cmd.stdin(std::process::Stdio::null());
+            let stdout_file =
+                match std::fs::File::create(self.config.workspace_dir.join("stdout.log")) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        close_fd(Some(seccomp_fd));
+                        close_fd(cgroup_procs_fd);
+                        let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                        return Err(append_cleanup_failure(
+                            SandboxError::SpawnFailed(format!("stdout log: {e}")),
+                            cleanup_error,
+                        ));
+                    }
+                };
+            let stderr_file =
+                match std::fs::File::create(self.config.workspace_dir.join("stderr.log")) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        close_fd(Some(seccomp_fd));
+                        close_fd(cgroup_procs_fd);
+                        let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                        return Err(append_cleanup_failure(
+                            SandboxError::SpawnFailed(format!("stderr log: {e}")),
+                            cleanup_error,
+                        ));
+                    }
+                };
+            cmd.stdout(std::process::Stdio::from(stdout_file));
+            cmd.stderr(std::process::Stdio::from(stderr_file));
+        }
+
+        let mut child_error_pipe = match ChildSetupErrorPipe::new() {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                close_fd(Some(seccomp_fd));
+                close_fd(cgroup_procs_fd);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                return Err(append_cleanup_failure(
+                    SandboxError::SpawnFailed(format!("child setup error pipe: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
+        let child_error_write_fd = child_error_pipe.write_fd;
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::SetProcessGroup,
+                        current_errno(),
+                    ));
+                }
+                if let Some(fd) = cgroup_procs_fd {
+                    if let Err(errno) = enter_cgroup_from_child_fd(fd) {
+                        libc::close(fd);
+                        return Err(child_setup_error(
+                            child_error_write_fd,
+                            ChildSetupErrorKind::EnterCgroup,
+                            errno,
+                        ));
+                    }
+                    libc::close(fd);
+                }
+                if let Some(limits) = prepared_rlimits {
+                    if let Err(errno) = apply_prepared_rlimits(limits) {
+                        return Err(child_setup_error(
+                            child_error_write_fd,
+                            ChildSetupErrorKind::ApplyResourceLimits,
+                            errno,
+                        ));
+                    }
+                }
+                if let Err(errno) = mark_unexpected_child_fds_close_on_exec() {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::CloseFileDescriptors,
+                        errno,
+                    ));
+                }
+                for fd in &bwrap_bind_fds {
+                    if let Err(errno) = clear_fd_cloexec(*fd) {
+                        return Err(child_setup_error(
+                            child_error_write_fd,
+                            ChildSetupErrorKind::CloseFileDescriptors,
+                            errno,
+                        ));
+                    }
+                }
+                if let Err(errno) = clear_fd_cloexec(seccomp_fd) {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::CloseFileDescriptors,
+                        errno,
+                    ));
+                }
+                Ok(())
+            });
+        }
+
+        let child = match cmd.spawn() {
+            Ok(child) => {
+                close_fd(Some(seccomp_fd));
+                close_fd(cgroup_procs_fd);
+                drop(child_error_pipe);
+                child
+            }
+            Err(e) => {
+                close_fd(Some(seccomp_fd));
+                close_fd(cgroup_procs_fd);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                return Err(append_cleanup_failure(
+                    spawn_error(e, &mut child_error_pipe),
+                    cleanup_error,
+                ));
+            }
+        };
+
+        let pid = child.id();
+        self.child = Some(child);
+        tracing::info!("sandbox {sandbox_id} started via bubblewrap fallback, pid={pid}");
+        Ok(pid)
+    }
+
     fn cleanup_tmpdir_after_stop(&mut self) {
         if let Err(e) = self.cleanup_tmpdir() {
             tracing::warn!("sandbox {}: tmpdir cleanup failed: {e}", self.config.id);
@@ -303,6 +555,19 @@ fn close_fd(fd: Option<i32>) {
         unsafe {
             libc::close(fd);
         }
+    }
+}
+
+fn clear_fd_cloexec(fd: i32) -> Result<(), i32> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(current_errno());
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if ret < 0 {
+        Err(current_errno())
+    } else {
+        Ok(())
     }
 }
 
@@ -412,7 +677,8 @@ fn set_resource_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) 
 
 fn seccomp_options_for_network(network: &strategy::NetworkStrategy) -> seccomp::SeccompOptions {
     match network {
-        strategy::NetworkStrategy::BlockedBySeccomp => {
+        strategy::NetworkStrategy::BlockedBySeccomp
+        | strategy::NetworkStrategy::BlockedByBubblewrap => {
             seccomp::SeccompOptions::deny_network_socket_domains()
         }
         strategy::NetworkStrategy::AllowHost | strategy::NetworkStrategy::Proxy { .. } => {
@@ -571,6 +837,12 @@ impl SandboxImpl for LinuxSandbox {
             "sandbox {sandbox_id}: linux isolation plan: {:?}",
             self.plan
         );
+        if matches!(
+            self.plan.filesystem,
+            strategy::FilesystemStrategy::Bubblewrap
+        ) {
+            return self.start_with_bwrap();
+        }
         let resolved_identity = self.resolve_identity()?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
@@ -581,7 +853,8 @@ impl SandboxImpl for LinuxSandbox {
             let identity = resolved_identity
                 .as_ref()
                 .expect("identity existence checked above");
-            if let Err(e) = identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
+            if let Err(e) =
+                identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
             {
                 return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
             }
@@ -1677,6 +1950,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn gated_bubblewrap_fallback_mounts_workspace_and_blocks_network() {
+        if std::env::var("AXIS_BWRAP_TESTS").as_deref() != Ok("1") {
+            eprintln!("AXIS_BWRAP_TESTS=1 not set (test skipped)");
+            return;
+        }
+        if !bwrap::available() {
+            eprintln!("safe bubblewrap executable unavailable (test skipped)");
+            return;
+        }
+
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let inherited_file_workspace = tempfile::tempdir().unwrap();
+        let inherited_file_path = inherited_file_workspace.path().join("leaked-fd");
+        let inherited_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&inherited_file_path)
+            .unwrap();
+        let inherited_file_fd = inherited_file.as_raw_fd();
+        clear_cloexec(inherited_file_fd);
+        let (inherited_socket, _peer_socket) = localhost_tcp_pair().unwrap();
+        let inherited_socket_fd = inherited_socket.as_raw_fd();
+        clear_cloexec(inherited_socket_fd);
+
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.command = python.to_string_lossy().into_owned();
+        sandbox.config.args = vec!["-c".into(), bubblewrap_probe_python().into()];
+        sandbox.config.capture_output = true;
+        sandbox.config.env = vec![
+            ("LEAKED_FD".into(), inherited_file_fd.to_string()),
+            ("LEAKED_TCP_FD".into(), inherited_socket_fd.to_string()),
+        ];
+        sandbox.config.timeout_sec = Some(5);
+        sandbox.config.policy.network.mode = NetworkMode::Block;
+        sandbox.config.policy.filesystem = FilesystemPolicy {
+            read_only: runtime_read_only_paths_for(&python),
+            read_write: vec!["{workspace}".into()],
+            compatibility: Compatibility::HardRequirement,
+            ..Default::default()
+        };
+        sandbox.config.policy.process.cpu_rate_percent = 0;
+        sandbox.plan.filesystem = strategy::FilesystemStrategy::Bubblewrap;
+        sandbox.plan.network = strategy::NetworkStrategy::BlockedByBubblewrap;
+        sandbox.plan.proxy = strategy::ProxyStrategy::None;
+        sandbox.plan.resources = strategy::ResourceStrategy::RlimitFallback {
+            memory_limit: false,
+            process_limit: strategy::ProcessLimitFallback::NotRequested,
+            cpu_limit: strategy::CpuLimitFallback::NotRequested,
+        };
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+        let stderr =
+            std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+
+        assert_eq!(code, 0, "bubblewrap fallback probe failed:\n{stderr}");
+        assert!(workspace.path().join("bwrap-ok").exists());
+        assert_eq!(std::fs::read_to_string(inherited_file_path).unwrap(), "");
+        sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn gated_run_as_user_drops_uid_gid_and_supplementary_groups() {
         if !contract_landlock_available() {
             return;
@@ -1990,6 +2335,54 @@ else:
     right.close()
 
 sys.exit(0)
+"#
+    }
+
+    fn bubblewrap_probe_python() -> &'static str {
+        r#"
+import errno
+import os
+import pathlib
+import socket
+import sys
+
+pathlib.Path("bwrap-ok").write_text("ok")
+
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    if key in os.environ:
+        print(f"unexpected proxy env: {key}", file=sys.stderr)
+        sys.exit(10)
+
+for key in ("LEAKED_FD", "LEAKED_TCP_FD"):
+    leaked_fd = os.environ.get(key)
+    if leaked_fd is None:
+        print(f"missing {key}", file=sys.stderr)
+        sys.exit(11)
+    try:
+        os.write(int(leaked_fd), b"fd-leak")
+    except OSError as exc:
+        if exc.errno != errno.EBADF:
+            print(f"unexpected inherited {key} errno: {exc.errno}", file=sys.stderr)
+            sys.exit(12)
+    else:
+        print(f"{key} unexpectedly remained open", file=sys.stderr)
+        sys.exit(13)
+
+for family in (socket.AF_INET, socket.AF_INET6):
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError as exc:
+        if exc.errno != errno.EPERM:
+            print(f"unexpected socket errno for {family}: {exc.errno}", file=sys.stderr)
+            sys.exit(20)
+    else:
+        sock.close()
+        print(f"socket unexpectedly succeeded for {family}", file=sys.stderr)
+        sys.exit(21)
+
+left, right = socket.socketpair()
+left.close()
+right.close()
 "#
     }
 }
