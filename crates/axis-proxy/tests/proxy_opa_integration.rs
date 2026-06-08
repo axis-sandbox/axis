@@ -6,9 +6,13 @@
 //! Starts a real proxy, sends CONNECT requests, verifies that allowed
 //! hosts get 200 and denied hosts get 403.
 
+use axis_core::connect_attribution::{
+    ConnectAttributionRecord, ConnectAttributionSource, ConnectAttributionStore,
+};
 use axis_core::policy::Policy;
 use axis_core::types::SandboxId;
 use axis_proxy::proxy::{AxisProxy, ProxyConfig};
+use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -58,6 +62,21 @@ async fn start_proxy_with_policy_and_roots(
     inference_ep: Option<std::net::SocketAddr>,
     upstream_tls_roots_pem: Vec<String>,
 ) -> (SandboxId, std::net::SocketAddr) {
+    start_proxy_with_policy_roots_and_attribution(
+        policy_yaml,
+        inference_ep,
+        upstream_tls_roots_pem,
+        None,
+    )
+    .await
+}
+
+async fn start_proxy_with_policy_roots_and_attribution(
+    policy_yaml: &str,
+    inference_ep: Option<std::net::SocketAddr>,
+    upstream_tls_roots_pem: Vec<String>,
+    connect_attribution: Option<ConnectAttributionStore>,
+) -> (SandboxId, std::net::SocketAddr) {
     let policy = Policy::from_yaml(policy_yaml).unwrap();
     let sandbox_id = SandboxId::new();
     let config = ProxyConfig {
@@ -68,6 +87,7 @@ async fn start_proxy_with_policy_and_roots(
         enable_leak_detection: true,
         upstream_tls_roots_pem,
         inference_endpoint: inference_ep,
+        connect_attribution,
     };
 
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -275,14 +295,72 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 /// Send a CONNECT request and return the response status line.
 async fn send_connect(proxy_addr: std::net::SocketAddr, target: &str) -> String {
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    send_connect_on_stream(&mut stream, target).await
+}
+
+async fn send_connect_on_stream(stream: &mut TcpStream, target: &str) -> String {
+    use tokio::io::AsyncReadExt;
 
     let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    reader.read_line(&mut response_line).await.unwrap();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1];
+    while stream.read(&mut buf).await.unwrap_or(0) == 1 {
+        response.push(buf[0]);
+        if response.ends_with(b"\n") {
+            break;
+        }
+    }
+    let response_line = String::from_utf8(response).unwrap();
     response_line
+}
+
+async fn send_connect_with_attribution(
+    store: &ConnectAttributionStore,
+    sandbox_id: SandboxId,
+    proxy_addr: SocketAddr,
+    target: &str,
+    executable_path: &str,
+    executable_sha256: &str,
+) -> String {
+    let (socket, peer_addr) = bound_tcp_socket();
+    store
+        .insert(connect_attribution_record(
+            sandbox_id,
+            peer_addr,
+            proxy_addr,
+            executable_path,
+            executable_sha256,
+        ))
+        .unwrap();
+    let mut stream = socket.connect(proxy_addr).await.unwrap();
+    send_connect_on_stream(&mut stream, target).await
+}
+
+fn bound_tcp_socket() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let peer_addr = socket.local_addr().unwrap();
+    (socket, peer_addr)
+}
+
+fn connect_attribution_record(
+    sandbox_id: SandboxId,
+    peer_addr: SocketAddr,
+    proxy_addr: SocketAddr,
+    executable_path: &str,
+    executable_sha256: &str,
+) -> ConnectAttributionRecord {
+    ConnectAttributionRecord {
+        sandbox_id,
+        peer_addr,
+        proxy_addr,
+        pid: 42,
+        executable_path: executable_path.into(),
+        executable_sha256: executable_sha256.into(),
+        source: ConnectAttributionSource::Test,
+    }
 }
 
 #[tokio::test]
@@ -343,6 +421,8 @@ async fn second_allowed_host() {
 #[cfg(target_os = "linux")]
 async fn binary_policy_allows_current_test_binary() {
     let binary_path = std::env::current_exe().unwrap();
+    let binary_path = binary_path.to_string_lossy().into_owned();
+    let store = ConnectAttributionStore::default();
     let policy = format!(
         r#"
 version: 1
@@ -359,12 +439,26 @@ network:
       binaries:
         - path: "{}"
 "#,
-        binary_path.to_string_lossy()
+        binary_path
     );
     let upstream = start_mock_tcp_server().await;
-    let (_sandbox_id, addr) = start_proxy_with_policy(&policy, Some(upstream)).await;
+    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
+        &policy,
+        Some(upstream),
+        Vec::new(),
+        Some(store.clone()),
+    )
+    .await;
 
-    let response = send_connect(addr, "inference.local:443").await;
+    let response = send_connect_with_attribution(
+        &store,
+        sandbox_id,
+        addr,
+        "inference.local:443",
+        &binary_path,
+        &"a".repeat(64),
+    )
+    .await;
     assert!(
         response.contains("200"),
         "expected current test binary to match policy, got: {response}"
@@ -394,7 +488,148 @@ network:
     let response = send_connect(addr, "inference.local:443").await;
     assert!(
         response.contains("403"),
-        "expected real binary identity instead of unknown fallback, got: {response}"
+        "expected missing connect-time attribution to deny unknown fallback, got: {response}"
+    );
+}
+
+#[tokio::test]
+async fn binary_policy_denies_wrong_connect_time_binary() {
+    let store = ConnectAttributionStore::default();
+    let policy = r#"
+version: 1
+name: proxy-binary-deny-test
+
+network:
+  mode: proxy
+  policies:
+    - name: allowed-binary
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+      binaries:
+        - path: "/usr/bin/allowed"
+"#;
+    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
+        policy,
+        None,
+        Vec::new(),
+        Some(store.clone()),
+    )
+    .await;
+
+    let response = send_connect_with_attribution(
+        &store,
+        sandbox_id,
+        addr,
+        "inference.local:443",
+        "/usr/bin/denied",
+        &"b".repeat(64),
+    )
+    .await;
+    assert!(
+        response.contains("403"),
+        "expected denied connect-time binary to fail policy, got: {response}"
+    );
+}
+
+#[tokio::test]
+async fn binary_policy_denies_stale_connect_time_record() {
+    let store = ConnectAttributionStore::new(std::time::Duration::from_millis(1));
+    let policy = r#"
+version: 1
+name: proxy-binary-stale-test
+
+network:
+  mode: proxy
+  policies:
+    - name: allowed-binary
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+      binaries:
+        - path: "/usr/bin/allowed"
+"#;
+    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
+        policy,
+        None,
+        Vec::new(),
+        Some(store.clone()),
+    )
+    .await;
+
+    let (socket, peer_addr) = bound_tcp_socket();
+    store
+        .insert(connect_attribution_record(
+            sandbox_id,
+            peer_addr,
+            addr,
+            "/usr/bin/allowed",
+            &"a".repeat(64),
+        ))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let mut stream = socket.connect(addr).await.unwrap();
+
+    let response = send_connect_on_stream(&mut stream, "inference.local:443").await;
+    assert!(
+        response.contains("403"),
+        "expected stale connect-time record to deny, got: {response}"
+    );
+}
+
+#[tokio::test]
+async fn binary_policy_denies_ambiguous_connect_time_records() {
+    let store = ConnectAttributionStore::default();
+    let policy = r#"
+version: 1
+name: proxy-binary-ambiguous-test
+
+network:
+  mode: proxy
+  policies:
+    - name: allowed-binary
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+      binaries:
+        - path: "/usr/bin/allowed"
+"#;
+    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
+        policy,
+        None,
+        Vec::new(),
+        Some(store.clone()),
+    )
+    .await;
+
+    let (socket, peer_addr) = bound_tcp_socket();
+    store
+        .insert(connect_attribution_record(
+            sandbox_id,
+            peer_addr,
+            addr,
+            "/usr/bin/allowed",
+            &"a".repeat(64),
+        ))
+        .unwrap();
+    store
+        .insert(connect_attribution_record(
+            sandbox_id,
+            peer_addr,
+            addr,
+            "/usr/bin/other",
+            &"b".repeat(64),
+        ))
+        .unwrap();
+    let mut stream = socket.connect(addr).await.unwrap();
+
+    let response = send_connect_on_stream(&mut stream, "inference.local:443").await;
+    assert!(
+        response.contains("403"),
+        "expected ambiguous connect-time records to deny, got: {response}"
     );
 }
 

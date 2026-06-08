@@ -15,6 +15,7 @@ use axis_core::policy::ProcessPolicy;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 
 const BPF_LD: u16 = 0x00;
 const BPF_JMP: u16 = 0x05;
@@ -35,6 +36,7 @@ const ARG_SIZE: u32 = 8;
 const AF_UNIX: u32 = 1;
 
 const SYS_SOCKET: u32 = 41;
+const SYS_CONNECT: u32 = 42;
 const SYS_SOCKETPAIR: u32 = 53;
 const SYS_CLONE: u32 = 56;
 const SYS_KILL: u32 = 62;
@@ -222,6 +224,17 @@ pub(crate) struct PreparedSeccompFilter {
 
 impl PreparedSeccompFilter {
     pub(crate) fn apply_current_process(&self) -> Result<(), i32> {
+        self.apply_current_process_with_flags(libc::SECCOMP_FILTER_FLAG_TSYNC as libc::c_long)
+            .map(|_| ())
+    }
+
+    pub(crate) fn apply_current_process_with_listener(&self) -> Result<i32, i32> {
+        self.apply_current_process_with_flags(
+            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER as libc::c_long,
+        )
+    }
+
+    fn apply_current_process_with_flags(&self, flags: libc::c_long) -> Result<i32, i32> {
         let prog = BpfProg {
             len: self.insns.len() as u16,
             filter: self.insns.as_ptr(),
@@ -231,7 +244,7 @@ impl PreparedSeccompFilter {
             libc::syscall(
                 libc::SYS_seccomp,
                 1 as libc::c_long, // SECCOMP_SET_MODE_FILTER
-                1 as libc::c_long, // SECCOMP_FILTER_FLAG_TSYNC
+                flags,
                 &prog as *const BpfProg as libc::c_long,
             )
         };
@@ -239,7 +252,7 @@ impl PreparedSeccompFilter {
         if ret < 0 {
             Err(current_errno())
         } else {
-            Ok(())
+            Ok(ret as i32)
         }
     }
 
@@ -273,6 +286,7 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> BpfInsn {
 enum FilterDecision {
     Allow,
     Errno(i32),
+    UserNotify,
     KillProcess,
 }
 
@@ -294,12 +308,14 @@ pub(crate) enum SocketDomainPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeccompOptions {
     socket_domain_policy: SocketDomainPolicy,
+    notify_connect: bool,
 }
 
 impl Default for SeccompOptions {
     fn default() -> Self {
         Self {
             socket_domain_policy: SocketDomainPolicy::AllowAll,
+            notify_connect: false,
         }
     }
 }
@@ -309,7 +325,13 @@ impl SeccompOptions {
     pub(crate) fn deny_network_socket_domains() -> Self {
         Self {
             socket_domain_policy: SocketDomainPolicy::DenyAllExcept(vec![AF_UNIX]),
+            notify_connect: false,
         }
+    }
+
+    pub(crate) fn notify_connect(mut self) -> Self {
+        self.notify_connect = true;
+        self
     }
 
     #[cfg(test)]
@@ -326,6 +348,7 @@ impl SeccompOptions {
 struct SeccompFilterSpec {
     allowed_syscalls: Vec<u32>,
     socket_domain_policy: SocketDomainPolicy,
+    notify_connect: bool,
     flag_deny_rules: Vec<FlagDenyRule>,
 }
 
@@ -342,9 +365,13 @@ impl SeccompFilterSpec {
         allowed_syscalls.sort();
         allowed_syscalls.dedup();
 
+        let notify_connect =
+            options.notify_connect && allowed_syscalls.binary_search(&SYS_CONNECT).is_ok();
+
         Ok(Self {
             allowed_syscalls,
             socket_domain_policy: options.socket_domain_policy,
+            notify_connect,
             flag_deny_rules: vec![
                 FlagDenyRule {
                     syscall_nr: SYS_CLONE,
@@ -376,6 +403,10 @@ impl SeccompFilterSpec {
 
         if self.denies_socket_domain(syscall_nr, args[0] as u32) {
             return FilterDecision::Errno(libc::EPERM);
+        }
+
+        if self.notify_connect && syscall_nr == SYS_CONNECT {
+            return FilterDecision::UserNotify;
         }
 
         for rule in &self.flag_deny_rules {
@@ -415,6 +446,9 @@ impl SeccompFilterSpec {
         for rule in &self.flag_deny_rules {
             append_flag_deny(&mut insns, *rule);
         }
+        if self.notify_connect {
+            append_syscall_return(&mut insns, SYS_CONNECT, user_notify_return());
+        }
 
         insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
 
@@ -433,6 +467,12 @@ impl SeccompFilterSpec {
         insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
         insns
     }
+}
+
+fn append_syscall_return(insns: &mut Vec<BpfInsn>, syscall_nr: u32, ret: BpfInsn) {
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr, 0, 1));
+    insns.push(ret);
 }
 
 fn append_socket_domain_denies(insns: &mut Vec<BpfInsn>, policy: &SocketDomainPolicy) {
@@ -501,6 +541,10 @@ fn errno_return() -> BpfInsn {
         BPF_RET | BPF_K,
         SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0xFFFF),
     )
+}
+
+fn user_notify_return() -> BpfInsn {
+    bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF)
 }
 
 fn checked_skip(len: usize) -> u8 {
@@ -797,6 +841,53 @@ mod tests {
     }
 
     #[test]
+    fn connect_notification_is_opt_in() {
+        let default_spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+        assert_eq!(
+            default_spec.decision_for(AUDIT_ARCH_X86_64, SYS_CONNECT, [0; 6]),
+            FilterDecision::Allow
+        );
+
+        let notify_spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().notify_connect(),
+        )
+        .unwrap();
+        assert_eq!(
+            notify_spec.decision_for(AUDIT_ARCH_X86_64, SYS_CONNECT, [0; 6]),
+            FilterDecision::UserNotify
+        );
+        assert_eq!(
+            notify_spec.decision_for(AUDIT_ARCH_X86_64, 0, [0; 6]),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn connect_notification_respects_policy_blocked_connect() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["connect".into()],
+            ..Default::default()
+        };
+        let spec =
+            SeccompFilterSpec::from_policy(&policy, SeccompOptions::default().notify_connect())
+                .unwrap();
+
+        assert!(!spec.allowed_syscalls.contains(&SYS_CONNECT));
+        assert!(!spec.notify_connect);
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_CONNECT, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_CONNECT, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+    }
+
+    #[test]
     fn conditional_rules_deny_dangerous_clone_and_unshare_flags() {
         let mut spec =
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
@@ -983,6 +1074,31 @@ mod tests {
                 SYS_SOCKET,
                 [AF_UNIX as u64, 0, 0, 0, 0, 0],
             ),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn generated_bpf_connect_notification_is_opt_in() {
+        let default_spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+        assert_eq!(
+            bpf_decision_for(&default_spec, AUDIT_ARCH_X86_64, SYS_CONNECT, [0; 6]),
+            FilterDecision::Allow
+        );
+
+        let notify_spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().notify_connect(),
+        )
+        .unwrap();
+        assert_eq!(
+            bpf_decision_for(&notify_spec, AUDIT_ARCH_X86_64, SYS_CONNECT, [0; 6]),
+            FilterDecision::UserNotify
+        );
+        assert_eq!(
+            bpf_decision_for(&notify_spec, AUDIT_ARCH_X86_64, 0, [0; 6]),
             FilterDecision::Allow
         );
     }
@@ -1285,6 +1401,8 @@ mod tests {
             FilterDecision::KillProcess
         } else if action == SECCOMP_RET_ALLOW {
             FilterDecision::Allow
+        } else if action == SECCOMP_RET_USER_NOTIF {
+            FilterDecision::UserNotify
         } else if (action & 0xffff_0000) == SECCOMP_RET_ERRNO {
             FilterDecision::Errno((action & 0xffff) as i32)
         } else {

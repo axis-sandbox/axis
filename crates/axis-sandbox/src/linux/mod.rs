@@ -5,6 +5,7 @@
 
 mod bwrap;
 pub mod bypass_audit;
+mod connect_attribution;
 mod identity;
 pub mod landlock;
 pub mod netns;
@@ -13,6 +14,7 @@ pub mod seccomp;
 pub mod strategy;
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
+use axis_core::connect_attribution::policy_requires_connect_attribution;
 use axis_core::types::SandboxId;
 use std::io;
 use std::process::Child;
@@ -282,6 +284,7 @@ pub(crate) struct LinuxSandbox {
     netns_name: Option<String>,
     netns_helper_destroy_token: Option<String>,
     cgroup: Option<resources::CgroupHandle>,
+    connect_supervisor: Option<connect_attribution::ConnectAttributionSupervisor>,
     tmpdir_active: bool,
 }
 
@@ -303,6 +306,7 @@ impl LinuxSandbox {
             netns_name: None,
             netns_helper_destroy_token: None,
             cgroup: None,
+            connect_supervisor: None,
             tmpdir_active: false,
         })
     }
@@ -379,6 +383,57 @@ impl LinuxSandbox {
         }
     }
 
+    fn stop_connect_supervisor(&mut self) {
+        if let Some(mut supervisor) = self.connect_supervisor.take() {
+            supervisor.stop();
+        }
+    }
+
+    fn connect_attribution_required(&self) -> bool {
+        policy_requires_connect_attribution(&self.config.policy)
+    }
+
+    fn connect_attribution_required_for_native_proxy(&self) -> Result<bool, SandboxError> {
+        if !self.connect_attribution_required() {
+            return Ok(false);
+        }
+        match self.plan.network {
+            strategy::NetworkStrategy::Proxy {
+                setup: strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
+                ..
+            } => {
+                if self
+                    .config
+                    .policy
+                    .process
+                    .blocked_syscalls
+                    .iter()
+                    .any(|name| name == "connect")
+                {
+                    return Err(SandboxError::IsolationFailed(
+                        "binary-restricted proxy policy cannot use connect-time attribution when process.blocked_syscalls includes connect"
+                            .into(),
+                    ));
+                }
+                if self.config.connect_attribution.is_none() {
+                    return Err(SandboxError::IsolationFailed(
+                        "binary-restricted proxy policy requires connect-time attribution store"
+                            .into(),
+                    ));
+                }
+                Ok(true)
+            }
+            strategy::NetworkStrategy::Proxy {
+                setup: strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+                ..
+            } => Err(SandboxError::IsolationFailed(
+                "binary-restricted proxy policy requires connect-time attribution, which is not implemented for axis-netns-helper launch"
+                    .into(),
+            )),
+            _ => Ok(false),
+        }
+    }
+
     fn cleanup_after_process_exit(&mut self) -> Option<String> {
         self.cleanup_after_process_exit_with_handlers(
             netns::destroy_netns,
@@ -407,6 +462,7 @@ impl LinuxSandbox {
         H: FnOnce(SandboxId, &str) -> Result<(), String>,
     {
         let mut cleanup_errors = Vec::new();
+        self.stop_connect_supervisor();
         self.finish_parent_death_guard();
         let netns_cleanup = if self.netns_helper_destroy_token.is_some() {
             self.cleanup_netns_with_helper_token(destroy_helper)
@@ -465,6 +521,7 @@ impl LinuxSandbox {
         H: FnOnce(SandboxId, &str) -> Result<(), String>,
     {
         close_fd(netns_fd);
+        self.stop_connect_supervisor();
         let mut cleanup_errors = Vec::new();
         let netns_cleanup = if self.netns_helper_destroy_token.is_some() {
             self.cleanup_netns_with_helper_token(destroy_helper)
@@ -511,7 +568,7 @@ impl LinuxSandbox {
             }
         }
 
-        let seccomp_options = seccomp_options_for_network(&self.plan.network);
+        let seccomp_options = seccomp_options_for_network(&self.plan.network, false);
         let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
             &self.config.policy.process,
             seccomp_options,
@@ -780,6 +837,13 @@ impl LinuxSandbox {
 
     fn start_with_netns_helper(&mut self, proxy_port: u16) -> Result<u32, SandboxError> {
         use std::process::Command;
+
+        if self.connect_attribution_required() {
+            return Err(SandboxError::IsolationFailed(
+                "binary-restricted proxy policy requires connect-time attribution, which is not implemented for axis-netns-helper launch"
+                    .into(),
+            ));
+        }
 
         if self.config.policy.process.run_as_user.is_some() {
             return Err(SandboxError::IsolationFailed(
@@ -1194,8 +1258,11 @@ fn set_resource_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) 
     }
 }
 
-fn seccomp_options_for_network(network: &strategy::NetworkStrategy) -> seccomp::SeccompOptions {
-    match network {
+fn seccomp_options_for_network(
+    network: &strategy::NetworkStrategy,
+    notify_connect: bool,
+) -> seccomp::SeccompOptions {
+    let options = match network {
         strategy::NetworkStrategy::BlockedBySeccomp
         | strategy::NetworkStrategy::BlockedByBubblewrap => {
             seccomp::SeccompOptions::deny_network_socket_domains()
@@ -1203,6 +1270,11 @@ fn seccomp_options_for_network(network: &strategy::NetworkStrategy) -> seccomp::
         strategy::NetworkStrategy::AllowHost | strategy::NetworkStrategy::Proxy { .. } => {
             seccomp::SeccompOptions::default()
         }
+    };
+    if notify_connect {
+        options.notify_connect()
+    } else {
+        options
     }
 }
 
@@ -1502,7 +1574,8 @@ impl SandboxImpl for LinuxSandbox {
             self.tmpdir_active = tmpdir_required;
             ruleset
         };
-        let seccomp_options = seccomp_options_for_network(&self.plan.network);
+        let notify_connect = self.connect_attribution_required_for_native_proxy()?;
+        let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect);
         let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
             &self.config.policy.process,
             seccomp_options,
@@ -1515,6 +1588,42 @@ impl SandboxImpl for LinuxSandbox {
                     cleanup_error,
                 ));
             }
+        };
+        let mut seccomp_listener_pair = if notify_connect {
+            match connect_attribution::SeccompListenerPair::new() {
+                Ok(pair) => Some(pair),
+                Err(e) => {
+                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(format!(
+                            "connect attribution listener channel: {e}"
+                        )),
+                        cleanup_error,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let seccomp_listener_child_fd = seccomp_listener_pair
+            .as_ref()
+            .and_then(|pair| pair.child_fd());
+        let connect_supervisor_config = if notify_connect {
+            Some(connect_attribution::ConnectSupervisorConfig {
+                sandbox_id,
+                proxy_addr: self.config.proxy_addr.ok_or_else(|| {
+                    SandboxError::IsolationFailed(
+                        "connect attribution requires proxy bind address".into(),
+                    )
+                })?,
+                store: self.config.connect_attribution.clone().ok_or_else(|| {
+                    SandboxError::IsolationFailed(
+                        "connect attribution requires shared attribution store".into(),
+                    )
+                })?,
+            })
+        } else {
+            None
         };
         let prepared_rlimits =
             match prepare_rlimits_for_plan(&self.config.policy.process, &self.plan.resources) {
@@ -1795,7 +1904,34 @@ impl SandboxImpl for LinuxSandbox {
                 }
 
                 // 11. seccomp-BPF syscall filter (must be last - it restricts further syscalls).
-                if let Err(e) = prepared_seccomp.apply_current_process() {
+                if let Some(listener_socket_fd) = seccomp_listener_child_fd {
+                    match prepared_seccomp.apply_current_process_with_listener() {
+                        Ok(listener_fd) => {
+                            if let Err(errno) = connect_attribution::send_listener_fd(
+                                listener_socket_fd,
+                                listener_fd,
+                            ) {
+                                libc::close(listener_fd);
+                                libc::close(listener_socket_fd);
+                                return Err(child_setup_error(
+                                    child_error_write_fd,
+                                    ChildSetupErrorKind::Seccomp,
+                                    errno,
+                                ));
+                            }
+                            libc::close(listener_fd);
+                            libc::close(listener_socket_fd);
+                        }
+                        Err(errno) => {
+                            libc::close(listener_socket_fd);
+                            return Err(child_setup_error(
+                                child_error_write_fd,
+                                ChildSetupErrorKind::Seccomp,
+                                errno,
+                            ));
+                        }
+                    }
+                } else if let Err(e) = prepared_seccomp.apply_current_process() {
                     return Err(child_setup_error(
                         child_error_write_fd,
                         ChildSetupErrorKind::Seccomp,
@@ -1811,6 +1947,9 @@ impl SandboxImpl for LinuxSandbox {
             Ok(child) => {
                 close_fd(netns_fd);
                 close_fd(cgroup_procs_fd);
+                if let Some(pair) = seccomp_listener_pair.as_mut() {
+                    pair.close_child_in_parent();
+                }
                 drop(child_error_pipe);
                 child
             }
@@ -1825,6 +1964,46 @@ impl SandboxImpl for LinuxSandbox {
         };
 
         let pid = child.id();
+        if let Some(mut pair) = seccomp_listener_pair.take() {
+            let listener_fd = match pair.recv_listener_fd() {
+                Ok(fd) => fd,
+                Err(e) => {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    kill_process_group(pid as i32);
+                    let _ = wait_for_killed_child(&mut child, pid as i32);
+                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(format!(
+                            "connect attribution listener receive failed: {e}"
+                        )),
+                        cleanup_error,
+                    ));
+                }
+            };
+            let config = connect_supervisor_config
+                .clone()
+                .expect("connect supervisor config exists when listener pair exists");
+            match connect_attribution::ConnectAttributionSupervisor::start(listener_fd, config) {
+                Ok(supervisor) => self.connect_supervisor = Some(supervisor),
+                Err(e) => {
+                    close_fd(Some(listener_fd));
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    kill_process_group(pid as i32);
+                    let _ = wait_for_killed_child(&mut child, pid as i32);
+                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(format!(
+                            "connect attribution supervisor failed: {e}"
+                        )),
+                        cleanup_error,
+                    ));
+                }
+            }
+        }
         let parent_death_guard =
             match ParentDeathGuard::spawn_for_process_group(pid as i32, parent_death_guard_pipe) {
                 Ok(guard) => guard,
@@ -1939,6 +2118,7 @@ impl SandboxImpl for LinuxSandbox {
             kill_process_group(pid);
         }
         self.finish_parent_death_guard();
+        self.stop_connect_supervisor();
 
         let mut cleanup_errors = Vec::new();
         if let Some(e) = self.cleanup_netns() {
@@ -2033,8 +2213,8 @@ fn kill_process_group(pid: i32) {
 mod tests {
     use super::*;
     use axis_core::policy::{
-        Compatibility, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy,
-        Policy, ProcessPolicy, SshPolicy,
+        BinaryMatch, Compatibility, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy,
+        InferencePolicy, NetworkMode, NetworkPolicy, Policy, ProcessPolicy, SshPolicy,
     };
     use axis_core::types::SandboxId;
     use std::io::Write;
@@ -2799,23 +2979,129 @@ mod tests {
     #[test]
     fn seccomp_options_follow_network_strategy() {
         assert!(
-            seccomp_options_for_network(&strategy::NetworkStrategy::BlockedBySeccomp)
+            seccomp_options_for_network(&strategy::NetworkStrategy::BlockedBySeccomp, false)
                 .denies_non_unix_socket_domains()
         );
         assert!(
-            !seccomp_options_for_network(&strategy::NetworkStrategy::AllowHost)
+            !seccomp_options_for_network(&strategy::NetworkStrategy::AllowHost, false)
                 .denies_non_unix_socket_domains()
         );
         assert!(
-            !seccomp_options_for_network(&strategy::NetworkStrategy::Proxy {
-                setup: strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
-                firewall: Some(strategy::FirewallTool::Iptables),
-                host_addr: Ipv4Addr::new(10, 200, 0, 1),
-                sandbox_addr: Ipv4Addr::new(10, 200, 0, 2),
-                proxy_port: 3128,
-            })
+            !seccomp_options_for_network(
+                &strategy::NetworkStrategy::Proxy {
+                    setup: strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
+                    firewall: Some(strategy::FirewallTool::Iptables),
+                    host_addr: Ipv4Addr::new(10, 200, 0, 1),
+                    sandbox_addr: Ipv4Addr::new(10, 200, 0, 2),
+                    proxy_port: 3128,
+                },
+                false
+            )
             .denies_non_unix_socket_domains()
         );
+    }
+
+    #[test]
+    fn binary_restricted_proxy_requires_attribution_store_for_native_proxy() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000201").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.policy = binary_restricted_proxy_policy();
+        sandbox.config.proxy_addr = Some(proxy_bind_addr(id, 3128));
+        sandbox.plan.network = native_proxy_network(id, 3128);
+
+        let err = sandbox
+            .connect_attribution_required_for_native_proxy()
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::IsolationFailed(message) if message.contains("requires connect-time attribution store"))
+        );
+    }
+
+    #[test]
+    fn binary_restricted_proxy_allows_native_proxy_with_attribution_store() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000202").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.policy = binary_restricted_proxy_policy();
+        sandbox.config.proxy_addr = Some(proxy_bind_addr(id, 3128));
+        sandbox.config.connect_attribution =
+            Some(axis_core::connect_attribution::ConnectAttributionStore::default());
+        sandbox.plan.network = native_proxy_network(id, 3128);
+
+        assert!(
+            sandbox
+                .connect_attribution_required_for_native_proxy()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn binary_restricted_native_proxy_rejects_policy_blocked_connect() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000204").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.policy = binary_restricted_proxy_policy();
+        sandbox.config.policy.process.blocked_syscalls = vec!["connect".into()];
+        sandbox.config.proxy_addr = Some(proxy_bind_addr(id, 3128));
+        sandbox.config.connect_attribution =
+            Some(axis_core::connect_attribution::ConnectAttributionStore::default());
+        sandbox.plan.network = native_proxy_network(id, 3128);
+
+        let err = sandbox
+            .connect_attribution_required_for_native_proxy()
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::IsolationFailed(message) if message.contains("blocked_syscalls includes connect"))
+        );
+    }
+
+    #[test]
+    fn binary_restricted_proxy_rejects_helper_launch_without_record_channel() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000203").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.policy = binary_restricted_proxy_policy();
+        sandbox.config.proxy_addr = Some(proxy_bind_addr(id, 3128));
+        let allocation = netns::proxy_netns_allocation(id, 3128);
+        sandbox.plan.network = strategy::NetworkStrategy::Proxy {
+            setup: strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+            firewall: Some(strategy::FirewallTool::Iptables),
+            host_addr: allocation.host_addr,
+            sandbox_addr: allocation.sandbox_addr,
+            proxy_port: 3128,
+        };
+
+        let err = sandbox
+            .connect_attribution_required_for_native_proxy()
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::IsolationFailed(message) if message.contains("axis-netns-helper launch"))
+        );
+    }
+
+    #[test]
+    fn start_rejects_binary_restricted_helper_launch_without_record_channel() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000205").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.policy = binary_restricted_proxy_policy();
+        sandbox.config.proxy_addr = Some(proxy_bind_addr(id, 3128));
+        let allocation = netns::proxy_netns_allocation(id, 3128);
+        sandbox.plan.network = strategy::NetworkStrategy::Proxy {
+            setup: strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+            firewall: Some(strategy::FirewallTool::Iptables),
+            host_addr: allocation.host_addr,
+            sandbox_addr: allocation.sandbox_addr,
+            proxy_port: 3128,
+        };
+
+        match SandboxImpl::start(&mut sandbox) {
+            Err(SandboxError::IsolationFailed(message)) => {
+                assert!(message.contains("axis-netns-helper launch"));
+            }
+            other => panic!("expected helper launch attribution rejection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2953,6 +3239,7 @@ mod tests {
             ],
             proxy_port: 0,
             proxy_addr: None,
+            connect_attribution: None,
             capture_output: false,
             timeout_sec: None,
         };
@@ -3444,6 +3731,7 @@ mod tests {
                 env: Vec::new(),
                 proxy_port: 0,
                 proxy_addr: None,
+                connect_attribution: None,
                 capture_output: false,
                 timeout_sec: None,
             },
@@ -3454,6 +3742,7 @@ mod tests {
             netns_name: None,
             netns_helper_destroy_token: None,
             cgroup: None,
+            connect_supervisor: None,
             tmpdir_active: false,
         }
     }
@@ -3472,6 +3761,42 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+        }
+    }
+
+    fn binary_restricted_proxy_policy() -> Policy {
+        let mut policy = test_policy();
+        policy.network = NetworkPolicy {
+            mode: NetworkMode::Proxy,
+            policies: vec![EndpointPolicy {
+                name: "api".into(),
+                endpoints: vec![Endpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    access: axis_core::policy::Access::ReadWrite,
+                    protocol: None,
+                    rules: Vec::new(),
+                }],
+                binaries: vec![BinaryMatch {
+                    path: "/usr/bin/curl".into(),
+                }],
+            }],
+        };
+        policy
+    }
+
+    fn proxy_bind_addr(id: SandboxId, proxy_port: u16) -> std::net::SocketAddr {
+        netns::proxy_netns_allocation(id, proxy_port).proxy_addr
+    }
+
+    fn native_proxy_network(id: SandboxId, proxy_port: u16) -> strategy::NetworkStrategy {
+        let allocation = netns::proxy_netns_allocation(id, proxy_port);
+        strategy::NetworkStrategy::Proxy {
+            setup: strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
+            firewall: Some(strategy::FirewallTool::Iptables),
+            host_addr: allocation.host_addr,
+            sandbox_addr: allocation.sandbox_addr,
+            proxy_port,
         }
     }
 

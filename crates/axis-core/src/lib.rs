@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod bench;
+pub mod connect_attribution;
 pub mod opa;
 pub mod policy;
 pub mod sandbox_env;

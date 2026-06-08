@@ -70,6 +70,7 @@ network:
         env: vec![],
         proxy_port: 0,
         proxy_addr: None,
+        connect_attribution: None,
         capture_output: false,
         timeout_sec: None,
     };
@@ -114,6 +115,7 @@ network:
         enable_leak_detection: false,
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
+        connect_attribution: None,
     };
 
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -225,6 +227,7 @@ network:
         enable_leak_detection: true,
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
+        connect_attribution: None,
     };
 
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -374,6 +377,7 @@ async fn main() {
             enable_leak_detection: true,
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
+            connect_attribution: None,
         };
         let _proxy = axis_proxy::proxy::AxisProxy::new(config).unwrap();
         let rss_after = measure_memory_overhead();

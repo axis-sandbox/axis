@@ -3,11 +3,12 @@
 
 //! Binary identity via SHA256 Trust-on-First-Use (TOFU) fingerprinting.
 //!
-//! When a process makes a network request through the proxy, we identify
-//! the calling binary by resolving /proc/[pid]/net/tcp → socket inode →
-//! /proc/[pid]/fd → /proc/[pid]/exe and computing a SHA256 hash. The first
-//! time a binary is seen, its hash is recorded. Subsequent requests verify
-//! the hash matches.
+//! For Linux policies with binary allowlists, the proxy consumes
+//! kernel-observed connect-time records produced by the sandbox launcher. This
+//! module provides the `/proc` accept-time resolver used only as a fallback for
+//! policies whose semantics do not depend on binary identity as a hard security
+//! boundary. The first time a binary is seen, its hash is recorded. Subsequent
+//! requests verify the hash matches.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

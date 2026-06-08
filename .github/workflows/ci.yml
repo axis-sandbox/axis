@@ -69,6 +69,11 @@ jobs:
       - name: Unit & integration tests
         run: cargo test
 
+      - name: Seccomp notify connect attribution proof
+        env:
+          AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION: "1"
+        run: cargo test -p axis-sandbox gated_seccomp_notify_records_connecting_executable_before_fd_handoff_exec -- --nocapture
+
       - name: Standalone Linux e2e test
         run: bash e2e/linux/test_sandbox.sh ./target/release/axis
 

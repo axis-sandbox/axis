@@ -3,6 +3,7 @@
 
 //! Sandbox trait and configuration.
 
+use axis_core::connect_attribution::ConnectAttributionStore;
 use axis_core::policy::Policy;
 use axis_core::types::{SandboxId, SandboxStatus};
 use std::path::PathBuf;
@@ -41,6 +42,7 @@ pub struct SandboxConfig {
     pub env: Vec<(String, String)>,
     pub proxy_port: u16,
     pub proxy_addr: Option<std::net::SocketAddr>,
+    pub connect_attribution: Option<ConnectAttributionStore>,
     /// Capture stdout/stderr to files in workspace (for daemon mode).
     /// When false, child inherits parent's stdio (for standalone/run mode).
     pub capture_output: bool,
@@ -285,6 +287,7 @@ mod tests {
             env: Vec::new(),
             proxy_port: 0,
             proxy_addr: None,
+            connect_attribution: None,
             capture_output: false,
             timeout_sec: None,
         }

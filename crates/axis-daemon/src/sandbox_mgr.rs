@@ -129,7 +129,7 @@ impl SandboxManager {
         let inference_endpoint = ensure_inference_server_from_shared(mgr.clone(), &policy).await;
 
         // 2. Start the proxy only for proxy-mode policies.
-        let (proxy_addr, proxy_shutdown) =
+        let (proxy_addr, proxy_shutdown, connect_attribution) =
             match start_proxy_for_sandbox(id, &policy, inference_endpoint).await {
                 Ok(proxy) => proxy,
                 Err(e) => {
@@ -166,6 +166,7 @@ impl SandboxManager {
             extra_env,
             workspace_dir.clone(),
             proxy_addr,
+            connect_attribution,
             proxy_shutdown,
         ) {
             Ok(managed) => managed,
@@ -588,6 +589,7 @@ fn start_managed_sandbox(
     extra_env: Vec<(String, String)>,
     workspace_dir: PathBuf,
     proxy_addr: Option<SocketAddr>,
+    connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
     proxy_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<ManagedSandbox, String> {
     let mut all_env = env;
@@ -606,6 +608,7 @@ fn start_managed_sandbox(
         env: all_env.clone(),
         proxy_port: proxy_addr.map(|addr| addr.port()).unwrap_or(0),
         proxy_addr,
+        connect_attribution,
         capture_output: true,
         timeout_sec,
     };
@@ -825,7 +828,7 @@ async fn run_contained_exec(
         exec_id,
         policy_uses_proxy(&policy),
     );
-    let (exec_proxy_addr, mut exec_proxy_shutdown) =
+    let (exec_proxy_addr, mut exec_proxy_shutdown, exec_connect_attribution) =
         start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
     let config = contained_exec_config_from(
         &policy,
@@ -833,6 +836,7 @@ async fn run_contained_exec(
         &env,
         exec_id,
         exec_proxy_addr,
+        exec_connect_attribution,
         command.clone(),
         args.clone(),
     );
@@ -947,18 +951,37 @@ async fn start_proxy_for_sandbox(
     id: SandboxId,
     policy: &Policy,
     inference_endpoint: Option<SocketAddr>,
-) -> Result<(Option<SocketAddr>, Option<tokio::sync::oneshot::Sender<()>>), String> {
+) -> Result<
+    (
+        Option<SocketAddr>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+        Option<axis_core::connect_attribution::ConnectAttributionStore>,
+    ),
+    String,
+> {
     if !policy_uses_proxy(policy) {
         tracing::info!(
             "sandbox {id}: network proxy disabled for {:?} mode",
             policy.network.mode
         );
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
 
     let proxy_port = allocate_port();
-    let proxy_config = proxy_config_for_sandbox(id, policy, inference_endpoint, proxy_port)
-        .expect("proxy config must exist for proxy-mode policy");
+    let connect_attribution =
+        if axis_core::connect_attribution::policy_requires_connect_attribution(policy) {
+            Some(axis_core::connect_attribution::ConnectAttributionStore::default())
+        } else {
+            None
+        };
+    let proxy_config = proxy_config_for_sandbox(
+        id,
+        policy,
+        inference_endpoint,
+        proxy_port,
+        connect_attribution.clone(),
+    )
+    .expect("proxy config must exist for proxy-mode policy");
 
     let mut proxy = AxisProxy::new(proxy_config).map_err(|e| format!("proxy init: {e}"))?;
     let proxy_addr = proxy.bind().await.map_err(|e| format!("proxy bind: {e}"))?;
@@ -979,7 +1002,7 @@ async fn start_proxy_for_sandbox(
         }
     });
 
-    Ok((Some(proxy_addr), Some(shutdown_tx)))
+    Ok((Some(proxy_addr), Some(shutdown_tx), connect_attribution))
 }
 
 fn proxy_config_for_sandbox(
@@ -987,6 +1010,7 @@ fn proxy_config_for_sandbox(
     policy: &Policy,
     inference_endpoint: Option<SocketAddr>,
     proxy_port: u16,
+    connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
 ) -> Option<ProxyConfig> {
     if !policy_uses_proxy(policy) {
         return None;
@@ -1000,6 +1024,7 @@ fn proxy_config_for_sandbox(
         enable_leak_detection: true,
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint,
+        connect_attribution,
     })
 }
 
@@ -1250,6 +1275,7 @@ fn contained_exec_config_from(
     env: &[(String, String)],
     exec_id: SandboxId,
     proxy_addr: Option<SocketAddr>,
+    connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
     command: String,
     args: Vec<String>,
 ) -> SandboxConfig {
@@ -1276,6 +1302,7 @@ fn contained_exec_config_from(
         env: env.to_vec(),
         proxy_port: proxy_addr.map(|addr| addr.port()).unwrap_or(0),
         proxy_addr,
+        connect_attribution,
         capture_output: true,
         timeout_sec,
     }
@@ -1522,7 +1549,7 @@ mod tests {
         for mode in [NetworkMode::Block, NetworkMode::Allow] {
             let policy = test_policy(mode);
 
-            assert!(proxy_config_for_sandbox(id, &policy, None, 3128).is_none());
+            assert!(proxy_config_for_sandbox(id, &policy, None, 3128, None).is_none());
         }
     }
 
@@ -1531,7 +1558,7 @@ mod tests {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let policy = test_policy(NetworkMode::Proxy);
         let inference_endpoint = Some("127.0.0.1:9000".parse().unwrap());
-        let config = proxy_config_for_sandbox(id, &policy, inference_endpoint, 3128)
+        let config = proxy_config_for_sandbox(id, &policy, inference_endpoint, 3128, None)
             .expect("proxy mode should plan a proxy config");
 
         assert_eq!(config.sandbox_id, id);
@@ -1550,11 +1577,12 @@ mod tests {
 
         for mode in [NetworkMode::Block, NetworkMode::Allow] {
             let policy = test_policy(mode);
-            let (proxy_addr, proxy_shutdown) =
+            let (proxy_addr, proxy_shutdown, connect_attribution) =
                 start_proxy_for_sandbox(id, &policy, None).await.unwrap();
 
             assert!(proxy_addr.is_none());
             assert!(proxy_shutdown.is_none());
+            assert!(connect_attribution.is_none());
         }
     }
 
@@ -1699,6 +1727,7 @@ mod tests {
             &[("PATH".into(), "/bin".into())],
             exec_id,
             None,
+            None,
             "true".into(),
             Vec::new(),
         );
@@ -1737,6 +1766,7 @@ mod tests {
             &[("PATH".into(), "/bin".into())],
             exec_id,
             Some(proxy_addr),
+            None,
             "true".into(),
             Vec::new(),
         );
@@ -1775,6 +1805,7 @@ mod tests {
             &workspace,
             &[],
             exec_id,
+            None,
             None,
             "true".into(),
             Vec::new(),

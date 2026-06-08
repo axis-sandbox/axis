@@ -688,11 +688,20 @@ async fn main() -> Result<()> {
                     let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
                     let sandbox_id = axis_core::types::SandboxId::new();
                     let workspace = tempfile::tempdir()?;
+                    let connect_attribution =
+                        if axis_core::connect_attribution::policy_requires_connect_attribution(
+                            &policy,
+                        ) {
+                            Some(axis_core::connect_attribution::ConnectAttributionStore::default())
+                        } else {
+                            None
+                        };
 
                     // Start an inline proxy if policy uses proxy mode.
                     let proxy_addr = match standalone_proxy_config_for_sandbox(
                         sandbox_id,
                         &policy,
+                        connect_attribution.clone(),
                     ) {
                         Some(proxy_config) => {
                             let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
@@ -737,6 +746,7 @@ async fn main() -> Result<()> {
                         env,
                         proxy_port,
                         proxy_addr,
+                        connect_attribution,
                         capture_output: false,
                         timeout_sec,
                     };
@@ -1035,6 +1045,7 @@ fn proxy_bind_addr_for_sandbox(
 fn standalone_proxy_config_for_sandbox(
     id: axis_core::types::SandboxId,
     policy: &axis_core::policy::Policy,
+    connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
 ) -> Option<axis_proxy::proxy::ProxyConfig> {
     if !matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
         return None;
@@ -1048,6 +1059,7 @@ fn standalone_proxy_config_for_sandbox(
         enable_leak_detection: true,
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
+        connect_attribution,
     })
 }
 
@@ -1151,7 +1163,7 @@ mod tests {
         for mode in [NetworkMode::Block, NetworkMode::Allow] {
             let policy = test_policy(mode);
 
-            assert!(standalone_proxy_config_for_sandbox(id, &policy).is_none());
+            assert!(standalone_proxy_config_for_sandbox(id, &policy, None).is_none());
         }
     }
 
@@ -1159,7 +1171,7 @@ mod tests {
     fn standalone_proxy_config_uses_netns_bind_addr_for_proxy_mode() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let policy = test_policy(NetworkMode::Proxy);
-        let config = standalone_proxy_config_for_sandbox(id, &policy)
+        let config = standalone_proxy_config_for_sandbox(id, &policy, None)
             .expect("proxy mode should plan an inline proxy");
 
         assert_eq!(config.sandbox_id, id);

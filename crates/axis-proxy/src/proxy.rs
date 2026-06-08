@@ -11,6 +11,10 @@
 //! 5. Log decision via OCSF audit
 
 use axis_core::audit::AuditLog;
+use axis_core::connect_attribution::{
+    ConnectAttributionError, ConnectAttributionRecord, ConnectAttributionStore,
+    policy_requires_connect_attribution,
+};
 use axis_core::opa::PolicyEngine;
 use axis_core::policy::Policy;
 use axis_core::types::{NetworkAction, SandboxId};
@@ -28,6 +32,8 @@ use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
 use crate::secrets::CredentialInjector;
 
 const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
+const CONNECT_ATTRIBUTION_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+const CONNECT_ATTRIBUTION_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -63,6 +69,9 @@ pub struct ProxyConfig {
     /// When set, CONNECT requests to `inference.local` are routed here
     /// instead of the real internet.
     pub inference_endpoint: Option<SocketAddr>,
+    /// Connect-time identity records produced by a platform-specific sandbox
+    /// launcher. Policies with binary allowlists require this hard boundary.
+    pub connect_attribution: Option<ConnectAttributionStore>,
 }
 
 /// Shared state for the proxy, protected by a Mutex for thread-safe access.
@@ -73,6 +82,8 @@ struct ProxyState {
     leak_detector: Option<LeakDetector>,
     credential_injector: CredentialInjector,
     upstream_tls_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    connect_attribution: Option<ConnectAttributionStore>,
+    requires_connect_attribution: bool,
 }
 
 /// An AXIS HTTP CONNECT proxy serving a single sandbox.
@@ -109,6 +120,7 @@ impl AxisProxy {
         }
         let upstream_tls_roots = parse_upstream_tls_roots(&config.upstream_tls_roots_pem)
             .map_err(|e| ProxyError::BindFailed(format!("upstream TLS roots: {e}")))?;
+        let requires_connect_attribution = policy_requires_connect_attribution(&config.policy);
 
         let state = Arc::new(Mutex::new(ProxyState {
             policy_engine,
@@ -117,6 +129,8 @@ impl AxisProxy {
             leak_detector,
             credential_injector,
             upstream_tls_roots,
+            connect_attribution: config.connect_attribution.clone(),
+            requires_connect_attribution,
         }));
 
         Ok(Self {
@@ -149,11 +163,6 @@ impl AxisProxy {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let proxy_addr = stream.local_addr()?;
-            // Resolve immediately after accept, before any sandbox-controlled
-            // request bytes are consumed. TCP does not expose kernel
-            // connect-time credentials, so ambiguous proc identities fail
-            // closed inside the resolver.
-            let binary_identity = resolve_binary_identity(peer_addr, proxy_addr);
             let sandbox_id = self.config.sandbox_id;
             let state = Arc::clone(&self.state);
             let enable_l7 = self.config.enable_l7;
@@ -164,7 +173,7 @@ impl AxisProxy {
                     sandbox_id,
                     stream,
                     peer_addr,
-                    binary_identity,
+                    proxy_addr,
                     state,
                     enable_l7,
                     inference_endpoint,
@@ -242,13 +251,14 @@ async fn handle_connection(
     sandbox_id: SandboxId,
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
-    binary_identity: Result<Option<BinaryFingerprint>, IdentityError>,
+    proxy_addr: SocketAddr,
     state: Arc<Mutex<ProxyState>>,
     enable_l7: bool,
     inference_endpoint: Option<SocketAddr>,
 ) -> Result<(), ProxyError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    let binary_identity = resolve_binary_identity(sandbox_id, peer_addr, proxy_addr, &state).await;
     let identity_check = {
         let mut st = state.lock().unwrap();
         verify_binary_identity(&mut st.tofu_store, binary_identity)
@@ -793,12 +803,44 @@ fn find_http_head_end(bytes: &[u8]) -> Option<usize> {
         })
 }
 
-/// Resolve the calling binary path from the peer address.
-/// On Linux: /proc/[pid]/net/tcp → socket inode → PID → /proc/[pid]/exe.
-fn resolve_binary_identity(
+/// Resolve the calling binary before any sandbox-controlled request bytes are
+/// consumed. Binary-restricted policies require a kernel-observed connect-time
+/// record. The Linux /proc resolver remains a fallback only for policies whose
+/// semantics do not depend on binary identity as a hard boundary.
+async fn resolve_binary_identity(
+    sandbox_id: SandboxId,
     peer_addr: SocketAddr,
     proxy_addr: SocketAddr,
+    state: &Arc<Mutex<ProxyState>>,
 ) -> Result<Option<BinaryFingerprint>, IdentityError> {
+    let (connect_attribution, requires_connect_attribution) = {
+        let st = state.lock().unwrap();
+        (
+            st.connect_attribution.clone(),
+            st.requires_connect_attribution,
+        )
+    };
+
+    if let Some(store) = connect_attribution {
+        match wait_for_connect_attribution(&store, sandbox_id, peer_addr, proxy_addr).await {
+            Ok(record) => return Ok(Some(record.into())),
+            Err(error) if requires_connect_attribution => {
+                return Err(connect_attribution_identity_error(error));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "sandbox {sandbox_id}: no connect-time attribution for {peer_addr} -> {proxy_addr}: {error}"
+                );
+            }
+        }
+    } else if requires_connect_attribution {
+        return Err(IdentityError::ResolveFailed {
+            pid: 0,
+            reason: "connect-time attribution is required by binary-restricted policy but is not configured"
+                .into(),
+        });
+    }
+
     #[cfg(target_os = "linux")]
     {
         crate::identity::resolve_peer_identity(peer_addr, proxy_addr).map(Some)
@@ -808,6 +850,41 @@ fn resolve_binary_identity(
         let _ = peer_addr;
         let _ = proxy_addr;
         Ok(None)
+    }
+}
+
+async fn wait_for_connect_attribution(
+    store: &ConnectAttributionStore,
+    sandbox_id: SandboxId,
+    peer_addr: SocketAddr,
+    proxy_addr: SocketAddr,
+) -> Result<ConnectAttributionRecord, ConnectAttributionError> {
+    let started = std::time::Instant::now();
+    loop {
+        match store.consume(sandbox_id, peer_addr, proxy_addr) {
+            Err(ConnectAttributionError::Missing { .. })
+                if started.elapsed() < CONNECT_ATTRIBUTION_WAIT =>
+            {
+                tokio::time::sleep(CONNECT_ATTRIBUTION_RETRY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+impl From<ConnectAttributionRecord> for BinaryFingerprint {
+    fn from(record: ConnectAttributionRecord) -> Self {
+        Self {
+            path: record.executable_path,
+            sha256: record.executable_sha256,
+        }
+    }
+}
+
+fn connect_attribution_identity_error(error: ConnectAttributionError) -> IdentityError {
+    IdentityError::ResolveFailed {
+        pid: 0,
+        reason: format!("connect-time attribution failed: {error}"),
     }
 }
 
@@ -1005,6 +1082,7 @@ mod tests {
             enable_leak_detection: true,
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
+            connect_attribution: None,
         };
         let proxy = AxisProxy::new(config);
         assert!(proxy.is_ok(), "proxy creation failed: {:?}", proxy.err());
@@ -1032,6 +1110,7 @@ network:
             enable_leak_detection: false,
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
+            connect_attribution: None,
         };
         let proxy = AxisProxy::new(config).unwrap();
         // Verify the proxy state was initialized correctly.

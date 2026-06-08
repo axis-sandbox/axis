@@ -61,6 +61,16 @@ Credential injection is intentionally fail-closed:
 - L7-readable HTTP is required. Real HTTPS providers require the L7 TLS
   termination and per-sandbox CA trust path to be configured.
 
+## Proxy Binary Identity
+
+Proxy endpoint policies with `binaries` require Linux native proxy launch with
+seccomp-notify connect attribution. The attribution supervisor records the
+executable that created the socket before the process can exec or hand the fd to
+another binary. If that mechanism is unavailable, AXIS fails closed instead of
+falling back to accept-time `/proc` identity for binary allowlists. The
+`axis-netns-helper` launch path does not yet publish connect-time records, so
+binary-restricted proxy policies are rejected on helper-only hosts.
+
 ## Optional Netns Helper
 
 Proxy mode needs network namespace and firewall setup. Standard user processes
