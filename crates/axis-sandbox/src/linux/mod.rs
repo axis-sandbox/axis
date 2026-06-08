@@ -3,6 +3,7 @@
 
 //! Linux sandbox implementation using Landlock, seccomp-BPF, and network namespaces.
 
+mod identity;
 pub mod landlock;
 pub mod netns;
 pub mod resources;
@@ -31,12 +32,6 @@ struct CapData {
     effective: u32,
     permitted: u32,
     inheritable: u32,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedIdentity {
-    uid: u32,
-    gid: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,30 +288,15 @@ impl LinuxSandbox {
         match &self.plan.identity {
             strategy::IdentityStrategy::CurrentUser => Ok(None),
             strategy::IdentityStrategy::RunAsUser { username } => {
-                let user = nix::unistd::User::from_name(username)
-                    .map_err(|e| {
-                        SandboxError::IsolationFailed(format!(
-                            "cannot resolve run_as_user '{username}': {e}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        SandboxError::IsolationFailed(format!(
-                            "run_as_user '{username}' does not exist"
-                        ))
-                    })?;
-                if user.uid.as_raw() == 0 || user.gid.as_raw() == 0 {
-                    return Err(SandboxError::IsolationFailed(format!(
-                        "run_as_user '{username}' must not resolve to UID or GID 0"
-                    )));
-                }
-                Ok(Some(ResolvedIdentity {
-                    uid: user.uid.as_raw(),
-                    gid: user.gid.as_raw(),
-                }))
+                identity::resolve_run_as_user(username, &identity::SystemUserLookup)
+                    .map(Some)
+                    .map_err(SandboxError::IsolationFailed)
             }
         }
     }
 }
+
+type ResolvedIdentity = identity::ResolvedIdentity;
 
 fn close_fd(fd: Option<i32>) {
     if let Some(fd) = fd {
@@ -593,10 +573,42 @@ impl SandboxImpl for LinuxSandbox {
         );
         let resolved_identity = self.resolve_identity()?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
-        let prepared_landlock =
-            landlock::prepare_landlock(&self.config.policy.filesystem, &self.config.workspace_dir)
-                .map_err(SandboxError::IsolationFailed)?;
-        self.tmpdir_active = tmpdir_required;
+        if let Some(identity) = &resolved_identity {
+            identity::prepare_workspace_for_identity(&self.config.workspace_dir, identity)
+                .map_err(|e| SandboxError::IsolationFailed(format!("run_as_user: {e}")))?;
+        }
+        let prepared_landlock = if resolved_identity.is_some() && tmpdir_required {
+            let identity = resolved_identity
+                .as_ref()
+                .expect("identity existence checked above");
+            if let Err(e) = identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
+            {
+                return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
+            }
+            self.tmpdir_active = true;
+            match landlock::prepare_landlock_with_tmpdir_setup(
+                &self.config.policy.filesystem,
+                &self.config.workspace_dir,
+                landlock::TmpdirSetup::AlreadyPrepared,
+            ) {
+                Ok(ruleset) => ruleset,
+                Err(e) => {
+                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                    return Err(append_cleanup_failure(
+                        SandboxError::IsolationFailed(e),
+                        cleanup_error,
+                    ));
+                }
+            }
+        } else {
+            let ruleset = landlock::prepare_landlock(
+                &self.config.policy.filesystem,
+                &self.config.workspace_dir,
+            )
+            .map_err(SandboxError::IsolationFailed)?;
+            self.tmpdir_active = tmpdir_required;
+            ruleset
+        };
         let seccomp_options = seccomp_options_for_network(&self.plan.network);
         let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
             &self.config.policy.process,
@@ -1066,12 +1078,13 @@ fn kill_process_group(pid: i32) {
 mod tests {
     use super::*;
     use axis_core::policy::{
-        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, Policy,
-        ProcessPolicy, SshPolicy,
+        Compatibility, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy,
+        Policy, ProcessPolicy, SshPolicy,
     };
     use axis_core::types::SandboxId;
     use std::io::Write;
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -1660,6 +1673,94 @@ mod tests {
         let stderr =
             std::fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
         assert_eq!(code, 0, "block-mode probe failed with stderr:\n{stderr}");
+        sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_run_as_user_drops_uid_gid_and_supplementary_groups() {
+        if !contract_landlock_available() {
+            return;
+        }
+        if identity::current_euid() != 0 {
+            eprintln!("run_as_user runtime test requires euid 0 (test skipped)");
+            return;
+        }
+        let Ok(username) = std::env::var("AXIS_TEST_RUN_AS_USER") else {
+            eprintln!("AXIS_TEST_RUN_AS_USER not set (test skipped)");
+            return;
+        };
+        let target = match identity::resolve_run_as_user(&username, &identity::SystemUserLookup) {
+            Ok(identity) => identity,
+            Err(e) => {
+                eprintln!("cannot use AXIS_TEST_RUN_AS_USER='{username}': {e} (test skipped)");
+                return;
+            }
+        };
+
+        let Some(shell) = find_on_path("sh").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            eprintln!("sh unavailable (test skipped)");
+            return;
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.command = shell.to_string_lossy().into_owned();
+        sandbox.config.args = vec![
+            "-c".into(),
+            concat!(
+                "id -u > uid && id -g > gid && id -G > groups && ",
+                "touch run_as_user_probe || exit 1; ",
+                "if ( echo leak > /tmp/axis-run-as-user-denied-$$ ) 2>/dev/null; ",
+                "then exit 42; fi"
+            )
+            .into(),
+        ];
+        sandbox.config.policy.filesystem = FilesystemPolicy {
+            read_only: runtime_read_only_paths_for(&shell),
+            read_write: vec!["{workspace}".into(), "{tmpdir}".into()],
+            compatibility: Compatibility::HardRequirement,
+            ..Default::default()
+        };
+        sandbox.config.policy.process.run_as_user = Some(username);
+        sandbox.config.policy.process.cpu_rate_percent = 0;
+        sandbox.plan.identity = strategy::IdentityStrategy::RunAsUser {
+            username: target.username.clone(),
+        };
+        sandbox.plan.resources = strategy::ResourceStrategy::RlimitFallback {
+            memory_limit: false,
+            process_limit: strategy::ProcessLimitFallback::NotRequested,
+            cpu_limit: strategy::CpuLimitFallback::NotRequested,
+        };
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let workspace_meta = std::fs::metadata(workspace.path()).unwrap();
+        assert_eq!(workspace_meta.uid(), target.uid);
+        assert_eq!(workspace_meta.gid(), target.gid);
+
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("uid"))
+                .unwrap()
+                .trim(),
+            target.uid.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("gid"))
+                .unwrap()
+                .trim(),
+            target.gid.to_string()
+        );
+        let groups = std::fs::read_to_string(workspace.path().join("groups")).unwrap();
+        let target_gid = target.gid.to_string();
+        assert_eq!(
+            groups.split_whitespace().collect::<Vec<_>>(),
+            vec![target_gid.as_str()]
+        );
+        assert!(workspace.path().join("run_as_user_probe").exists());
         sandbox.destroy().unwrap();
     }
 

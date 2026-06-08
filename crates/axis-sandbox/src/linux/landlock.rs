@@ -136,6 +136,12 @@ impl Drop for PreparedLandlockRuleset {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TmpdirSetup {
+    Create,
+    AlreadyPrepared,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpandedPath {
     original: String,
@@ -203,6 +209,14 @@ pub(crate) fn prepare_landlock(
     policy: &FilesystemPolicy,
     workspace: &Path,
 ) -> Result<PreparedLandlockRuleset, String> {
+    prepare_landlock_with_tmpdir_setup(policy, workspace, TmpdirSetup::Create)
+}
+
+pub(crate) fn prepare_landlock_with_tmpdir_setup(
+    policy: &FilesystemPolicy,
+    workspace: &Path,
+    tmpdir_setup: TmpdirSetup,
+) -> Result<PreparedLandlockRuleset, String> {
     // Verify workspace exists.
     if !workspace.exists() {
         return Err(format!(
@@ -221,7 +235,10 @@ pub(crate) fn prepare_landlock(
     let handled = handled_access_for_abi(abi)?;
 
     if expanded.tmpdir_required {
-        create_tmpdir(workspace)?;
+        match tmpdir_setup {
+            TmpdirSetup::Create => create_tmpdir(workspace)?,
+            TmpdirSetup::AlreadyPrepared => validate_prepared_tmpdir(workspace)?,
+        }
     }
 
     match build_ruleset(policy, workspace, &expanded, handled) {
@@ -235,6 +252,23 @@ pub(crate) fn prepare_landlock(
             Err(e)
         }
     }
+}
+
+fn validate_prepared_tmpdir(workspace: &Path) -> Result<(), String> {
+    let tmpdir = sandbox_tmpdir(workspace);
+    let metadata = std::fs::symlink_metadata(&tmpdir).map_err(|e| {
+        format!(
+            "prepared tmpdir {} cannot be inspected: {e}",
+            tmpdir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "prepared tmpdir {} must be a real directory",
+            tmpdir.display()
+        ));
+    }
+    Ok(())
 }
 
 fn handled_access_for_abi(abi: i32) -> Result<u64, String> {

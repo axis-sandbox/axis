@@ -256,20 +256,25 @@ fn plan_filesystem(
         return Ok(FilesystemStrategy::Landlock { abi });
     }
 
+    let uid_dac_error = policy.process.run_as_user.as_ref().map(|username| {
+        format!(
+            "UID/DAC fallback for run_as_user '{username}' is disabled because DAC cannot prove Landlock default-deny filesystem semantics"
+        )
+    });
+
     if caps.bubblewrap {
-        return Err(StrategyError::new(
-            "filesystem",
-            "Landlock unavailable; bubblewrap filesystem fallback is not implemented yet",
-        ));
+        let message = match uid_dac_error {
+            Some(reason) => format!(
+                "Landlock unavailable; bubblewrap filesystem fallback is not implemented yet; {reason}"
+            ),
+            None => "Landlock unavailable; bubblewrap filesystem fallback is not implemented yet"
+                .to_string(),
+        };
+        return Err(StrategyError::new("filesystem", message));
     }
 
-    if let Some(username) = policy.process.run_as_user.as_ref() {
-        return Err(StrategyError::new(
-            "filesystem",
-            format!(
-                "Landlock unavailable; UID/DAC fallback for run_as_user '{username}' requires verified filesystem permissions"
-            ),
-        ));
+    if let Some(reason) = uid_dac_error {
+        return Err(StrategyError::new("filesystem", reason));
     }
 
     Err(StrategyError::new(
@@ -1023,11 +1028,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_landlock_rejects_uid_fallback_until_permissions_are_verified() {
+    fn missing_landlock_rejects_uid_dac_fallback_even_with_run_as_user() {
         let mut caps = full_caps();
         caps.landlock_abi = None;
 
         let mut policy = policy(NetworkMode::Allow);
+        policy.filesystem.read_only = vec!["/".into()];
+        policy.filesystem.read_write = vec!["{workspace}".into(), "{tmpdir}".into()];
         policy.process.run_as_user = Some("sandbox-user".into());
 
         let err = plan_with_probe(
@@ -1042,7 +1049,7 @@ mod tests {
 
         assert_eq!(err.area, "filesystem");
         assert!(err.message.contains("UID/DAC fallback"));
-        assert!(err.message.contains("verified filesystem permissions"));
+        assert!(err.message.contains("disabled"));
     }
 
     #[test]
