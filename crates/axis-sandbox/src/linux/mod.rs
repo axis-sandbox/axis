@@ -21,6 +21,7 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const LINUX_CAPABILITY_U32S_3: usize = 2;
 const CAP_LAST_CAP: i32 = 40;
 const POST_TIMEOUT_REAP_GRACE_SEC: u64 = 5;
+const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 
 #[repr(C)]
 struct CapHeader {
@@ -809,15 +810,8 @@ impl LinuxSandbox {
             sandbox_addr, port, ..
         } = &self.plan.proxy
         {
-            let proxy_url = format!("http://{sandbox_addr}:{port}");
-            env.extend([
-                ("HTTP_PROXY".into(), proxy_url.clone()),
-                ("HTTPS_PROXY".into(), proxy_url.clone()),
-                ("http_proxy".into(), proxy_url.clone()),
-                ("https_proxy".into(), proxy_url),
-                ("NO_PROXY".into(), "localhost,127.0.0.1,::1".into()),
-                ("no_proxy".into(), "localhost,127.0.0.1,::1".into()),
-            ]);
+            retain_non_proxy_env(&mut env);
+            env.extend(proxy_env_vars(sandbox_addr, *port));
         }
         env
     }
@@ -1177,6 +1171,40 @@ fn drop_process_capabilities() -> Result<(), i32> {
     clear_process_capability_sets()
 }
 
+fn apply_proxy_env_from_strategy(cmd: &mut std::process::Command, proxy: &strategy::ProxyStrategy) {
+    if let strategy::ProxyStrategy::Required {
+        sandbox_addr, port, ..
+    } = proxy
+    {
+        for (key, value) in proxy_env_vars(sandbox_addr, *port) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn proxy_env_vars(sandbox_addr: &std::net::Ipv4Addr, port: u16) -> Vec<(String, String)> {
+    let proxy_url = format!("http://{sandbox_addr}:{port}");
+    vec![
+        ("HTTP_PROXY".into(), proxy_url.clone()),
+        ("HTTPS_PROXY".into(), proxy_url.clone()),
+        ("http_proxy".into(), proxy_url.clone()),
+        ("https_proxy".into(), proxy_url),
+        ("NO_PROXY".into(), NO_PROXY_VALUE.into()),
+        ("no_proxy".into(), NO_PROXY_VALUE.into()),
+    ]
+}
+
+fn retain_non_proxy_env(env: &mut Vec<(String, String)>) {
+    env.retain(|(key, _)| !is_proxy_env_key(key));
+}
+
+fn is_proxy_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "HTTP_PROXY" | "HTTPS_PROXY" | "http_proxy" | "https_proxy" | "NO_PROXY" | "no_proxy"
+    )
+}
+
 fn current_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
@@ -1373,19 +1401,7 @@ impl SandboxImpl for LinuxSandbox {
             cmd.env(k, v);
         }
 
-        // Inject proxy env vars only when the plan requires a proxy.
-        if let strategy::ProxyStrategy::Required {
-            sandbox_addr, port, ..
-        } = &self.plan.proxy
-        {
-            let proxy_url = format!("http://{sandbox_addr}:{port}");
-            cmd.env("HTTP_PROXY", &proxy_url);
-            cmd.env("HTTPS_PROXY", &proxy_url);
-            cmd.env("http_proxy", &proxy_url);
-            cmd.env("https_proxy", &proxy_url);
-            cmd.env("NO_PROXY", "localhost,127.0.0.1,::1");
-            cmd.env("no_proxy", "localhost,127.0.0.1,::1");
-        }
+        apply_proxy_env_from_strategy(&mut cmd, &self.plan.proxy);
 
         let cgroup_procs_fd = match &self.cgroup {
             Some(cgroup) => match cgroup.open_procs_fd() {
@@ -1724,6 +1740,7 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::str::FromStr;
 
     #[test]
     fn spawn_error_maps_child_setup_pipe_failures() {
@@ -2410,6 +2427,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn helper_target_env_injects_proxy_env_from_strategy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000111").unwrap();
+        let proxy_port = 31_280;
+        let allocation = netns::proxy_netns_allocation(id, proxy_port);
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.env = vec![
+            ("PATH".into(), "/bin".into()),
+            ("HTTP_PROXY".into(), "http://stale-proxy:1".into()),
+            ("NO_PROXY".into(), "stale-no-proxy".into()),
+        ];
+        sandbox.plan.proxy = strategy::ProxyStrategy::Required {
+            bind_addr: allocation.host_addr,
+            sandbox_addr: allocation.host_addr,
+            port: proxy_port,
+        };
+
+        let env = sandbox.helper_target_env();
+        let env_value = |key: &str| {
+            env.iter()
+                .find(|(env_key, _)| env_key == key)
+                .map(|(_, value)| value.as_str())
+        };
+        let expected_proxy = format!("http://{}:{proxy_port}", allocation.host_addr);
+
+        assert_eq!(env_value("PATH"), Some("/bin"));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(env_value(key), Some(expected_proxy.as_str()), "{key}");
+            assert_eq!(
+                env.iter().filter(|(env_key, _)| env_key == key).count(),
+                1,
+                "{key} should not retain stale inherited values"
+            );
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(env_value(key), Some(NO_PROXY_VALUE), "{key}");
+            assert_eq!(
+                env.iter().filter(|(env_key, _)| env_key == key).count(),
+                1,
+                "{key} should not retain stale inherited values"
+            );
+        }
+    }
+
+    #[test]
+    fn native_proxy_env_from_strategy_overrides_inherited_proxy_env() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000112").unwrap();
+        let proxy_port = 31_281;
+        let allocation = netns::proxy_netns_allocation(id, proxy_port);
+        let proxy = strategy::ProxyStrategy::Required {
+            bind_addr: allocation.host_addr,
+            sandbox_addr: allocation.host_addr,
+            port: proxy_port,
+        };
+        let mut cmd = Command::new("true");
+        cmd.env("PATH", "/bin")
+            .env("HTTP_PROXY", "http://stale-proxy:1")
+            .env("NO_PROXY", "stale-no-proxy");
+
+        apply_proxy_env_from_strategy(&mut cmd, &proxy);
+
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let env_value = |key: &str| {
+            envs.iter()
+                .find(|(env_key, _)| env_key == key)
+                .and_then(|(_, value)| value.as_deref())
+        };
+        let expected_proxy = format!("http://{}:{proxy_port}", allocation.host_addr);
+
+        assert_eq!(env_value("PATH"), Some("/bin"));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(env_value(key), Some(expected_proxy.as_str()), "{key}");
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(env_value(key), Some(NO_PROXY_VALUE), "{key}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn block_mode_sandbox_denies_ip_sockets_preserves_unix_and_omits_proxy_env() {
         if !contract_landlock_available() {
@@ -2990,6 +3094,8 @@ denied_port = int(os.environ["AXIS_DENIED_HOST_PORT"])
 expected_proxy = f"http://{host}:{port}"
 for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
     assert os.environ.get(key) == expected_proxy, (key, os.environ.get(key), expected_proxy)
+for key in ("NO_PROXY", "no_proxy"):
+    assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
 
 pid = os.fork()
 if pid == 0:
@@ -3034,7 +3140,7 @@ import os
 import socket
 import sys
 
-for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
     if key in os.environ:
         print(f"unexpected proxy env: {key}", file=sys.stderr)
         sys.exit(10)
@@ -3086,7 +3192,7 @@ import sys
 
 pathlib.Path("bwrap-ok").write_text("ok")
 
-for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
     if key in os.environ:
         print(f"unexpected proxy env: {key}", file=sys.stderr)
         sys.exit(10)

@@ -690,16 +690,11 @@ async fn main() -> Result<()> {
                     let workspace = tempfile::tempdir()?;
 
                     // Start an inline proxy if policy uses proxy mode.
-                    let proxy_addr = match policy.network.mode {
-                        axis_core::policy::NetworkMode::Proxy => {
-                            let proxy_config = axis_proxy::proxy::ProxyConfig {
-                                sandbox_id,
-                                bind_addr: proxy_bind_addr_for_sandbox(sandbox_id, 0, &policy),
-                                policy: policy.clone(),
-                                enable_l7: false,
-                                enable_leak_detection: true,
-                                inference_endpoint: None,
-                            };
+                    let proxy_addr = match standalone_proxy_config_for_sandbox(
+                        sandbox_id,
+                        &policy,
+                    ) {
+                        Some(proxy_config) => {
                             let mut proxy = axis_proxy::proxy::AxisProxy::new(proxy_config)
                                 .map_err(|e| anyhow::anyhow!("proxy: {e}"))?;
                             let addr = proxy.bind().await
@@ -708,7 +703,7 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move { let _ = proxy.run().await; });
                             Some(addr)
                         }
-                        _ => None,
+                        None => None,
                     };
                     let proxy_port = proxy_addr.map(|addr| addr.port()).unwrap_or(0);
 
@@ -1069,6 +1064,24 @@ fn proxy_bind_addr_for_sandbox(
     format!("127.0.0.1:{proxy_port}").parse().unwrap()
 }
 
+fn standalone_proxy_config_for_sandbox(
+    id: axis_core::types::SandboxId,
+    policy: &axis_core::policy::Policy,
+) -> Option<axis_proxy::proxy::ProxyConfig> {
+    if !matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
+        return None;
+    }
+
+    Some(axis_proxy::proxy::ProxyConfig {
+        sandbox_id: id,
+        bind_addr: proxy_bind_addr_for_sandbox(id, 0, policy),
+        policy: policy.clone(),
+        enable_l7: false,
+        enable_leak_detection: true,
+        inference_endpoint: None,
+    })
+}
+
 /// Discover common runtime directories (Node.js, Python) that may not be
 /// in PATH. Returns directories that exist and contain expected binaries.
 /// This lets npm-installed agents and Python venvs work out-of-the-box
@@ -1150,14 +1163,42 @@ mod tests {
     }
 
     #[test]
+    fn standalone_proxy_config_is_only_planned_for_proxy_mode() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+
+        for mode in [NetworkMode::Block, NetworkMode::Allow] {
+            let policy = test_policy(mode);
+
+            assert!(standalone_proxy_config_for_sandbox(id, &policy).is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_proxy_config_uses_netns_bind_addr_for_proxy_mode() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let policy = test_policy(NetworkMode::Proxy);
+        let config = standalone_proxy_config_for_sandbox(id, &policy)
+            .expect("proxy mode should plan an inline proxy");
+
+        assert_eq!(config.sandbox_id, id);
+        assert_eq!(config.bind_addr, proxy_bind_addr_for_sandbox(id, 0, &policy));
+        assert!(!config.enable_l7);
+        assert!(config.enable_leak_detection);
+        assert!(config.inference_endpoint.is_none());
+    }
+
+    #[test]
     fn standalone_non_proxy_modes_keep_loopback_bind_addr() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let policy = test_policy(NetworkMode::Block);
 
-        assert_eq!(
-            proxy_bind_addr_for_sandbox(id, 0, &policy),
-            "127.0.0.1:0".parse().unwrap()
-        );
+        for mode in [NetworkMode::Block, NetworkMode::Allow] {
+            let policy = test_policy(mode);
+
+            assert_eq!(
+                proxy_bind_addr_for_sandbox(id, 0, &policy),
+                "127.0.0.1:0".parse().unwrap()
+            );
+        }
     }
 
     fn test_policy(network_mode: NetworkMode) -> Policy {

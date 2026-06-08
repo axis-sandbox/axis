@@ -807,15 +807,8 @@ async fn start_proxy_for_sandbox(
     }
 
     let proxy_port = allocate_port();
-    let bind_addr = proxy_bind_addr_for_sandbox(id, proxy_port, policy);
-    let proxy_config = ProxyConfig {
-        sandbox_id: id,
-        bind_addr,
-        policy: policy.clone(),
-        enable_l7: false,
-        enable_leak_detection: true,
-        inference_endpoint,
-    };
+    let proxy_config = proxy_config_for_sandbox(id, policy, inference_endpoint, proxy_port)
+        .expect("proxy config must exist for proxy-mode policy");
 
     let mut proxy = AxisProxy::new(proxy_config).map_err(|e| format!("proxy init: {e}"))?;
     let proxy_addr = proxy.bind().await.map_err(|e| format!("proxy bind: {e}"))?;
@@ -837,6 +830,26 @@ async fn start_proxy_for_sandbox(
     });
 
     Ok((Some(proxy_addr), Some(shutdown_tx)))
+}
+
+fn proxy_config_for_sandbox(
+    id: SandboxId,
+    policy: &Policy,
+    inference_endpoint: Option<SocketAddr>,
+    proxy_port: u16,
+) -> Option<ProxyConfig> {
+    if !policy_uses_proxy(policy) {
+        return None;
+    }
+
+    Some(ProxyConfig {
+        sandbox_id: id,
+        bind_addr: proxy_bind_addr_for_sandbox(id, proxy_port, policy),
+        policy: policy.clone(),
+        enable_l7: false,
+        enable_leak_detection: true,
+        inference_endpoint,
+    })
 }
 
 fn proxy_bind_addr_for_sandbox(id: SandboxId, proxy_port: u16, policy: &Policy) -> SocketAddr {
@@ -1182,10 +1195,60 @@ mod tests {
     }
 
     #[test]
+    fn allow_mode_does_not_use_daemon_proxy() {
+        let policy = test_policy(NetworkMode::Allow);
+
+        assert!(!policy_uses_proxy(&policy));
+    }
+
+    #[test]
     fn proxy_mode_uses_daemon_proxy() {
         let policy = test_policy(NetworkMode::Proxy);
 
         assert!(policy_uses_proxy(&policy));
+    }
+
+    #[test]
+    fn proxy_config_is_omitted_for_non_proxy_modes() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+
+        for mode in [NetworkMode::Block, NetworkMode::Allow] {
+            let policy = test_policy(mode);
+
+            assert!(proxy_config_for_sandbox(id, &policy, None, 3128).is_none());
+        }
+    }
+
+    #[test]
+    fn proxy_config_uses_netns_bind_addr_for_proxy_mode() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let policy = test_policy(NetworkMode::Proxy);
+        let inference_endpoint = Some("127.0.0.1:9000".parse().unwrap());
+        let config = proxy_config_for_sandbox(id, &policy, inference_endpoint, 3128)
+            .expect("proxy mode should plan a proxy config");
+
+        assert_eq!(config.sandbox_id, id);
+        assert_eq!(
+            config.bind_addr,
+            proxy_bind_addr_for_sandbox(id, 3128, &policy)
+        );
+        assert!(!config.enable_l7);
+        assert!(config.enable_leak_detection);
+        assert_eq!(config.inference_endpoint, inference_endpoint);
+    }
+
+    #[tokio::test]
+    async fn start_proxy_for_sandbox_returns_none_for_non_proxy_modes() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+
+        for mode in [NetworkMode::Block, NetworkMode::Allow] {
+            let policy = test_policy(mode);
+            let (proxy_addr, proxy_shutdown) =
+                start_proxy_for_sandbox(id, &policy, None).await.unwrap();
+
+            assert!(proxy_addr.is_none());
+            assert!(proxy_shutdown.is_none());
+        }
     }
 
     #[test]
@@ -1207,12 +1270,15 @@ mod tests {
     #[test]
     fn non_proxy_modes_keep_loopback_bind_addr() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let policy = test_policy(NetworkMode::Block);
 
-        assert_eq!(
-            proxy_bind_addr_for_sandbox(id, 3128, &policy),
-            "127.0.0.1:3128".parse().unwrap()
-        );
+        for mode in [NetworkMode::Block, NetworkMode::Allow] {
+            let policy = test_policy(mode);
+
+            assert_eq!(
+                proxy_bind_addr_for_sandbox(id, 3128, &policy),
+                "127.0.0.1:3128".parse().unwrap()
+            );
+        }
     }
 
     #[test]
