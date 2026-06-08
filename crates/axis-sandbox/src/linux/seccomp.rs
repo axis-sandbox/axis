@@ -22,11 +22,38 @@ const BPF_RET: u16 = 0x06;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JSET: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+const ARG_SIZE: u32 = 8;
+
+const AF_UNIX: u32 = 1;
+
+const SYS_SOCKET: u32 = 41;
+const SYS_SOCKETPAIR: u32 = 53;
+const SYS_CLONE: u32 = 56;
+const SYS_KILL: u32 = 62;
+const SYS_SETPGID: u32 = 109;
+const SYS_SETSID: u32 = 112;
+const SYS_TKILL: u32 = 200;
+const SYS_UNSHARE: u32 = 272;
+const SYS_EXECVEAT: u32 = 322;
+const SYS_CLONE3: u32 = 435;
+
+const EXECVEAT_FLAGS_ARG: usize = 4;
+const AT_EMPTY_PATH: u32 = 0x1000;
+const DANGEROUS_UNSHARE_FLAGS: u32 = libc::CLONE_NEWNS as u32
+    | libc::CLONE_NEWUTS as u32
+    | libc::CLONE_NEWIPC as u32
+    | libc::CLONE_NEWUSER as u32
+    | libc::CLONE_NEWPID as u32
+    | libc::CLONE_NEWNET as u32
+    | libc::CLONE_NEWCGROUP as u32;
 
 /// Syscalls that are always allowed in default-deny mode.
 /// These are the minimum set needed for Python, shell, and most userspace
@@ -83,13 +110,12 @@ const WHITELIST: &[(u32, &str)] = &[
     (53, "socketpair"),
     (54, "setsockopt"),
     (55, "getsockopt"),
-    (56, "clone"), // needed for threads (fork filtering done separately)
+    (56, "clone"), // namespace flags are blocked by conditional rules
     (57, "fork"),
     (58, "vfork"),
     (59, "execve"),
     (60, "exit"),
     (61, "wait4"),
-    (62, "kill"), // only for sending signals to own process group
     (63, "uname"),
     (72, "fcntl"),
     (73, "flock"),
@@ -120,10 +146,8 @@ const WHITELIST: &[(u32, &str)] = &[
     (104, "getgid"),
     (107, "geteuid"),
     (108, "getegid"),
-    (109, "setpgid"),
     (110, "getppid"),
     (111, "getpgrp"),
-    (112, "setsid"),
     (124, "getsid"),
     (131, "sigaltstack"),
     (137, "statfs"),
@@ -136,7 +160,6 @@ const WHITELIST: &[(u32, &str)] = &[
     (157, "prctl"),
     (158, "arch_prctl"),
     (186, "gettid"),
-    (200, "tkill"),
     (202, "futex"),
     (204, "sched_getaffinity"),
     (217, "getdents64"),
@@ -174,8 +197,6 @@ const WHITELIST: &[(u32, &str)] = &[
     (334, "rseq"),
     (439, "faccessat2"),
     (448, "process_mrelease"),
-    // clone3 — needed by newer glibc for thread creation
-    (435, "clone3"),
 ];
 
 /// BPF instruction.
@@ -236,72 +257,264 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> BpfInsn {
     BpfInsn { code, jt, jf, k }
 }
 
-pub(crate) fn prepare_seccomp(policy: &ProcessPolicy) -> PreparedSeccompFilter {
-    // Build the complete allowlist.
-    let mut allowed: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterDecision {
+    Allow,
+    Errno(i32),
+    KillProcess,
+}
 
-    // Remove any syscalls the policy explicitly blocks.
-    for name in &policy.blocked_syscalls {
-        if let Some(nr) = syscall_number(name) {
-            allowed.retain(|&n| n != nr);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlagDenyRule {
+    syscall_nr: u32,
+    arg_index: usize,
+    mask: u32,
+    reason: &'static str,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SocketDomainPolicy {
+    AllowAll,
+    DenyAllExcept(Vec<u32>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeccompOptions {
+    socket_domain_policy: SocketDomainPolicy,
+}
+
+impl Default for SeccompOptions {
+    fn default() -> Self {
+        Self {
+            socket_domain_policy: SocketDomainPolicy::AllowAll,
+        }
+    }
+}
+
+impl SeccompOptions {
+    #[allow(dead_code)]
+    pub(crate) fn deny_network_socket_domains() -> Self {
+        Self {
+            socket_domain_policy: SocketDomainPolicy::DenyAllExcept(vec![AF_UNIX]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeccompFilterSpec {
+    allowed_syscalls: Vec<u32>,
+    socket_domain_policy: SocketDomainPolicy,
+    flag_deny_rules: Vec<FlagDenyRule>,
+}
+
+impl SeccompFilterSpec {
+    fn from_policy(policy: &ProcessPolicy, options: SeccompOptions) -> Result<Self, String> {
+        let mut allowed_syscalls: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
+
+        for name in &policy.blocked_syscalls {
+            let nr = syscall_number(name)
+                .ok_or_else(|| format!("unknown syscall in blocked_syscalls: '{name}'"))?;
+            allowed_syscalls.retain(|&n| n != nr);
+        }
+
+        allowed_syscalls.sort();
+        allowed_syscalls.dedup();
+
+        Ok(Self {
+            allowed_syscalls,
+            socket_domain_policy: options.socket_domain_policy,
+            flag_deny_rules: vec![
+                FlagDenyRule {
+                    syscall_nr: SYS_CLONE,
+                    arg_index: 0,
+                    mask: DANGEROUS_UNSHARE_FLAGS,
+                    reason: "dangerous namespace clone",
+                },
+                FlagDenyRule {
+                    syscall_nr: SYS_UNSHARE,
+                    arg_index: 0,
+                    mask: DANGEROUS_UNSHARE_FLAGS,
+                    reason: "dangerous namespace unshare",
+                },
+                FlagDenyRule {
+                    syscall_nr: SYS_EXECVEAT,
+                    arg_index: EXECVEAT_FLAGS_ARG,
+                    mask: AT_EMPTY_PATH,
+                    reason: "execveat AT_EMPTY_PATH",
+                },
+            ],
+        })
+    }
+
+    #[allow(dead_code)]
+    fn decision_for(&self, arch: u32, syscall_nr: u32, args: [u64; 6]) -> FilterDecision {
+        if arch != AUDIT_ARCH_X86_64 {
+            return FilterDecision::KillProcess;
+        }
+
+        if self.denies_socket_domain(syscall_nr, args[0] as u32) {
+            return FilterDecision::Errno(libc::EPERM);
+        }
+
+        for rule in &self.flag_deny_rules {
+            if rule.syscall_nr == syscall_nr && ((args[rule.arg_index] as u32) & rule.mask) != 0 {
+                return FilterDecision::Errno(libc::EPERM);
+            }
+        }
+
+        if self.allowed_syscalls.binary_search(&syscall_nr).is_ok() {
+            FilterDecision::Allow
         } else {
-            tracing::warn!("seccomp: unknown syscall '{name}' in blocked_syscalls");
+            FilterDecision::Errno(libc::EPERM)
         }
     }
 
-    allowed.sort();
-    allowed.dedup();
-
-    // Build BPF program.
-    // Structure:
-    //   0: Load arch → verify x86_64 → kill if wrong
-    //   3: Load syscall nr
-    //   4..N: For each allowed syscall: JEQ → ALLOW
-    //   N+1: Default: ERRNO(EPERM)
-    let n_allowed = allowed.len();
-    let mut insns: Vec<BpfInsn> = Vec::with_capacity(4 + n_allowed + 2);
-
-    // Validate architecture.
-    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
-    insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
-    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-
-    // Load syscall number.
-    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
-
-    // For each allowed syscall: if match, jump to ALLOW.
-    for (i, nr) in allowed.iter().enumerate() {
-        let remaining = n_allowed - i - 1;
-        insns.push(bpf_jump(
-            BPF_JMP | BPF_JEQ | BPF_K,
-            *nr,
-            (remaining + 1) as u8, // jump to ALLOW (skip remaining + DENY)
-            0,                     // fall through
-        ));
+    #[allow(dead_code)]
+    fn denies_socket_domain(&self, syscall_nr: u32, domain: u32) -> bool {
+        if !matches!(syscall_nr, SYS_SOCKET | SYS_SOCKETPAIR) {
+            return false;
+        }
+        match &self.socket_domain_policy {
+            SocketDomainPolicy::AllowAll => false,
+            SocketDomainPolicy::DenyAllExcept(allowed_domains) => {
+                !allowed_domains.contains(&domain)
+            }
+        }
     }
 
-    // Default: DENY with EPERM.
+    fn to_bpf(&self) -> Vec<BpfInsn> {
+        let mut insns = Vec::new();
+
+        insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
+        insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
+        insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+
+        append_socket_domain_denies(&mut insns, &self.socket_domain_policy);
+        for rule in &self.flag_deny_rules {
+            append_flag_deny(&mut insns, *rule);
+        }
+
+        insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+
+        let n_allowed = self.allowed_syscalls.len();
+        for (i, nr) in self.allowed_syscalls.iter().enumerate() {
+            let remaining = n_allowed - i - 1;
+            insns.push(bpf_jump(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                *nr,
+                checked_skip(remaining + 1),
+                0,
+            ));
+        }
+
+        insns.push(errno_return());
+        insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+        insns
+    }
+}
+
+fn append_socket_domain_denies(insns: &mut Vec<BpfInsn>, policy: &SocketDomainPolicy) {
+    match policy {
+        SocketDomainPolicy::AllowAll => {}
+        SocketDomainPolicy::DenyAllExcept(allowed_domains) => {
+            for syscall_nr in [SYS_SOCKET, SYS_SOCKETPAIR] {
+                append_socket_domain_deny_all_except(insns, syscall_nr, allowed_domains);
+            }
+        }
+    };
+}
+
+fn append_socket_domain_deny_all_except(
+    insns: &mut Vec<BpfInsn>,
+    syscall_nr: u32,
+    allowed_domains: &[u32],
+) {
+    if allowed_domains.is_empty() {
+        insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+        insns.push(bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, syscall_nr, 0, 1));
+        insns.push(errno_return());
+        return;
+    }
+
+    let body_len = 1 + allowed_domains.len() + 1;
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+    insns.push(bpf_jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        syscall_nr,
+        0,
+        checked_skip(body_len),
+    ));
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg_low_offset(0)));
+    for (i, domain) in allowed_domains.iter().enumerate() {
+        let remaining_allowed_checks = allowed_domains.len() - i - 1;
+        insns.push(bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            *domain,
+            checked_skip(remaining_allowed_checks + 1),
+            0,
+        ));
+    }
+    insns.push(errno_return());
+}
+
+fn append_flag_deny(insns: &mut Vec<BpfInsn>, rule: FlagDenyRule) {
+    let body_len = 3;
+    insns.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+    insns.push(bpf_jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        rule.syscall_nr,
+        0,
+        checked_skip(body_len),
+    ));
     insns.push(bpf_stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        arg_low_offset(rule.arg_index),
+    ));
+    insns.push(bpf_jump(BPF_JMP | BPF_JSET | BPF_K, rule.mask, 0, 1));
+    insns.push(errno_return());
+}
+
+fn errno_return() -> BpfInsn {
+    bpf_stmt(
         BPF_RET | BPF_K,
         SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0xFFFF),
-    ));
+    )
+}
 
-    // ALLOW.
-    insns.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+fn checked_skip(len: usize) -> u8 {
+    u8::try_from(len).expect("seccomp BPF conditional block too large")
+}
+
+fn arg_low_offset(index: usize) -> u32 {
+    SECCOMP_DATA_ARGS_OFFSET + (index as u32 * ARG_SIZE)
+}
+
+pub(crate) fn prepare_seccomp(policy: &ProcessPolicy) -> Result<PreparedSeccompFilter, String> {
+    prepare_seccomp_with_options(policy, SeccompOptions::default())
+}
+
+pub(crate) fn prepare_seccomp_with_options(
+    policy: &ProcessPolicy,
+    options: SeccompOptions,
+) -> Result<PreparedSeccompFilter, String> {
+    let spec = SeccompFilterSpec::from_policy(policy, options)?;
+    let insns = spec.to_bpf();
 
     tracing::info!(
         "seccomp: prepared default-deny mode — {} syscalls whitelisted, {} BPF instructions",
-        allowed.len(),
+        spec.allowed_syscalls.len(),
         insns.len(),
     );
-    PreparedSeccompFilter { insns }
+    Ok(PreparedSeccompFilter { insns })
 }
 
 /// Apply seccomp-BPF in default-deny whitelist mode.
 ///
 /// Only syscalls in the whitelist are allowed. Everything else returns EPERM.
 pub fn apply_seccomp(policy: &ProcessPolicy) -> Result<(), String> {
-    let filter = prepare_seccomp(policy);
+    let filter = prepare_seccomp(policy)?;
     filter.apply_current_process().map_err(|errno| {
         format!(
             "seccomp(SET_MODE_FILTER) failed: {}",
@@ -338,7 +551,12 @@ fn syscall_number(name: &str) -> Option<u32> {
                 "reboot" => Some(169),
                 "pivot_root" => Some(155),
                 "chroot" => Some(161),
+                "kill" => Some(SYS_KILL),
+                "setpgid" => Some(SYS_SETPGID),
+                "setsid" => Some(SYS_SETSID),
+                "tkill" => Some(SYS_TKILL),
                 "unshare" => Some(272),
+                "clone3" => Some(SYS_CLONE3),
                 _ => None,
             }
         })
@@ -347,6 +565,28 @@ fn syscall_number(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, ExitStatus};
+
+    const DOCUMENTED_NETWORK_SOCKET_DOMAINS: &[u32] = &[
+        2,  // AF_INET
+        10, // AF_INET6
+        16, // AF_NETLINK
+        17, // AF_PACKET
+        29, // AF_CAN
+        31, // AF_BLUETOOTH
+        36, // AF_IEEE802154
+        39, // AF_NFC
+        40, // AF_VSOCK
+        44, // AF_XDP
+    ];
+
+    const PROBE_DENIED: i32 = 0;
+    const PROBE_ALLOWED: i32 = 1;
+    const PROBE_UNEXPECTED_ERRNO: i32 = 2;
+    const PROBE_SECCOMP_SETUP_FAILED: i32 = 101;
+    const PROBE_NO_NEW_PRIVS_FAILED: i32 = 102;
+    const PROBE_SIGNALLED: i32 = 128;
 
     #[test]
     fn whitelist_has_essential_syscalls() {
@@ -370,6 +610,23 @@ mod tests {
             "io_uring_setup should not be in whitelist"
         );
         assert!(!nrs.contains(&169), "reboot should not be in whitelist");
+        assert!(
+            !nrs.contains(&SYS_CLONE3),
+            "clone3 should not be in whitelist"
+        );
+        assert!(!nrs.contains(&SYS_KILL), "kill should not be in whitelist");
+        assert!(
+            !nrs.contains(&SYS_TKILL),
+            "tkill should not be in whitelist"
+        );
+        assert!(
+            !nrs.contains(&SYS_SETPGID),
+            "setpgid should not be in whitelist"
+        );
+        assert!(
+            !nrs.contains(&SYS_SETSID),
+            "setsid should not be in whitelist"
+        );
     }
 
     #[test]
@@ -378,14 +635,613 @@ mod tests {
             blocked_syscalls: vec!["fork".into(), "execve".into()],
             ..Default::default()
         };
-        let mut allowed: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
-        for name in &policy.blocked_syscalls {
-            if let Some(nr) = syscall_number(name) {
-                allowed.retain(|&n| n != nr);
+        let spec = SeccompFilterSpec::from_policy(&policy, SeccompOptions::default()).unwrap();
+
+        assert!(
+            !spec.allowed_syscalls.contains(&57),
+            "fork should be removed"
+        );
+        assert!(
+            !spec.allowed_syscalls.contains(&59),
+            "execve should be removed"
+        );
+        assert!(spec.allowed_syscalls.contains(&0), "read should remain");
+    }
+
+    #[test]
+    fn unknown_blocked_syscall_is_fatal() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["not_a_real_syscall".into()],
+            ..Default::default()
+        };
+
+        let err = prepare_seccomp(&policy).unwrap_err();
+
+        assert!(err.contains("unknown syscall"));
+    }
+
+    #[test]
+    fn decision_kills_wrong_architecture() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        assert_eq!(spec.decision_for(0, 0, [0; 6]), FilterDecision::KillProcess);
+    }
+
+    #[test]
+    fn decision_denies_documented_escape_syscalls() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [
+            "ptrace",
+            "mount",
+            "umount2",
+            "bpf",
+            "io_uring_setup",
+            "process_vm_readv",
+            "process_vm_writev",
+            "userfaultfd",
+            "clone3",
+        ] {
+            let nr = syscall_number(syscall).unwrap();
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{syscall} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_denies_broad_signal_syscalls() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [SYS_KILL, SYS_TKILL] {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "signal syscall {syscall} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_denies_process_group_escape_syscalls() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [SYS_SETPGID, SYS_SETSID] {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "process group syscall {syscall} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_denies_policy_blocked_syscall() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["getpid".into()],
+            ..Default::default()
+        };
+        let spec = SeccompFilterSpec::from_policy(&policy, SeccompOptions::default()).unwrap();
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, 39, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, 0, [0; 6]),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn socket_domain_policy_denies_network_domains_but_allows_unix() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::deny_network_socket_domains(),
+        )
+        .unwrap();
+
+        for domain in DOCUMENTED_NETWORK_SOCKET_DOMAINS
+            .iter()
+            .copied()
+            .chain([9_999])
+        {
+            assert_eq!(
+                spec.decision_for(
+                    AUDIT_ARCH_X86_64,
+                    SYS_SOCKET,
+                    [domain as u64, 0, 0, 0, 0, 0]
+                ),
+                FilterDecision::Errno(libc::EPERM),
+                "socket domain {domain} should be denied"
+            );
+        }
+        assert_eq!(
+            spec.decision_for(
+                AUDIT_ARCH_X86_64,
+                SYS_SOCKET,
+                [AF_UNIX as u64, 0, 0, 0, 0, 0]
+            ),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn conditional_rules_deny_dangerous_clone_and_unshare_flags() {
+        let mut spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+        spec.allowed_syscalls.push(SYS_UNSHARE);
+        spec.allowed_syscalls.sort();
+
+        assert_eq!(
+            spec.decision_for(
+                AUDIT_ARCH_X86_64,
+                SYS_CLONE,
+                [libc::CLONE_NEWUSER as u64, 0, 0, 0, 0, 0],
+            ),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            spec.decision_for(
+                AUDIT_ARCH_X86_64,
+                SYS_CLONE,
+                [libc::SIGCHLD as u64, 0, 0, 0, 0, 0]
+            ),
+            FilterDecision::Allow
+        );
+        assert_eq!(
+            spec.decision_for(
+                AUDIT_ARCH_X86_64,
+                SYS_UNSHARE,
+                [libc::CLONE_NEWUSER as u64, 0, 0, 0, 0, 0],
+            ),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_UNSHARE, [0; 6]),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn generated_bpf_denies_security_sensitive_syscalls() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [
+            "ptrace",
+            "mount",
+            "umount2",
+            "bpf",
+            "io_uring_setup",
+            "process_vm_readv",
+            "process_vm_writev",
+            "userfaultfd",
+            "clone3",
+        ] {
+            let nr = syscall_number(syscall).unwrap();
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, nr, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "{syscall} should be denied by generated BPF"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bpf_denies_broad_signal_syscalls() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [SYS_KILL, SYS_TKILL] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "signal syscall {syscall} should be denied by generated BPF"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bpf_denies_process_group_escape_syscalls() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [SYS_SETPGID, SYS_SETSID] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "process group syscall {syscall} should be denied by generated BPF"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bpf_applies_conditional_flag_rules() {
+        let mut spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+        spec.allowed_syscalls.push(SYS_UNSHARE);
+        spec.allowed_syscalls.sort();
+
+        assert_eq!(
+            bpf_decision_for(
+                &spec,
+                AUDIT_ARCH_X86_64,
+                SYS_CLONE,
+                [libc::CLONE_NEWNS as u64, 0, 0, 0, 0, 0],
+            ),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(
+                &spec,
+                AUDIT_ARCH_X86_64,
+                SYS_CLONE,
+                [libc::SIGCHLD as u64, 0, 0, 0, 0, 0],
+            ),
+            FilterDecision::Allow
+        );
+        assert_eq!(
+            bpf_decision_for(
+                &spec,
+                AUDIT_ARCH_X86_64,
+                SYS_UNSHARE,
+                [libc::CLONE_NEWUSER as u64, 0, 0, 0, 0, 0],
+            ),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_UNSHARE, [0; 6]),
+            FilterDecision::Allow
+        );
+
+        let mut args = [0u64; 6];
+        args[EXECVEAT_FLAGS_ARG] = AT_EMPTY_PATH as u64;
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_EXECVEAT, args),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_EXECVEAT, [0; 6]),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn generated_bpf_denies_network_socket_domains_when_requested() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::deny_network_socket_domains(),
+        )
+        .unwrap();
+
+        for domain in DOCUMENTED_NETWORK_SOCKET_DOMAINS
+            .iter()
+            .copied()
+            .chain([9_999])
+        {
+            assert_eq!(
+                bpf_decision_for(
+                    &spec,
+                    AUDIT_ARCH_X86_64,
+                    SYS_SOCKET,
+                    [domain as u64, 0, 0, 0, 0, 0],
+                ),
+                FilterDecision::Errno(libc::EPERM),
+                "socket domain {domain} should be denied by generated BPF"
+            );
+            assert_eq!(
+                bpf_decision_for(
+                    &spec,
+                    AUDIT_ARCH_X86_64,
+                    SYS_SOCKETPAIR,
+                    [domain as u64, 0, 0, 0, 0, 0],
+                ),
+                FilterDecision::Errno(libc::EPERM),
+                "socketpair domain {domain} should be denied by generated BPF"
+            );
+        }
+        assert_eq!(
+            bpf_decision_for(
+                &spec,
+                AUDIT_ARCH_X86_64,
+                SYS_SOCKET,
+                [AF_UNIX as u64, 0, 0, 0, 0, 0],
+            ),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn conditional_rules_deny_execveat_empty_path() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+        let mut args = [0u64; 6];
+        args[EXECVEAT_FLAGS_ARG] = AT_EMPTY_PATH as u64;
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_EXECVEAT, args),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_EXECVEAT, [0; 6]),
+            FilterDecision::Allow
+        );
+    }
+
+    #[test]
+    fn runtime_execveat_empty_path_flag_is_denied_by_kernel_filter() {
+        assert_eq!(
+            run_seccomp_errno_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default(),
+                probe_execveat_empty_path,
+            ),
+            PROBE_DENIED
+        );
+    }
+
+    #[test]
+    fn runtime_socket_domain_filter_denies_inet_socket() {
+        assert_eq!(
+            run_seccomp_errno_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::deny_network_socket_domains(),
+                probe_inet_socket,
+            ),
+            PROBE_DENIED
+        );
+    }
+
+    #[test]
+    fn runtime_shell_smoke_under_filter() {
+        let Some(status) = run_with_seccomp("/bin/sh", &["-c", "true"], &ProcessPolicy::default())
+        else {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        };
+
+        assert!(status.success(), "shell smoke failed: {status}");
+    }
+
+    #[test]
+    fn runtime_python_smoke_under_filter_when_available() {
+        let Some(python) = find_on_path("python3") else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+        let Ok(baseline) = Command::new(&python).arg("-c").arg("pass").status() else {
+            eprintln!("python3 baseline failed to start (test skipped)");
+            return;
+        };
+        if !baseline.success() {
+            eprintln!("python3 baseline failed (test skipped)");
+            return;
+        }
+
+        let status = run_with_seccomp(&python, &["-c", "pass"], &ProcessPolicy::default())
+            .expect("python3 should exist after baseline check");
+
+        assert!(status.success(), "python smoke failed: {status}");
+    }
+
+    #[test]
+    fn runtime_configured_blocked_syscall_denies_process() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["write".into()],
+            ..Default::default()
+        };
+        let Some(status) = run_with_seccomp("/bin/sh", &["-c", "echo denied"], &policy) else {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        };
+
+        assert!(
+            !status.success(),
+            "write-blocked shell unexpectedly succeeded"
+        );
+    }
+
+    fn run_with_seccomp(
+        program: &str,
+        args: &[&str],
+        policy: &ProcessPolicy,
+    ) -> Option<ExitStatus> {
+        if !std::path::Path::new(program).exists() {
+            return None;
+        }
+
+        let filter = prepare_seccomp(policy).expect("test policy should prepare seccomp");
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                filter
+                    .apply_current_process()
+                    .map_err(std::io::Error::from_raw_os_error)
+            });
+        }
+        Some(cmd.status().expect("seccomp runtime child should start"))
+    }
+
+    fn run_seccomp_errno_probe(
+        policy: &ProcessPolicy,
+        options: SeccompOptions,
+        probe: unsafe fn() -> libc::c_long,
+    ) -> i32 {
+        let filter =
+            prepare_seccomp_with_options(policy, options).expect("test policy should prepare");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    libc::_exit(PROBE_NO_NEW_PRIVS_FAILED);
+                }
+            }
+            if filter.apply_current_process().is_err() {
+                unsafe {
+                    libc::_exit(PROBE_SECCOMP_SETUP_FAILED);
+                }
+            }
+
+            let ret = unsafe { probe() };
+            if ret == -1 {
+                let errno = current_errno();
+                let code = if errno == libc::EPERM {
+                    PROBE_DENIED
+                } else {
+                    PROBE_UNEXPECTED_ERRNO
+                };
+                unsafe {
+                    libc::_exit(code);
+                }
+            }
+
+            unsafe {
+                libc::_exit(PROBE_ALLOWED);
             }
         }
-        assert!(!allowed.contains(&57), "fork should be removed");
-        assert!(!allowed.contains(&59), "execve should be removed");
-        assert!(allowed.contains(&0), "read should remain");
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid failed for seccomp probe");
+
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            PROBE_SIGNALLED
+        }
+    }
+
+    unsafe fn probe_execveat_empty_path() -> libc::c_long {
+        unsafe {
+            libc::syscall(
+                SYS_EXECVEAT as libc::c_long,
+                -1,
+                b"\0".as_ptr() as *const libc::c_char,
+                std::ptr::null::<*const libc::c_char>(),
+                std::ptr::null::<*const libc::c_char>(),
+                AT_EMPTY_PATH,
+            )
+        }
+    }
+
+    unsafe fn probe_inet_socket() -> libc::c_long {
+        unsafe {
+            libc::syscall(
+                SYS_SOCKET as libc::c_long,
+                libc::AF_INET,
+                libc::SOCK_STREAM,
+                0,
+            )
+        }
+    }
+
+    fn bpf_decision_for(
+        spec: &SeccompFilterSpec,
+        arch: u32,
+        syscall_nr: u32,
+        args: [u64; 6],
+    ) -> FilterDecision {
+        decode_seccomp_action(interpret_bpf(&spec.to_bpf(), arch, syscall_nr, args))
+    }
+
+    fn interpret_bpf(insns: &[BpfInsn], arch: u32, syscall_nr: u32, args: [u64; 6]) -> u32 {
+        let mut pc = 0usize;
+        let mut accumulator = 0u32;
+
+        loop {
+            let insn = insns
+                .get(pc)
+                .unwrap_or_else(|| panic!("seccomp BPF program fell off at pc {pc}"));
+            match insn.code {
+                code if code == (BPF_LD | BPF_W | BPF_ABS) => {
+                    accumulator = load_seccomp_word(insn.k, arch, syscall_nr, args);
+                    pc += 1;
+                }
+                code if code == (BPF_JMP | BPF_JEQ | BPF_K) => {
+                    let skip = if accumulator == insn.k {
+                        insn.jt
+                    } else {
+                        insn.jf
+                    };
+                    pc += 1 + usize::from(skip);
+                }
+                code if code == (BPF_JMP | BPF_JSET | BPF_K) => {
+                    let skip = if (accumulator & insn.k) != 0 {
+                        insn.jt
+                    } else {
+                        insn.jf
+                    };
+                    pc += 1 + usize::from(skip);
+                }
+                code if code == (BPF_RET | BPF_K) => return insn.k,
+                other => panic!("unsupported seccomp BPF opcode {other:#x} at pc {pc}"),
+            }
+        }
+    }
+
+    fn load_seccomp_word(offset: u32, arch: u32, syscall_nr: u32, args: [u64; 6]) -> u32 {
+        match offset {
+            SECCOMP_DATA_NR_OFFSET => syscall_nr,
+            SECCOMP_DATA_ARCH_OFFSET => arch,
+            offset
+                if (SECCOMP_DATA_ARGS_OFFSET..SECCOMP_DATA_ARGS_OFFSET + ARG_SIZE * 6)
+                    .contains(&offset) =>
+            {
+                let relative = offset - SECCOMP_DATA_ARGS_OFFSET;
+                let arg = args[(relative / ARG_SIZE) as usize];
+                match relative % ARG_SIZE {
+                    0 => arg as u32,
+                    4 => (arg >> 32) as u32,
+                    _ => panic!("unaligned seccomp argument load offset {offset}"),
+                }
+            }
+            _ => panic!("unsupported seccomp data load offset {offset}"),
+        }
+    }
+
+    fn decode_seccomp_action(action: u32) -> FilterDecision {
+        if action == SECCOMP_RET_KILL_PROCESS {
+            FilterDecision::KillProcess
+        } else if action == SECCOMP_RET_ALLOW {
+            FilterDecision::Allow
+        } else if (action & 0xffff_0000) == SECCOMP_RET_ERRNO {
+            FilterDecision::Errno((action & 0xffff) as i32)
+        } else {
+            panic!("unsupported seccomp return action {action:#x}")
+        }
+    }
+
+    fn find_on_path(binary: &str) -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(binary);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+        None
     }
 }

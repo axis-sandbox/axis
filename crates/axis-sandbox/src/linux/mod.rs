@@ -286,7 +286,16 @@ impl SandboxImpl for LinuxSandbox {
             landlock::prepare_landlock(&self.config.policy.filesystem, &self.config.workspace_dir)
                 .map_err(SandboxError::IsolationFailed)?;
         self.tmpdir_active = tmpdir_required;
-        let prepared_seccomp = seccomp::prepare_seccomp(&self.config.policy.process);
+        let prepared_seccomp = match seccomp::prepare_seccomp(&self.config.policy.process) {
+            Ok(filter) => filter,
+            Err(e) => {
+                let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                return Err(append_cleanup_failure(
+                    SandboxError::IsolationFailed(e),
+                    cleanup_error,
+                ));
+            }
+        };
 
         // ── Step 1: Create network namespace (parent side) ──
         // This creates the netns, veth pair, and iptables rules.
@@ -748,6 +757,36 @@ mod tests {
     }
 
     #[test]
+    fn start_cleans_tmpdir_when_seccomp_policy_preparation_fails() {
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let mut sandbox = test_sandbox(id, workspace.path(), None);
+        sandbox.config.policy.filesystem = FilesystemPolicy {
+            read_write: vec!["{tmpdir}".into()],
+            ..Default::default()
+        };
+        sandbox.config.policy.process = ProcessPolicy {
+            blocked_syscalls: vec!["not_a_real_syscall".into()],
+            ..Default::default()
+        };
+        let tmpdir = landlock::sandbox_tmpdir(workspace.path());
+
+        match SandboxImpl::start(&mut sandbox) {
+            Err(SandboxError::IsolationFailed(message)) => {
+                assert!(message.contains("unknown syscall"));
+            }
+            other => panic!("expected seccomp preparation failure, got {other:?}"),
+        }
+
+        assert!(!tmpdir.exists());
+        assert!(!sandbox.tmpdir_active);
+    }
+
+    #[test]
     fn resolve_identity_rejects_root_aliases() {
         let workspace = tempfile::tempdir().unwrap();
         let id = SandboxId::new();
@@ -836,6 +875,22 @@ mod tests {
             identity: strategy::IdentityStrategy::CurrentUser,
             proxy: strategy::ProxyStrategy::None,
             fallbacks: Vec::new(),
+        }
+    }
+
+    fn contract_landlock_available() -> bool {
+        match landlock::detect_abi_version() {
+            Ok(v) if v >= 3 => true,
+            Ok(v) => {
+                eprintln!(
+                    "Landlock ABI {v} cannot enforce the AXIS filesystem contract (test skipped)"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("Landlock not available: {e} (test skipped)");
+                false
+            }
         }
     }
 }
