@@ -46,6 +46,20 @@ pub struct AuditEvent {
     pub details: serde_json::Value,
 }
 
+/// Structured details for a kernel-rejected network bypass attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkBypassDetails {
+    pub observed_at: DateTime<Utc>,
+    pub source: Option<String>,
+    pub destination: String,
+    pub protocol: String,
+    pub source_port: Option<u16>,
+    pub destination_port: Option<u16>,
+    pub input_interface: Option<String>,
+    pub output_interface: Option<String>,
+    pub policy_context: String,
+}
+
 impl AuditEvent {
     pub fn new(
         category: EventCategory,
@@ -136,6 +150,26 @@ impl AuditLog {
         );
     }
 
+    pub fn network_bypass_detected(
+        &self,
+        sandbox_id: SandboxId,
+        details: NetworkBypassDetails,
+    ) {
+        let event = AuditEvent {
+            id: Uuid::new_v4(),
+            timestamp: details.observed_at,
+            category: EventCategory::SecurityFinding,
+            severity: Severity::High,
+            sandbox_id: Some(sandbox_id),
+            message: format!(
+                "network bypass attempt to {} rejected by firewall",
+                details.destination
+            ),
+            details: serde_json::to_value(details).unwrap_or_default(),
+        };
+        self.emit(&event);
+    }
+
     pub fn credential_leak_detected(&self, sandbox_id: SandboxId, pattern: &str) {
         self.emit(&AuditEvent::new(
             EventCategory::SecurityFinding,
@@ -209,6 +243,18 @@ impl AuditSink for FileSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingSink {
+        events: Arc<Mutex<Vec<AuditEvent>>>,
+    }
+
+    impl AuditSink for CapturingSink {
+        fn write(&self, event: &AuditEvent) -> Result<(), Box<dyn std::error::Error>> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
 
     #[test]
     fn create_and_serialize_event() {
@@ -229,5 +275,48 @@ mod tests {
         log.add_sink(Box::new(TracingSink));
         log.sandbox_created(SandboxId::new(), "test-policy");
         // No panic = success (tracing subscriber not installed in test, that's fine)
+    }
+
+    #[test]
+    fn network_bypass_detected_emits_structured_security_finding() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut log = AuditLog::new();
+        log.add_sink(Box::new(CapturingSink {
+            events: events.clone(),
+        }));
+        let sandbox_id = SandboxId(
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+        );
+        let observed_at = Utc::now();
+
+        log.network_bypass_detected(
+            sandbox_id,
+            NetworkBypassDetails {
+                observed_at,
+                source: Some("10.0.0.2".into()),
+                destination: "203.0.113.7".into(),
+                protocol: "TCP".into(),
+                source_port: Some(43100),
+                destination_port: Some(443),
+                input_interface: None,
+                output_interface: Some("axs000000000000".into()),
+                policy_context: "iptables OUTPUT LOG+REJECT".into(),
+            },
+        );
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert!(matches!(event.category, EventCategory::SecurityFinding));
+        assert!(matches!(event.severity, Severity::High));
+        assert_eq!(event.sandbox_id, Some(sandbox_id));
+        assert_eq!(event.timestamp, observed_at);
+        assert!(event.message.contains("203.0.113.7"));
+        assert_eq!(event.details["destination"], "203.0.113.7");
+        assert_eq!(event.details["destination_port"], 443);
+        assert_eq!(
+            event.details["policy_context"],
+            "iptables OUTPUT LOG+REJECT"
+        );
     }
 }

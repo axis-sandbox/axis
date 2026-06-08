@@ -32,6 +32,7 @@ const HELPER_PGROUP_DRAIN_INTERVAL_MS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyNetnsAllocation {
+    pub sandbox_id: SandboxId,
     pub namespace: String,
     pub veth_host: String,
     pub veth_sandbox: String,
@@ -176,6 +177,7 @@ pub fn proxy_netns_allocation(sandbox_id: SandboxId, proxy_port: u16) -> ProxyNe
     let sandbox_addr = proxy_addr_from_host_bits(network_host_bits + 2);
     let network_addr = proxy_addr_from_host_bits(network_host_bits);
     ProxyNetnsAllocation {
+        sandbox_id,
         namespace,
         veth_host,
         veth_sandbox,
@@ -254,6 +256,7 @@ fn create_command_plan_with_paths(
     let host = &allocation.veth_host;
     let sandbox = &allocation.veth_sandbox;
     let proxy_port = allocation.proxy_addr.port().to_string();
+    let bypass_log_prefix = super::bypass_audit::bypass_log_prefix(allocation.sandbox_id);
     vec![
         ip_with_paths(paths, ["netns", "add", ns]),
         ip_with_paths(
@@ -371,7 +374,7 @@ fn create_command_plan_with_paths(
                 "-j",
                 "LOG",
                 "--log-prefix",
-                "AXIS-BYPASS: ",
+                &bypass_log_prefix,
                 "--log-level",
                 "4",
             ],
@@ -2633,7 +2636,14 @@ mod tests {
                 allocation.host_addr
             ))
         }));
-        assert!(rendered.iter().any(|cmd| cmd.contains("AXIS-BYPASS: ")));
+        let bypass_prefix = crate::linux::bypass_audit::bypass_log_prefix(sandbox_id);
+        assert!(rendered.iter().any(|cmd| {
+            cmd.contains(&format!("iptables -A OUTPUT -j LOG --log-prefix {bypass_prefix}"))
+        }));
+        assert!(
+            bypass_prefix.len() <= crate::linux::bypass_audit::IPTABLES_LOG_PREFIX_LIMIT,
+            "iptables log prefix exceeded kernel limit"
+        );
         assert!(
             rendered
                 .iter()

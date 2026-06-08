@@ -31,6 +31,11 @@ const EXEC_OUTPUT_DIR: &str = ".axis-exec";
 const TIMEOUT_DESTROY_ATTEMPTS: usize = 3;
 const TIMEOUT_DESTROY_RETRY_DELAY_MS: u64 = 100;
 const LIFECYCLE_REAP_INTERVAL_MS: u64 = 100;
+#[cfg(all(target_os = "linux", not(test)))]
+const BYPASS_AUDIT_POLL_INTERVAL_MS: u64 = 250;
+
+#[cfg(target_os = "linux")]
+type BypassAuditTokens = std::sync::Arc<std::sync::Mutex<HashMap<String, SandboxId>>>;
 
 /// Atomic counter for allocating unique proxy ports.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(PROXY_PORT_BASE);
@@ -58,6 +63,8 @@ pub struct SandboxManager {
     inference_server: Option<InferenceServer>,
     audit: AuditLog,
     sandbox_base_dir: PathBuf,
+    #[cfg(target_os = "linux")]
+    bypass_audit_tokens: BypassAuditTokens,
 }
 
 impl SandboxManager {
@@ -72,7 +79,7 @@ impl SandboxManager {
     ) -> Self {
         let mut audit = AuditLog::new();
         audit.add_sink(Box::new(TracingSink));
-        if let Some(tx) = event_tx {
+        if let Some(tx) = event_tx.clone() {
             audit.add_sink(Box::new(BroadcastSink::new(tx)));
         }
 
@@ -81,6 +88,11 @@ impl SandboxManager {
 
         // Look for hip-worker binary in standard locations.
         let worker_binary = find_hip_worker();
+        #[cfg(target_os = "linux")]
+        let bypass_audit_tokens = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        #[cfg(all(target_os = "linux", not(test)))]
+        spawn_linux_bypass_audit_collector(bypass_audit_tokens.clone(), event_tx);
 
         Self {
             sandboxes: HashMap::new(),
@@ -88,6 +100,8 @@ impl SandboxManager {
             inference_server: None,
             audit,
             sandbox_base_dir,
+            #[cfg(target_os = "linux")]
+            bypass_audit_tokens,
         }
     }
 
@@ -128,6 +142,18 @@ impl SandboxManager {
         let extra_env =
             spawn_gpu_worker_from_shared(mgr.clone(), id, &policy, &workspace_dir).await;
 
+        #[cfg(target_os = "linux")]
+        let bypass_audit_tokens = {
+            let manager = mgr.lock().await;
+            manager.bypass_audit_tokens.clone()
+        };
+        #[cfg(target_os = "linux")]
+        let register_bypass_audit = policy_uses_proxy(&policy);
+        #[cfg(target_os = "linux")]
+        if register_bypass_audit {
+            register_bypass_audit_token(&bypass_audit_tokens, id);
+        }
+
         // 4. Create and start the sandbox process.
         let managed = match start_managed_sandbox(
             id,
@@ -144,6 +170,10 @@ impl SandboxManager {
         ) {
             Ok(managed) => managed,
             Err(e) => {
+                #[cfg(target_os = "linux")]
+                if register_bypass_audit {
+                    unregister_bypass_audit_token(&bypass_audit_tokens, id);
+                }
                 if gpu_enabled {
                     stop_gpu_worker_from_shared(mgr.clone(), &id).await;
                 }
@@ -176,9 +206,24 @@ impl SandboxManager {
             let _ = manager.reap_exited(&id)?;
             manager.exec_context(&id)?
         };
-        let inference_endpoint = ensure_inference_server_from_shared(mgr, &policy).await;
+        #[cfg(target_os = "linux")]
+        let bypass_audit_tokens = {
+            let manager = mgr.lock().await;
+            manager.bypass_audit_tokens.clone()
+        };
+        let inference_endpoint = ensure_inference_server_from_shared(mgr.clone(), &policy).await;
 
-        run_contained_exec(policy, workspace, env, inference_endpoint, command, args).await
+        run_contained_exec(
+            policy,
+            workspace,
+            env,
+            inference_endpoint,
+            #[cfg(target_os = "linux")]
+            bypass_audit_tokens,
+            command,
+            args,
+        )
+        .await
     }
 
     fn exec_context(
@@ -205,8 +250,14 @@ impl SandboxManager {
             .ok_or_else(|| format!("sandbox not found: {id}"))?;
 
         managed.sandbox.status = SandboxStatus::Stopping;
+        #[cfg(target_os = "linux")]
+        let unregister_bypass_audit = policy_uses_proxy(&managed.policy);
         let sandbox_cleanup = managed.sandbox.destroy().map_err(|e| e.to_string());
         shutdown_proxy(managed.proxy_shutdown.take());
+        #[cfg(target_os = "linux")]
+        if unregister_bypass_audit {
+            unregister_bypass_audit_token(&self.bypass_audit_tokens, *id);
+        }
 
         if managed.gpu_enabled {
             match self.gpu_manager.stop_worker(id) {
@@ -230,8 +281,16 @@ impl SandboxManager {
     fn reap_exited(&mut self, id: &SandboxId) -> Result<Option<i32>, String> {
         enum ReapOutcome {
             Running,
-            Exited { code: i32, gpu_enabled: bool },
-            Failed { error: String, gpu_enabled: bool },
+            Exited {
+                code: i32,
+                gpu_enabled: bool,
+                proxy_mode: bool,
+            },
+            Failed {
+                error: String,
+                gpu_enabled: bool,
+                proxy_mode: bool,
+            },
         }
 
         let outcome = {
@@ -243,16 +302,23 @@ impl SandboxManager {
                 Ok(Some(code)) => {
                     shutdown_proxy(managed.proxy_shutdown.take());
                     let gpu_enabled = managed.gpu_enabled;
-                    ReapOutcome::Exited { code, gpu_enabled }
+                    let proxy_mode = policy_uses_proxy(&managed.policy);
+                    ReapOutcome::Exited {
+                        code,
+                        gpu_enabled,
+                        proxy_mode,
+                    }
                 }
                 Ok(None) => ReapOutcome::Running,
                 Err(e) => {
                     managed.sandbox.status = SandboxStatus::Failed;
                     shutdown_proxy(managed.proxy_shutdown.take());
                     let gpu_enabled = managed.gpu_enabled;
+                    let proxy_mode = policy_uses_proxy(&managed.policy);
                     ReapOutcome::Failed {
                         error: e.to_string(),
                         gpu_enabled,
+                        proxy_mode,
                     }
                 }
             }
@@ -260,7 +326,17 @@ impl SandboxManager {
 
         match outcome {
             ReapOutcome::Running => Ok(None),
-            ReapOutcome::Exited { code, gpu_enabled } => {
+            ReapOutcome::Exited {
+                code,
+                gpu_enabled,
+                proxy_mode,
+            } => {
+                #[cfg(target_os = "linux")]
+                if proxy_mode {
+                    unregister_bypass_audit_token(&self.bypass_audit_tokens, *id);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = proxy_mode;
                 if gpu_enabled {
                     match self.gpu_manager.stop_worker(id) {
                         Ok(()) => {
@@ -274,7 +350,17 @@ impl SandboxManager {
                 tracing::info!("sandbox {id}: exited with code {code}");
                 Ok(Some(code))
             }
-            ReapOutcome::Failed { error, gpu_enabled } => {
+            ReapOutcome::Failed {
+                error,
+                gpu_enabled,
+                proxy_mode,
+            } => {
+                #[cfg(target_os = "linux")]
+                if proxy_mode {
+                    unregister_bypass_audit_token(&self.bypass_audit_tokens, *id);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = proxy_mode;
                 if gpu_enabled {
                     match self.gpu_manager.stop_worker(id) {
                         Ok(()) => {
@@ -728,10 +814,17 @@ async fn run_contained_exec(
     workspace: PathBuf,
     env: Vec<(String, String)>,
     inference_endpoint: Option<SocketAddr>,
+    #[cfg(target_os = "linux")] bypass_audit_tokens: BypassAuditTokens,
     command: String,
     args: Vec<String>,
 ) -> Result<i32, String> {
     let exec_id = SandboxId::new();
+    #[cfg(target_os = "linux")]
+    let _bypass_audit_registration = scoped_bypass_audit_token_registration(
+        &bypass_audit_tokens,
+        exec_id,
+        policy_uses_proxy(&policy),
+    );
     let (exec_proxy_addr, mut exec_proxy_shutdown) =
         start_proxy_for_sandbox(exec_id, &policy, inference_endpoint).await?;
     let config = contained_exec_config_from(
@@ -916,6 +1009,119 @@ fn proxy_bind_addr_for_sandbox(id: SandboxId, proxy_port: u16, policy: &Policy) 
 fn shutdown_proxy(tx: Option<tokio::sync::oneshot::Sender<()>>) {
     if let Some(tx) = tx {
         let _ = tx.send(());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn register_bypass_audit_token(tokens: &BypassAuditTokens, id: SandboxId) {
+    let token = axis_sandbox::linux::bypass_audit::bypass_log_token(id);
+    match tokens.lock() {
+        Ok(mut tokens) => {
+            tokens.insert(token, id);
+        }
+        Err(_) => tracing::warn!("sandbox {id}: bypass audit token registry is poisoned"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unregister_bypass_audit_token(tokens: &BypassAuditTokens, id: SandboxId) {
+    let token = axis_sandbox::linux::bypass_audit::bypass_log_token(id);
+    match tokens.lock() {
+        Ok(mut tokens) => {
+            tokens.remove(&token);
+        }
+        Err(_) => tracing::warn!("sandbox {id}: bypass audit token registry is poisoned"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ScopedBypassAuditTokenRegistration {
+    tokens: BypassAuditTokens,
+    id: SandboxId,
+    registered: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn scoped_bypass_audit_token_registration(
+    tokens: &BypassAuditTokens,
+    id: SandboxId,
+    enabled: bool,
+) -> ScopedBypassAuditTokenRegistration {
+    if enabled {
+        register_bypass_audit_token(tokens, id);
+    }
+    ScopedBypassAuditTokenRegistration {
+        tokens: tokens.clone(),
+        id,
+        registered: enabled,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopedBypassAuditTokenRegistration {
+    fn drop(&mut self) {
+        if self.registered {
+            unregister_bypass_audit_token(&self.tokens, self.id);
+            self.registered = false;
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn spawn_linux_bypass_audit_collector(
+    tokens: BypassAuditTokens,
+    event_tx: Option<tokio::sync::broadcast::Sender<AuditEvent>>,
+) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("axis-bypass-audit".into())
+        .spawn(move || run_linux_bypass_audit_collector(tokens, event_tx))
+    {
+        tracing::warn!("linux bypass audit collector disabled: {e}");
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn run_linux_bypass_audit_collector(
+    tokens: BypassAuditTokens,
+    event_tx: Option<tokio::sync::broadcast::Sender<AuditEvent>>,
+) {
+    let mut audit = AuditLog::new();
+    audit.add_sink(Box::new(TracingSink));
+    if let Some(tx) = event_tx {
+        audit.add_sink(Box::new(BroadcastSink::new(tx)));
+    }
+
+    let file = match axis_sandbox::linux::bypass_audit::open_kernel_log_source() {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::info!("linux bypass audit collector disabled: cannot read /dev/kmsg: {e}");
+            return;
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
+
+    loop {
+        let token_snapshot = match tokens.lock() {
+            Ok(tokens) => tokens.clone(),
+            Err(_) => {
+                tracing::warn!("linux bypass audit collector stopped: token registry is poisoned");
+                return;
+            }
+        };
+
+        if let Err(e) = axis_sandbox::linux::bypass_audit::collect_available_bypass_events(
+            &mut reader,
+            &token_snapshot,
+            &audit,
+        ) {
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                tracing::warn!("linux bypass audit collector read failed: {e}");
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            BYPASS_AUDIT_POLL_INTERVAL_MS,
+        ));
     }
 }
 
@@ -1394,6 +1600,50 @@ mod tests {
                 ("CLAUDE_CODE_ENTRYPOINT".into(), "entrypoint".into())
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bypass_audit_token_registry_tracks_active_proxy_sandboxes() {
+        let tokens = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let sandbox_id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let token = axis_sandbox::linux::bypass_audit::bypass_log_token(sandbox_id);
+
+        register_bypass_audit_token(&tokens, sandbox_id);
+
+        assert_eq!(tokens.lock().unwrap().get(&token), Some(&sandbox_id));
+
+        unregister_bypass_audit_token(&tokens, sandbox_id);
+
+        assert!(!tokens.lock().unwrap().contains_key(&token));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_bypass_audit_registration_unregisters_on_drop() {
+        let tokens = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let sandbox_id = SandboxId::from_str("00000000-0000-4000-8000-000000000011").unwrap();
+        let token = axis_sandbox::linux::bypass_audit::bypass_log_token(sandbox_id);
+
+        {
+            let _registration = scoped_bypass_audit_token_registration(&tokens, sandbox_id, true);
+
+            assert_eq!(tokens.lock().unwrap().get(&token), Some(&sandbox_id));
+        }
+
+        assert!(!tokens.lock().unwrap().contains_key(&token));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disabled_scoped_bypass_audit_registration_is_noop() {
+        let tokens = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let sandbox_id = SandboxId::from_str("00000000-0000-4000-8000-000000000012").unwrap();
+        let token = axis_sandbox::linux::bypass_audit::bypass_log_token(sandbox_id);
+
+        let _registration = scoped_bypass_audit_token_registration(&tokens, sandbox_id, false);
+
+        assert!(!tokens.lock().unwrap().contains_key(&token));
     }
 
     #[test]

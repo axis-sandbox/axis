@@ -4,6 +4,7 @@
 //! Linux sandbox implementation using Landlock, seccomp-BPF, and network namespaces.
 
 mod bwrap;
+pub mod bypass_audit;
 mod identity;
 pub mod landlock;
 pub mod netns;
