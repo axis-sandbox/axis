@@ -300,6 +300,15 @@ impl SeccompOptions {
             socket_domain_policy: SocketDomainPolicy::DenyAllExcept(vec![AF_UNIX]),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn denies_non_unix_socket_domains(&self) -> bool {
+        matches!(
+            &self.socket_domain_policy,
+            SocketDomainPolicy::DenyAllExcept(allowed_domains)
+                if allowed_domains.as_slice() == [AF_UNIX]
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -988,7 +997,7 @@ mod tests {
     #[test]
     fn runtime_execveat_empty_path_flag_is_denied_by_kernel_filter() {
         assert_eq!(
-            run_seccomp_errno_probe(
+            run_seccomp_probe(
                 &ProcessPolicy::default(),
                 SeccompOptions::default(),
                 probe_execveat_empty_path,
@@ -998,14 +1007,28 @@ mod tests {
     }
 
     #[test]
-    fn runtime_socket_domain_filter_denies_inet_socket() {
+    fn runtime_socket_domain_filter_denies_ip_sockets_and_preserves_unix() {
+        let options = SeccompOptions::deny_network_socket_domains();
+
         assert_eq!(
-            run_seccomp_errno_probe(
+            run_seccomp_probe(
                 &ProcessPolicy::default(),
-                SeccompOptions::deny_network_socket_domains(),
-                probe_inet_socket,
+                options.clone(),
+                probe_inet_socket
             ),
             PROBE_DENIED
+        );
+        assert_eq!(
+            run_seccomp_probe(
+                &ProcessPolicy::default(),
+                options.clone(),
+                probe_inet6_socket
+            ),
+            PROBE_DENIED
+        );
+        assert_eq!(
+            run_seccomp_probe(&ProcessPolicy::default(), options, probe_unix_socketpair),
+            PROBE_ALLOWED
         );
     }
 
@@ -1083,7 +1106,7 @@ mod tests {
         Some(cmd.status().expect("seccomp runtime child should start"))
     }
 
-    fn run_seccomp_errno_probe(
+    fn run_seccomp_probe(
         policy: &ProcessPolicy,
         options: SeccompOptions,
         probe: unsafe fn() -> libc::c_long,
@@ -1154,6 +1177,30 @@ mod tests {
                 libc::AF_INET,
                 libc::SOCK_STREAM,
                 0,
+            )
+        }
+    }
+
+    unsafe fn probe_inet6_socket() -> libc::c_long {
+        unsafe {
+            libc::syscall(
+                SYS_SOCKET as libc::c_long,
+                libc::AF_INET6,
+                libc::SOCK_STREAM,
+                0,
+            )
+        }
+    }
+
+    unsafe fn probe_unix_socketpair() -> libc::c_long {
+        let mut fds = [0; 2];
+        unsafe {
+            libc::syscall(
+                SYS_SOCKETPAIR as libc::c_long,
+                AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                fds.as_mut_ptr(),
             )
         }
     }

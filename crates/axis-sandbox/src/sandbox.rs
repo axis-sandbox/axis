@@ -72,21 +72,41 @@ pub struct Sandbox {
 impl Sandbox {
     /// Create a new sandbox with platform-specific isolation.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
+        Self::create_inner(config, true)
+    }
+
+    /// Create an isolated process for an already prepared managed workspace.
+    ///
+    /// This skips agent workspace symlink setup/cleanup so short-lived daemon
+    /// exec commands do not disturb symlinks owned by the primary sandbox.
+    pub fn create_for_exec(config: SandboxConfig) -> Result<Self, SandboxError> {
+        Self::create_inner(config, false)
+    }
+
+    fn create_inner(
+        config: SandboxConfig,
+        manage_agent_workspace: bool,
+    ) -> Result<Self, SandboxError> {
         // Prepare agent workspace: create ~/.axis/agents/<name>/ and
         // symlink agent-expected directories (e.g., ~/.claude) to it.
-        let mut agent_symlinks = crate::workspace::prepare_agent_workspace(
-            &config.policy.name,
-            &config.policy.filesystem.read_write,
-        ).unwrap_or_else(|e| {
-            tracing::warn!("workspace prep: {e}");
+        let mut agent_symlinks = if manage_agent_workspace {
+            crate::workspace::prepare_agent_workspace(
+                &config.policy.name,
+                &config.policy.filesystem.read_write,
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!("workspace prep: {e}");
+                Vec::new()
+            })
+        } else {
             Vec::new()
-        });
+        };
 
         // Prepare scoped SSH if policy has SSH key specs.
-        if !config.policy.ssh.allowed_keys.is_empty() {
-            if let Ok(Some(ssh_dir)) = crate::workspace::prepare_ssh_workspace(
-                &config.policy.name, &config.policy.ssh,
-            ) {
+        if manage_agent_workspace && !config.policy.ssh.allowed_keys.is_empty() {
+            if let Ok(Some(ssh_dir)) =
+                crate::workspace::prepare_ssh_workspace(&config.policy.name, &config.policy.ssh)
+            {
                 // Symlink ~/.ssh -> contained ssh dir (only if real ~/.ssh doesn't exist).
                 if let Ok(home) = std::env::var("HOME") {
                     let ssh_link = PathBuf::from(&home).join(".ssh");
@@ -158,19 +178,29 @@ pub(crate) trait SandboxImpl: Send {
     fn start(&mut self) -> Result<u32, SandboxError>;
 
     /// Wait for the process to exit.
-    fn wait(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>;
+    fn wait(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>;
 
     /// Take captured stdout handle (if capture_output was enabled).
-    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> { None }
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        None
+    }
 
     /// Take captured stderr handle (if capture_output was enabled).
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> { None }
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        None
+    }
 
     /// Take captured stdin handle for writing input to the child.
-    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> { None }
+    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        None
+    }
 
     /// Take ConPTY read handle (Windows only — provides merged TTY output).
-    fn take_pty_read(&mut self) -> Option<std::fs::File> { None }
+    fn take_pty_read(&mut self) -> Option<std::fs::File> {
+        None
+    }
 
     /// Kill the process and clean up isolation resources.
     fn destroy(&mut self) -> Result<(), SandboxError>;

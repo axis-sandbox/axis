@@ -53,6 +53,7 @@ pub(crate) enum NetworkStrategy {
         sandbox_addr: Ipv4Addr,
         proxy_port: u16,
     },
+    BlockedBySeccomp,
     AllowHost,
 }
 
@@ -298,10 +299,7 @@ fn plan_network(
     match policy.network.mode {
         NetworkMode::Block => {
             reject_endpoint_policies_for_non_proxy(policy, "block")?;
-            Err(StrategyError::new(
-                "network",
-                "network block mode requires the policy-aware socket-domain filter that is not implemented yet",
-            ))
+            Ok((NetworkStrategy::BlockedBySeccomp, ProxyStrategy::None))
         }
         NetworkMode::Allow => {
             reject_endpoint_policies_for_non_proxy(policy, "allow")?;
@@ -871,21 +869,21 @@ mod tests {
     }
 
     #[test]
-    fn block_mode_rejects_until_socket_domain_filter_exists() {
-        let err = plan_with_probe(
+    fn block_mode_uses_seccomp_socket_filter_without_proxy() {
+        let plan = plan_with_probe(
             &policy(NetworkMode::Block),
             SandboxId::new(),
             tempfile::tempdir().unwrap().path(),
-            0,
-            None,
+            3128,
+            proxy_bind(3128),
             &FakeProbe {
                 snapshot: full_caps(),
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(err.area, "network");
-        assert!(err.message.contains("socket-domain filter"));
+        assert_eq!(plan.network, NetworkStrategy::BlockedBySeccomp);
+        assert_eq!(plan.proxy, ProxyStrategy::None);
     }
 
     #[test]
