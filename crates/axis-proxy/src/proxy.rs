@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 #[cfg(target_os = "linux")]
 use tokio::net::TcpSocket;
 
-use crate::identity::TofuStore;
+use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -130,18 +130,30 @@ impl AxisProxy {
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
+            let proxy_addr = stream.local_addr()?;
+            // Resolve immediately after accept, before any sandbox-controlled
+            // request bytes are consumed. TCP does not expose kernel
+            // connect-time credentials, so ambiguous proc identities fail
+            // closed inside the resolver.
+            let binary_identity = resolve_binary_identity(peer_addr, proxy_addr);
             let sandbox_id = self.config.sandbox_id;
             let state = Arc::clone(&self.state);
             let enable_l7 = self.config.enable_l7;
             let inference_endpoint = self.config.inference_endpoint;
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(sandbox_id, stream, peer_addr, state, enable_l7, inference_endpoint).await
+                if let Err(e) = handle_connection(
+                    sandbox_id,
+                    stream,
+                    peer_addr,
+                    binary_identity,
+                    state,
+                    enable_l7,
+                    inference_endpoint,
+                )
+                .await
                 {
-                    tracing::warn!(
-                        "sandbox {sandbox_id}: connection from {peer_addr} failed: {e}"
-                    );
+                    tracing::warn!("sandbox {sandbox_id}: connection from {peer_addr} failed: {e}");
                 }
             });
         }
@@ -210,13 +222,31 @@ fn set_ip_freebind(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 /// Handle a single proxy connection with full policy evaluation.
 async fn handle_connection(
     sandbox_id: SandboxId,
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
+    binary_identity: Result<Option<BinaryFingerprint>, IdentityError>,
     state: Arc<Mutex<ProxyState>>,
     _enable_l7: bool,
     inference_endpoint: Option<SocketAddr>,
 ) -> Result<(), ProxyError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let identity_check = {
+        let mut st = state.lock().unwrap();
+        verify_binary_identity(&mut st.tofu_store, binary_identity)
+    };
+    let (binary_path, binary_sha256) = match identity_check {
+        Ok(identity) => identity,
+        Err(e) => {
+            tracing::warn!("sandbox {sandbox_id}: binary identity check failed: {e}");
+            send_forbidden_response(
+                &mut stream,
+                "AXIS policy denied connection\r\nReason: binary identity check failed\r\n",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let mut reader = BufReader::new(stream);
 
@@ -236,27 +266,9 @@ async fn handle_connection(
         }
     }
 
-    // 3. Resolve calling binary identity.
-    //    On Linux we'd resolve via /proc/net/tcp → PID → /proc/[pid]/exe.
-    //    For now, use the peer address to identify the caller.
-    let binary_path = resolve_binary_path(peer_addr);
-    let binary_sha256 = "unknown".to_string();
-
     // 4. Evaluate OPA network policy.
     let decision = {
         let mut st = state.lock().unwrap();
-
-        // TOFU identity check (if we have a real path).
-        if binary_path != "unknown" {
-            if let Ok(path) = std::path::Path::new(&binary_path).canonicalize() {
-                match st.tofu_store.verify(&path) {
-                    Ok(_fp) => {}
-                    Err(e) => {
-                        tracing::warn!("sandbox {sandbox_id}: TOFU check failed for {binary_path}: {e}");
-                    }
-                }
-            }
-        }
 
         let action = NetworkAction {
             host: host.clone(),
@@ -266,17 +278,14 @@ async fn handle_connection(
             sandbox_id,
         };
 
-        let decision = st
-            .policy_engine
-            .eval_network(&action)
-            .unwrap_or_else(|e| {
-                tracing::error!("OPA eval failed: {e}, defaulting to deny");
-                axis_core::types::PolicyDecision {
-                    allowed: false,
-                    matched_policy: None,
-                    reason: Some(format!("OPA error: {e}")),
-                }
-            });
+        let decision = st.policy_engine.eval_network(&action).unwrap_or_else(|e| {
+            tracing::error!("OPA eval failed: {e}, defaulting to deny");
+            axis_core::types::PolicyDecision {
+                allowed: false,
+                matched_policy: None,
+                reason: Some(format!("OPA error: {e}")),
+            }
+        });
 
         // Audit log the decision.
         st.audit_log
@@ -287,24 +296,16 @@ async fn handle_connection(
 
     // 5. Enforce the decision.
     if !decision.allowed {
-        let reason = decision
-            .reason
-            .as_deref()
-            .unwrap_or("policy denied");
+        let reason = decision.reason.as_deref().unwrap_or("policy denied");
         tracing::info!(
             "sandbox {sandbox_id}: DENIED {host}:{port} (binary={binary_path}, reason={reason})"
         );
 
         // Send HTTP 403 Forbidden.
         let mut stream = reader.into_inner();
-        let body = format!(
-            "AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n"
-        );
-        let response = format!(
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await?;
+        let body =
+            format!("AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n");
+        send_forbidden_response(&mut stream, &body).await?;
         return Ok(());
     }
 
@@ -318,9 +319,7 @@ async fn handle_connection(
     let is_inference_local = host == "inference.local" || host.starts_with("inference.local:");
     let upstream_target = if is_inference_local {
         if let Some(ep) = inference_endpoint {
-            tracing::info!(
-                "sandbox {sandbox_id}: routing inference.local -> {ep}"
-            );
+            tracing::info!("sandbox {sandbox_id}: routing inference.local -> {ep}");
             ep.to_string()
         } else {
             // No inference endpoint configured — return 502.
@@ -366,27 +365,21 @@ async fn handle_connection(
 async fn relay_with_l7_inspection(
     sandbox_id: SandboxId,
     hostname: &str,
-    mut client: tokio::net::TcpStream,
+    client: tokio::net::TcpStream,
     upstream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxyState>>,
 ) -> Result<(), ProxyError> {
-    use tokio::io::AsyncReadExt;
-
     // Peek first byte to detect TLS ClientHello (0x16 = TLS handshake).
     let mut peek_buf = [0u8; 1];
     let n = client.peek(&mut peek_buf).await?;
 
     if n > 0 && peek_buf[0] == 0x16 {
         // TLS detected — terminate and inspect.
-        tracing::debug!(
-            "sandbox {sandbox_id}: L7 TLS detected for {hostname}, terminating"
-        );
+        tracing::debug!("sandbox {sandbox_id}: L7 TLS detected for {hostname}, terminating");
         relay_tls_inspected(sandbox_id, hostname, client, upstream, state).await
     } else {
         // Not TLS — relay with leak detection on plaintext.
-        tracing::debug!(
-            "sandbox {sandbox_id}: L7 plaintext for {hostname}"
-        );
+        tracing::debug!("sandbox {sandbox_id}: L7 plaintext for {hostname}");
         relay_with_leak_detection(sandbox_id, client, upstream, state).await
     }
 }
@@ -429,9 +422,7 @@ async fn relay_tls_inspected(
         .await
         .map_err(|e| ProxyError::ConnectionError(format!("TLS accept: {e}")))?;
 
-    tracing::info!(
-        "sandbox {sandbox_id}: L7 TLS terminated for {hostname}"
-    );
+    tracing::info!("sandbox {sandbox_id}: L7 TLS terminated for {hostname}");
 
     // Now relay plaintext between decrypted client and raw upstream.
     // The upstream connection stays plaintext (the proxy is the TLS endpoint).
@@ -445,7 +436,9 @@ async fn relay_tls_inspected(
         let mut buf = vec![0u8; 65536];
         loop {
             let n = tokio::io::AsyncReadExt::read(&mut cr, &mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
 
             // Scan decrypted outgoing data for credential leaks.
             {
@@ -455,7 +448,8 @@ async fn relay_tls_inspected(
                     for f in &findings {
                         tracing::warn!(
                             "sandbox {sid}: L7 CREDENTIAL LEAK in TLS traffic: {} at offset {}",
-                            f.pattern_name, f.byte_offset,
+                            f.pattern_name,
+                            f.byte_offset,
                         );
                         st.audit_log.credential_leak_detected(sid, f.pattern_name);
                     }
@@ -531,10 +525,8 @@ async fn relay_with_leak_detection(
                             finding.pattern_name,
                             finding.byte_offset,
                         );
-                        st.audit_log.credential_leak_detected(
-                            sandbox_id,
-                            finding.pattern_name,
-                        );
+                        st.audit_log
+                            .credential_leak_detected(sandbox_id, finding.pattern_name);
                     }
                     if !findings.is_empty() {
                         // Block the data — don't forward it.
@@ -565,19 +557,49 @@ async fn relay_with_leak_detection(
 }
 
 /// Resolve the calling binary path from the peer address.
-/// On Linux: /proc/net/tcp → socket inode → PID → /proc/[pid]/exe.
-fn resolve_binary_path(peer_addr: SocketAddr) -> String {
+/// On Linux: /proc/[pid]/net/tcp → socket inode → PID → /proc/[pid]/exe.
+fn resolve_binary_identity(
+    peer_addr: SocketAddr,
+    proxy_addr: SocketAddr,
+) -> Result<Option<BinaryFingerprint>, IdentityError> {
     #[cfg(target_os = "linux")]
     {
-        match crate::identity::resolve_peer_binary(peer_addr) {
-            Ok(path) => return path.to_string_lossy().into_owned(),
-            Err(e) => {
-                tracing::debug!("binary resolution failed for {peer_addr}: {e}");
-            }
-        }
+        crate::identity::resolve_peer_identity(peer_addr, proxy_addr).map(Some)
     }
-    let _ = peer_addr;
-    "unknown".to_string()
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = peer_addr;
+        let _ = proxy_addr;
+        Ok(None)
+    }
+}
+
+fn verify_binary_identity(
+    tofu_store: &mut TofuStore,
+    identity: Result<Option<BinaryFingerprint>, IdentityError>,
+) -> Result<(String, String), IdentityError> {
+    let Some(identity) = identity? else {
+        return Ok(("unknown".into(), "unknown".into()));
+    };
+    tofu_store.verify_fingerprint(&identity)?;
+    Ok((
+        identity.path.to_string_lossy().into_owned(),
+        identity.sha256,
+    ))
+}
+
+async fn send_forbidden_response(
+    stream: &mut tokio::net::TcpStream,
+    body: &str,
+) -> Result<(), ProxyError> {
+    use tokio::io::AsyncWriteExt;
+
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
 }
 
 /// Parse "CONNECT host:port HTTP/1.1" into (host, port).
@@ -606,8 +628,7 @@ mod tests {
 
     #[test]
     fn parse_connect_host_port() {
-        let (host, port) =
-            parse_connect_target("CONNECT api.github.com:443 HTTP/1.1\r\n").unwrap();
+        let (host, port) = parse_connect_target("CONNECT api.github.com:443 HTTP/1.1\r\n").unwrap();
         assert_eq!(host, "api.github.com");
         assert_eq!(port, 443);
     }
@@ -639,6 +660,51 @@ mod tests {
         assert!(!linux_proxy_bind_requires_freebind(
             "[::1]:3128".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn verify_binary_identity_preserves_unsupported_unknown() {
+        let mut tofu_store = TofuStore::new();
+        let identity = verify_binary_identity(&mut tofu_store, Ok(None)).unwrap();
+        assert_eq!(identity, ("unknown".into(), "unknown".into()));
+    }
+
+    #[test]
+    fn verify_binary_identity_propagates_resolver_error() {
+        let mut tofu_store = TofuStore::new();
+        let err = verify_binary_identity(
+            &mut tofu_store,
+            Err(IdentityError::ResolveFailed {
+                pid: 0,
+                reason: "ambiguous socket owner".into(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IdentityError::ResolveFailed { .. }));
+    }
+
+    #[test]
+    fn verify_binary_identity_rejects_tofu_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("binary");
+        std::fs::write(&binary, b"content").unwrap();
+        let mut tofu_store = TofuStore::new();
+        tofu_store
+            .verify_fingerprint(&BinaryFingerprint {
+                path: binary.clone(),
+                sha256: "0".repeat(64),
+            })
+            .unwrap();
+
+        let err = verify_binary_identity(
+            &mut tofu_store,
+            Ok(Some(BinaryFingerprint {
+                path: binary,
+                sha256: "1".repeat(64),
+            })),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IdentityError::HashMismatch { .. }));
     }
 
     #[test]
@@ -705,6 +771,9 @@ network:
             sandbox_id: SandboxId::new(),
         };
         let deny_decision = st.policy_engine.eval_network(&deny_action).unwrap();
-        assert!(!deny_decision.allowed, "expected deny, got: {deny_decision:?}");
+        assert!(
+            !deny_decision.allowed,
+            "expected deny, got: {deny_decision:?}"
+        );
     }
 }

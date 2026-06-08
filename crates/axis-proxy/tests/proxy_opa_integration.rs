@@ -43,7 +43,14 @@ async fn start_proxy() -> (SandboxId, std::net::SocketAddr) {
 async fn start_proxy_with_inference(
     inference_ep: Option<std::net::SocketAddr>,
 ) -> (SandboxId, std::net::SocketAddr) {
-    let policy = Policy::from_yaml(TEST_POLICY).unwrap();
+    start_proxy_with_policy(TEST_POLICY, inference_ep).await
+}
+
+async fn start_proxy_with_policy(
+    policy_yaml: &str,
+    inference_ep: Option<std::net::SocketAddr>,
+) -> (SandboxId, std::net::SocketAddr) {
+    let policy = Policy::from_yaml(policy_yaml).unwrap();
     let sandbox_id = SandboxId::new();
     let config = ProxyConfig {
         sandbox_id,
@@ -66,6 +73,15 @@ async fn start_proxy_with_inference(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     (sandbox_id, addr)
+}
+
+async fn start_mock_tcp_server() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+    addr
 }
 
 /// Send a CONNECT request and return the response status line.
@@ -136,6 +152,65 @@ async fn second_allowed_host() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
+async fn binary_policy_allows_current_test_binary() {
+    let binary_path = std::env::current_exe().unwrap();
+    let policy = format!(
+        r#"
+version: 1
+name: proxy-binary-allow-test
+
+network:
+  mode: proxy
+  policies:
+    - name: current-test-binary
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+      binaries:
+        - path: "{}"
+"#,
+        binary_path.to_string_lossy()
+    );
+    let upstream = start_mock_tcp_server().await;
+    let (_sandbox_id, addr) = start_proxy_with_policy(&policy, Some(upstream)).await;
+
+    let response = send_connect(addr, "inference.local:443").await;
+    assert!(
+        response.contains("200"),
+        "expected current test binary to match policy, got: {response}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn binary_policy_does_not_fall_back_to_unknown_when_identity_is_available() {
+    let policy = r#"
+version: 1
+name: proxy-binary-no-unknown-fallback-test
+
+network:
+  mode: proxy
+  policies:
+    - name: unknown-fallback
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+      binaries:
+        - path: "unknown"
+"#;
+    let (_sandbox_id, addr) = start_proxy_with_policy(policy, None).await;
+
+    let response = send_connect(addr, "inference.local:443").await;
+    assert!(
+        response.contains("403"),
+        "expected real binary identity instead of unknown fallback, got: {response}"
+    );
+}
+
+#[tokio::test]
 async fn inference_local_without_endpoint_gets_502() {
     // No inference endpoint configured — should get 502 Bad Gateway.
     let (_sandbox_id, addr) = start_proxy_with_inference(None).await;
@@ -159,7 +234,8 @@ async fn inference_local_routes_to_endpoint() {
             // Read whatever the client sends and respond.
             let mut buf = [0u8; 4096];
             let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"model\":\"test\"}";
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"model\":\"test\"}";
             let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
         }
     });
@@ -193,7 +269,9 @@ async fn inference_local_routes_to_endpoint() {
 
     // Read the mock server's response through the tunnel.
     let mut buf = vec![0u8; 4096];
-    let n = tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut read_half, &mut buf)
+        .await
+        .unwrap();
     let body = String::from_utf8_lossy(&buf[..n]);
     assert!(
         body.contains("\"model\":\"test\""),
