@@ -167,6 +167,18 @@ impl Sandbox {
         Ok(code)
     }
 
+    /// Reap the sandboxed process if it has already exited.
+    pub fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
+        if !matches!(self.status, SandboxStatus::Running) {
+            return Ok(None);
+        }
+        let Some(code) = self.inner.try_wait()? else {
+            return Ok(None);
+        };
+        self.status = SandboxStatus::Stopped;
+        Ok(Some(code))
+    }
+
     /// Terminate the sandboxed process and clean up resources.
     pub fn destroy(&mut self) -> Result<(), SandboxError> {
         self.inner.destroy()?;
@@ -186,6 +198,9 @@ pub(crate) trait SandboxImpl: Send {
     fn wait(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>;
+
+    /// Reap the child process if it has already exited without blocking.
+    fn try_wait(&mut self) -> Result<Option<i32>, SandboxError>;
 
     /// Take captured stdout handle (if capture_output was enabled).
     fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {

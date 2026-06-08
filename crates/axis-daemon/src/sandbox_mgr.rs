@@ -30,6 +30,7 @@ const PROXY_PORT_BASE: u16 = 13100;
 const EXEC_OUTPUT_DIR: &str = ".axis-exec";
 const TIMEOUT_DESTROY_ATTEMPTS: usize = 3;
 const TIMEOUT_DESTROY_RETRY_DELAY_MS: u64 = 100;
+const LIFECYCLE_REAP_INTERVAL_MS: u64 = 100;
 
 /// Atomic counter for allocating unique proxy ports.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(PROXY_PORT_BASE);
@@ -108,6 +109,7 @@ impl SandboxManager {
         };
         let policy_name = policy.name.clone();
         let gpu_enabled = policy.gpu.enabled;
+        let timeout_sec = policy.process.timeout_sec;
 
         // 1. Start inference server if policy has routes with a local endpoint.
         let inference_endpoint = ensure_inference_server_from_shared(mgr.clone(), &policy).await;
@@ -150,9 +152,13 @@ impl SandboxManager {
             }
         };
 
-        let mut manager = mgr.lock().await;
-        manager.audit.sandbox_created(id, &policy_name);
-        manager.sandboxes.insert(id, managed);
+        {
+            let mut manager = mgr.lock().await;
+            manager.audit.sandbox_created(id, &policy_name);
+            manager.sandboxes.insert(id, managed);
+        }
+
+        spawn_sandbox_lifecycle(mgr, id, timeout_sec);
 
         Ok(id)
     }
@@ -166,7 +172,8 @@ impl SandboxManager {
         args: Vec<String>,
     ) -> Result<i32, String> {
         let (policy, workspace, env) = {
-            let manager = mgr.lock().await;
+            let mut manager = mgr.lock().await;
+            let _ = manager.reap_exited(&id)?;
             manager.exec_context(&id)?
         };
         let inference_endpoint = ensure_inference_server_from_shared(mgr, &policy).await;
@@ -182,6 +189,7 @@ impl SandboxManager {
             .sandboxes
             .get(id)
             .ok_or_else(|| format!("sandbox not found: {id}"))?;
+        ensure_sandbox_running(id, managed.sandbox.status)?;
         Ok((
             managed.policy.clone(),
             managed.sandbox.workspace_dir.clone(),
@@ -196,12 +204,14 @@ impl SandboxManager {
             .get_mut(id)
             .ok_or_else(|| format!("sandbox not found: {id}"))?;
 
+        managed.sandbox.status = SandboxStatus::Stopping;
         let sandbox_cleanup = managed.sandbox.destroy().map_err(|e| e.to_string());
         shutdown_proxy(managed.proxy_shutdown.take());
 
         if managed.gpu_enabled {
-            if let Err(e) = self.gpu_manager.stop_worker(id) {
-                tracing::warn!("sandbox {id}: GPU worker cleanup: {e}");
+            match self.gpu_manager.stop_worker(id) {
+                Ok(()) => managed.gpu_enabled = false,
+                Err(e) => tracing::warn!("sandbox {id}: GPU worker cleanup: {e}"),
             }
         }
 
@@ -215,6 +225,69 @@ impl SandboxManager {
 
         tracing::info!("sandbox {id}: destroyed");
         Ok(())
+    }
+
+    fn reap_exited(&mut self, id: &SandboxId) -> Result<Option<i32>, String> {
+        enum ReapOutcome {
+            Running,
+            Exited { code: i32, gpu_enabled: bool },
+            Failed { error: String, gpu_enabled: bool },
+        }
+
+        let outcome = {
+            let Some(managed) = self.sandboxes.get_mut(id) else {
+                return Ok(None);
+            };
+
+            match managed.sandbox.try_wait() {
+                Ok(Some(code)) => {
+                    shutdown_proxy(managed.proxy_shutdown.take());
+                    let gpu_enabled = managed.gpu_enabled;
+                    ReapOutcome::Exited { code, gpu_enabled }
+                }
+                Ok(None) => ReapOutcome::Running,
+                Err(e) => {
+                    managed.sandbox.status = SandboxStatus::Failed;
+                    shutdown_proxy(managed.proxy_shutdown.take());
+                    let gpu_enabled = managed.gpu_enabled;
+                    ReapOutcome::Failed {
+                        error: e.to_string(),
+                        gpu_enabled,
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            ReapOutcome::Running => Ok(None),
+            ReapOutcome::Exited { code, gpu_enabled } => {
+                if gpu_enabled {
+                    match self.gpu_manager.stop_worker(id) {
+                        Ok(()) => {
+                            if let Some(managed) = self.sandboxes.get_mut(id) {
+                                managed.gpu_enabled = false;
+                            }
+                        }
+                        Err(e) => tracing::warn!("sandbox {id}: GPU worker cleanup: {e}"),
+                    }
+                }
+                tracing::info!("sandbox {id}: exited with code {code}");
+                Ok(Some(code))
+            }
+            ReapOutcome::Failed { error, gpu_enabled } => {
+                if gpu_enabled {
+                    match self.gpu_manager.stop_worker(id) {
+                        Ok(()) => {
+                            if let Some(managed) = self.sandboxes.get_mut(id) {
+                                managed.gpu_enabled = false;
+                            }
+                        }
+                        Err(e) => tracing::warn!("sandbox {id}: GPU worker cleanup: {e}"),
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     /// List all sandboxes.
@@ -793,6 +866,14 @@ fn policy_uses_proxy(policy: &Policy) -> bool {
     matches!(policy.network.mode, NetworkMode::Proxy)
 }
 
+fn ensure_sandbox_running(id: &SandboxId, status: SandboxStatus) -> Result<(), String> {
+    if matches!(status, SandboxStatus::Running) {
+        Ok(())
+    } else {
+        Err(format!("sandbox is not running: {id} ({status:?})"))
+    }
+}
+
 async fn start_proxy_for_sandbox(
     id: SandboxId,
     policy: &Policy,
@@ -870,15 +951,71 @@ fn shutdown_proxy(tx: Option<tokio::sync::oneshot::Sender<()>>) {
     }
 }
 
-pub(crate) fn schedule_sandbox_timeout(
+fn spawn_sandbox_lifecycle(
     mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
     id: SandboxId,
     timeout_sec: Option<u64>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    schedule_sandbox_timeout_after(
+) -> tokio::task::JoinHandle<()> {
+    spawn_sandbox_lifecycle_after(
+        mgr,
         id,
         timeout_sec.map(std::time::Duration::from_secs),
+        std::time::Duration::from_millis(LIFECYCLE_REAP_INTERVAL_MS),
         std::time::Duration::from_millis(TIMEOUT_DESTROY_RETRY_DELAY_MS),
+    )
+}
+
+fn spawn_sandbox_lifecycle_after(
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+    id: SandboxId,
+    timeout: Option<std::time::Duration>,
+    reap_interval: std::time::Duration,
+    retry_delay: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        loop {
+            {
+                let mut manager = mgr.lock().await;
+                match manager.reap_exited(&id) {
+                    Ok(Some(_)) => return,
+                    Ok(None) if !manager.sandboxes.contains_key(&id) => return,
+                    Ok(None)
+                        if !manager.sandboxes.get(&id).is_some_and(|managed| {
+                            matches!(managed.sandbox.status, SandboxStatus::Running)
+                        }) =>
+                    {
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("sandbox {id}: lifecycle reaper failed: {e}");
+                        return;
+                    }
+                }
+            }
+
+            if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                destroy_sandbox_after_timeout(mgr.clone(), id, timeout, retry_delay).await;
+                return;
+            }
+
+            tokio::time::sleep(reap_interval).await;
+        }
+    })
+}
+
+async fn destroy_sandbox_after_timeout(
+    mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+    id: SandboxId,
+    timeout: Option<std::time::Duration>,
+    retry_delay: std::time::Duration,
+) {
+    destroy_sandbox_after_timeout_with(
+        id,
+        timeout,
+        retry_delay,
+        TIMEOUT_DESTROY_ATTEMPTS,
         move |id| {
             let mgr = mgr.clone();
             async move {
@@ -887,52 +1024,41 @@ pub(crate) fn schedule_sandbox_timeout(
             }
         },
     )
+    .await;
 }
 
-fn schedule_sandbox_timeout_after<D, Fut>(
+async fn destroy_sandbox_after_timeout_with<D, Fut>(
     id: SandboxId,
     timeout: Option<std::time::Duration>,
     retry_delay: std::time::Duration,
+    max_attempts: usize,
     mut destroy: D,
-) -> Option<tokio::task::JoinHandle<()>>
-where
-    D: FnMut(SandboxId) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+) where
+    D: FnMut(SandboxId) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let timeout = timeout?;
-    Some(tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        for attempt in 1..=TIMEOUT_DESTROY_ATTEMPTS {
-            match destroy(id).await {
-                Ok(()) => {
+    for attempt in 1..=max_attempts {
+        let destroy_result = destroy(id).await;
+        match destroy_result {
+            Ok(()) => {
+                if let Some(timeout) = timeout {
                     tracing::warn!(
                         "sandbox {id}: destroyed after {}s timeout",
                         timeout.as_secs()
                     );
-                    return;
                 }
-                Err(e) if e.contains("sandbox not found") => return,
-                Err(e) if attempt == TIMEOUT_DESTROY_ATTEMPTS => {
-                    tracing::warn!("sandbox {id}: timeout cleanup failed: {e}");
-                }
-                Err(e) => {
-                    tracing::warn!("sandbox {id}: timeout cleanup attempt {attempt} failed: {e}");
-                    tokio::time::sleep(retry_delay).await;
-                }
+                return;
+            }
+            Err(e) if e.contains("sandbox not found") => return,
+            Err(e) if attempt == max_attempts => {
+                tracing::warn!("sandbox {id}: timeout cleanup failed: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("sandbox {id}: timeout cleanup attempt {attempt} failed: {e}");
+                tokio::time::sleep(retry_delay).await;
             }
         }
-    }))
-}
-
-fn apply_proxy_env(cmd: &mut std::process::Command, proxy_addr: Option<SocketAddr>) {
-    let Some(proxy_addr) = proxy_addr else {
-        return;
-    };
-    let proxy_url = format!("http://{proxy_addr}");
-    cmd.env("HTTP_PROXY", &proxy_url)
-        .env("HTTPS_PROXY", &proxy_url)
-        .env("http_proxy", &proxy_url)
-        .env("https_proxy", &proxy_url);
+    }
 }
 
 fn contained_exec_config_from(
@@ -1095,11 +1221,9 @@ impl SandboxBackend for SandboxManagerBackend {
         Box::pin(async move {
             let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)
                 .map_err(|e| format!("invalid policy: {e}"))?;
-            let timeout_sec = policy.process.timeout_sec;
             let id =
                 SandboxManager::create_from_shared(mgr_handle.clone(), policy, command, args, env)
                     .await?;
-            let _ = schedule_sandbox_timeout(mgr_handle.clone(), id, timeout_sec);
             Ok(id.to_string())
         })
     }
@@ -1282,44 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_proxy_env_is_noop_without_proxy_addr() {
-        let mut cmd = std::process::Command::new("true");
-
-        apply_proxy_env(&mut cmd, None);
-
-        assert!(
-            cmd.get_envs()
-                .all(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case("http_proxy"))
-        );
-    }
-
-    #[test]
-    fn apply_proxy_env_sets_proxy_vars_when_proxy_addr_exists() {
-        let mut cmd = std::process::Command::new("true");
-        let proxy_addr: SocketAddr = "10.200.0.1:3128".parse().unwrap();
-
-        apply_proxy_env(&mut cmd, Some(proxy_addr));
-
-        let envs: Vec<_> = cmd
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-            assert_eq!(
-                envs.iter()
-                    .find(|(env_key, _)| env_key == key)
-                    .and_then(|(_, value)| value.as_deref()),
-                Some("http://10.200.0.1:3128")
-            );
-        }
-    }
-
-    #[test]
     fn contained_exec_config_for_block_mode_omits_proxy_state() {
         let workspace = std::env::temp_dir().join("axis-daemon-block-exec-test");
         let policy = test_policy(NetworkMode::Block);
@@ -1424,6 +1510,79 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_destroy_retries_until_success() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000201").unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        destroy_sandbox_after_timeout_with(
+            id,
+            Some(std::time::Duration::from_secs(1)),
+            std::time::Duration::from_millis(1),
+            3,
+            {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if attempt < 2 {
+                            Err("cleanup failed".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_destroy_stops_retrying_after_final_failure() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000202").unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        destroy_sandbox_after_timeout_with(
+            id,
+            Some(std::time::Duration::from_secs(1)),
+            std::time::Duration::from_millis(1),
+            3,
+            {
+                let attempts = attempts.clone();
+                move |_| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err("cleanup failed".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn exec_context_rejects_non_running_parent_status() {
+        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000203").unwrap();
+
+        assert!(ensure_sandbox_running(&id, SandboxStatus::Running).is_ok());
+        for status in [
+            SandboxStatus::Creating,
+            SandboxStatus::Stopping,
+            SandboxStatus::Stopped,
+            SandboxStatus::Failed,
+        ] {
+            let err = ensure_sandbox_running(&id, status).unwrap_err();
+
+            assert!(err.contains("not running"));
+        }
+    }
+
     #[test]
     fn cleanup_contained_exec_workspace_removes_only_exec_workspace() {
         let workspace = std::env::temp_dir().join(format!(
@@ -1457,106 +1616,148 @@ mod tests {
         assert!(!workspace.exists());
     }
 
-    #[test]
-    fn timeout_scheduler_without_timeout_does_not_spawn() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000201").unwrap();
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lifecycle_reaps_exited_sandbox_and_updates_status() {
+        if !std::path::Path::new("/bin/true").exists() {
+            eprintln!("/bin/true unavailable (test skipped)");
+            return;
+        }
+        let (mgr, base_dir) = runtime_manager("axis-daemon-lifecycle-reap");
+        let policy = runtime_policy(NetworkMode::Allow, None);
+        let Some(id) =
+            create_runtime_sandbox_or_skip(mgr.clone(), policy, "/bin/true".into(), Vec::new())
+                .await
+        else {
+            let _ = std::fs::remove_dir_all(base_dir);
+            return;
+        };
 
-        let handle = schedule_sandbox_timeout_after(
-            id,
-            None,
-            std::time::Duration::from_millis(1),
-            |_| async { Ok::<(), String>(()) },
+        assert!(
+            wait_for_sandbox_status(mgr.clone(), id, SandboxStatus::Stopped).await,
+            "sandbox was not reaped to stopped status"
         );
-
-        assert!(handle.is_none());
+        mgr.lock().await.destroy(&id).unwrap();
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn timeout_scheduler_invokes_destroy_after_delay() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000202").unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-
-        let handle = schedule_sandbox_timeout_after(
-            id,
-            Some(std::time::Duration::from_millis(10)),
-            std::time::Duration::from_millis(1),
-            move |destroyed_id| {
-                let tx = tx.clone();
-                async move {
-                    tx.send(destroyed_id).await.unwrap();
-                    Ok(())
-                }
-            },
+    async fn lifecycle_timeout_destroys_sandbox_without_caller_wait() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        }
+        let (mgr, base_dir) = runtime_manager("axis-daemon-lifecycle-timeout");
+        let policy = runtime_policy(NetworkMode::Allow, Some(1));
+        let Some(id) = create_runtime_sandbox_or_skip(
+            mgr.clone(),
+            policy,
+            "/bin/sh".into(),
+            vec!["-c".into(), "sleep 10".into()],
         )
-        .unwrap();
+        .await
+        else {
+            let _ = std::fs::remove_dir_all(base_dir);
+            return;
+        };
 
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        handle.await.unwrap();
-
-        assert_eq!(observed, id);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn timeout_scheduler_ignores_missing_sandbox_after_delay() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000203").unwrap();
-
-        let handle = schedule_sandbox_timeout_after(
-            id,
-            Some(std::time::Duration::from_millis(1)),
-            std::time::Duration::from_millis(1),
-            move |_| async move { Err(format!("sandbox not found: {id}")) },
-        )
-        .unwrap();
-
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn timeout_scheduler_reports_destroy_failure_without_panicking() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000204").unwrap();
-
-        let handle = schedule_sandbox_timeout_after(
-            id,
-            Some(std::time::Duration::from_millis(1)),
-            std::time::Duration::from_millis(1),
-            |_| async { Err("cleanup failed".to_string()) },
-        )
-        .unwrap();
-
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn timeout_scheduler_retries_destroy_failures() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000205").unwrap();
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        let handle = schedule_sandbox_timeout_after(
-            id,
-            Some(std::time::Duration::from_millis(1)),
-            std::time::Duration::from_millis(1),
-            {
-                let attempts = attempts.clone();
-                move |_| {
-                    let attempts = attempts.clone();
-                    async move {
-                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Err("cleanup failed".to_string())
-                    }
-                }
-            },
-        )
-        .unwrap();
-
-        handle.await.unwrap();
-
-        assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
-            TIMEOUT_DESTROY_ATTEMPTS
+        assert!(
+            wait_for_sandbox_absent(mgr.clone(), id).await,
+            "timed-out sandbox remained registered"
         );
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contained_exec_cannot_read_unallowed_host_file() {
+        if !std::path::Path::new("/bin/sh").exists() || !std::path::Path::new("/bin/cat").exists() {
+            eprintln!("/bin/sh or /bin/cat unavailable (test skipped)");
+            return;
+        }
+        let (mgr, base_dir) = runtime_manager("axis-daemon-exec-fs");
+        let denied_path = base_dir.join("host-denied.txt");
+        std::fs::write(&denied_path, b"secret").unwrap();
+        let mut policy = runtime_policy(NetworkMode::Allow, None);
+        policy
+            .filesystem
+            .deny
+            .push(denied_path.to_string_lossy().into_owned());
+        let Some(id) = create_runtime_sandbox_or_skip(
+            mgr.clone(),
+            policy,
+            "/bin/sh".into(),
+            vec!["-c".into(), "sleep 10".into()],
+        )
+        .await
+        else {
+            let _ = std::fs::remove_dir_all(base_dir);
+            return;
+        };
+
+        let code = SandboxManager::exec_in_sandbox_from_shared(
+            mgr.clone(),
+            id,
+            "/bin/cat".into(),
+            vec![denied_path.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(code, 0, "contained exec read an unallowed host file");
+        mgr.lock().await.destroy(&id).unwrap();
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contained_exec_preserves_block_mode_network_denial() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        }
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+        let (mgr, base_dir) = runtime_manager("axis-daemon-exec-network");
+        let mut policy = runtime_policy(NetworkMode::Block, None);
+        if let Some(parent) = python.parent() {
+            policy
+                .filesystem
+                .read_only
+                .push(parent.to_string_lossy().into_owned());
+        }
+        let Some(id) = create_runtime_sandbox_or_skip(
+            mgr.clone(),
+            policy,
+            "/bin/sh".into(),
+            vec!["-c".into(), "sleep 10".into()],
+        )
+        .await
+        else {
+            let _ = std::fs::remove_dir_all(base_dir);
+            return;
+        };
+
+        let code = SandboxManager::exec_in_sandbox_from_shared(
+            mgr.clone(),
+            id,
+            python.to_string_lossy().into_owned(),
+            vec![
+                "-c".into(),
+                "import socket, sys\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nexcept OSError:\n    sys.exit(0)\nelse:\n    s.close(); sys.exit(42)\n".into(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, 0, "contained exec bypassed block-mode network denial");
+        mgr.lock().await.destroy(&id).unwrap();
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     fn test_policy(network_mode: NetworkMode) -> Policy {
@@ -1574,5 +1775,127 @@ mod tests {
             ssh: SshPolicy::default(),
             amd: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_policy(network_mode: NetworkMode, timeout_sec: Option<u64>) -> Policy {
+        let mut policy = test_policy(network_mode);
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec![
+                "/bin".into(),
+                "/usr".into(),
+                "/lib".into(),
+                "/lib64".into(),
+                "/nix/store".into(),
+                "/etc".into(),
+            ],
+            read_write: Vec::new(),
+            ..Default::default()
+        };
+        policy.process.timeout_sec = timeout_sec;
+        policy.process.cpu_rate_percent = 0;
+        policy
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_manager(
+        name: &str,
+    ) -> (std::sync::Arc<tokio::sync::Mutex<SandboxManager>>, PathBuf) {
+        let base_dir = std::env::temp_dir().join(format!("{name}-{}", SandboxId::new()));
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let mut manager = SandboxManager::new();
+        manager.sandbox_base_dir = base_dir.clone();
+        (
+            std::sync::Arc::new(tokio::sync::Mutex::new(manager)),
+            base_dir,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn create_runtime_sandbox_or_skip(
+        mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+        policy: Policy,
+        command: String,
+        args: Vec<String>,
+    ) -> Option<SandboxId> {
+        match SandboxManager::create_from_shared(
+            mgr,
+            policy,
+            command,
+            args,
+            vec![("PATH".into(), "/bin:/usr/bin".into())],
+        )
+        .await
+        {
+            Ok(id) => Some(id),
+            Err(e) if runtime_create_is_capability_gated(&e) => {
+                eprintln!("runtime sandbox unavailable (test skipped): {e}");
+                None
+            }
+            Err(e) => panic!("runtime sandbox create failed: {e}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_create_is_capability_gated(error: &str) -> bool {
+        error.contains("process count rlimit fallback requires a dedicated run_as_user")
+            || error.contains("CPU rate limits require writable cgroups v2")
+            || error.contains("cgroups v2")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_sandbox_status(
+        mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+        id: SandboxId,
+        status: SandboxStatus,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if mgr
+                .lock()
+                .await
+                .list()
+                .iter()
+                .any(|sandbox| sandbox.id == id && sandbox.status == status)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_sandbox_absent(
+        mgr: std::sync::Arc<tokio::sync::Mutex<SandboxManager>>,
+        id: SandboxId,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !mgr
+                .lock()
+                .await
+                .list()
+                .iter()
+                .any(|sandbox| sandbox.id == id)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn find_on_path(binary: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(binary);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
     }
 }

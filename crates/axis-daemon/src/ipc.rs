@@ -4,7 +4,7 @@
 //! IPC server for axisd <-> CLI communication.
 //! Unix sockets on Linux/macOS, TCP on Windows.
 
-use crate::sandbox_mgr::{SandboxManager, schedule_sandbox_timeout};
+use crate::sandbox_mgr::SandboxManager;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -142,19 +142,15 @@ async fn handle_request(mgr: &SharedManager, req: IpcRequest) -> IpcResponse {
             env,
         } => match axis_core::policy::Policy::from_yaml(&policy_yaml) {
             Ok(policy) => {
-                let timeout_sec = policy.process.timeout_sec;
                 let create_result =
                     SandboxManager::create_from_shared(mgr.clone(), policy, command, args, env)
                         .await;
                 match create_result {
-                    Ok(id) => {
-                        let _ = schedule_sandbox_timeout(mgr.clone(), id, timeout_sec);
-                        IpcResponse {
-                            success: true,
-                            data: serde_json::json!({ "sandbox_id": id.to_string() }),
-                            error: None,
-                        }
-                    }
+                    Ok(id) => IpcResponse {
+                        success: true,
+                        data: serde_json::json!({ "sandbox_id": id.to_string() }),
+                        error: None,
+                    },
                     Err(e) => IpcResponse {
                         success: false,
                         data: serde_json::Value::Null,

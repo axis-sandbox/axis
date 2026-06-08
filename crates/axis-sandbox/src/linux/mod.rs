@@ -1624,6 +1624,38 @@ impl SandboxImpl for LinuxSandbox {
         })
     }
 
+    fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
+        if let Some(code) = self.exit_code {
+            if self.netns_name.is_some() || self.cgroup.is_some() {
+                if let Some(e) = self.cleanup_after_process_exit() {
+                    return Err(SandboxError::IsolationFailed(format!(
+                        "process cleanup failed: {e}"
+                    )));
+                }
+            }
+            return Ok(Some(code));
+        }
+
+        let Some(child) = self.child.as_mut() else {
+            return Err(SandboxError::SpawnFailed("no child process".into()));
+        };
+        let pid = child.id() as i32;
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+
+        self.child.take();
+        let code = status.code().unwrap_or(-1);
+        self.exit_code = Some(code);
+        kill_process_group(pid);
+        if let Some(e) = self.cleanup_after_process_exit() {
+            return Err(SandboxError::IsolationFailed(format!(
+                "process cleanup failed: {e}"
+            )));
+        }
+        Ok(Some(code))
+    }
+
     fn destroy(&mut self) -> Result<(), SandboxError> {
         if let Some(mut child) = self.child.take() {
             let pid = child.id() as i32;
@@ -1989,6 +2021,38 @@ mod tests {
         assert_eq!(code_again, 0);
         assert!(sandbox.child.is_none());
         assert!(!tmpdir.exists());
+        sandbox.destroy().unwrap();
+    }
+
+    #[test]
+    fn try_wait_returns_none_for_running_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let child = Command::new("sleep").arg("1").spawn().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), Some(child));
+
+        assert_eq!(SandboxImpl::try_wait(&mut sandbox).unwrap(), None);
+        sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_wait_reaps_exited_child_and_caches_exit_code() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let child = Command::new("true").spawn().unwrap();
+        let mut sandbox = test_sandbox(id, workspace.path(), Some(child));
+
+        let code = loop {
+            if let Some(code) = SandboxImpl::try_wait(&mut sandbox).unwrap() {
+                break code;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let code_again = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(code_again, 0);
+        assert!(sandbox.child.is_none());
         sandbox.destroy().unwrap();
     }
 

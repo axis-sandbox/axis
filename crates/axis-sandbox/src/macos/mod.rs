@@ -111,6 +111,17 @@ impl SandboxImpl for MacosSandbox {
         })
     }
 
+    fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+        self.child.take();
+        Ok(Some(status.code().unwrap_or(-1)))
+    }
+
     fn destroy(&mut self) -> Result<(), SandboxError> {
         if let Some(ref mut child) = self.child {
             let _ = child.kill();
