@@ -69,6 +69,9 @@ jobs:
       - name: Unit & integration tests
         run: cargo test
 
+      - name: Standalone Linux e2e test
+        run: bash e2e/linux/test_sandbox.sh ./target/release/axis
+
       - name: Policy validation
         run: |
           ./target/release/axis policy validate policies/minimal.yaml

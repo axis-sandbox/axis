@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn create_rejects_invalid_manual_resource_policy_before_platform_setup() {
         let mut config = test_config();
-        config.policy.process.max_memory_mb = 0;
+        config.policy.process.cpu_rate_percent = 101;
 
         let err = match Sandbox::create(config) {
             Ok(_) => panic!("invalid resource policy should be rejected"),
@@ -301,13 +301,13 @@ mod tests {
         };
 
         assert!(matches!(err, SandboxError::CreationFailed(_)));
-        assert!(err.to_string().contains("max_memory_mb"));
+        assert!(err.to_string().contains("cpu_rate_percent"));
     }
 
     #[test]
     fn create_for_exec_rejects_invalid_manual_resource_policy_before_platform_setup() {
         let mut config = test_config();
-        config.policy.process.max_processes = 0;
+        config.policy.process.cpu_rate_percent = 101;
 
         let err = match Sandbox::create_for_exec(config) {
             Ok(_) => panic!("invalid resource policy should be rejected"),
@@ -315,6 +315,6 @@ mod tests {
         };
 
         assert!(matches!(err, SandboxError::CreationFailed(_)));
-        assert!(err.to_string().contains("max_processes"));
+        assert!(err.to_string().contains("cpu_rate_percent"));
     }
 }

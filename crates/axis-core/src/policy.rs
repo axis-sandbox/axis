@@ -60,8 +60,9 @@ impl Policy {
 
     /// Parse a policy from a YAML file.
     pub fn from_file(path: &std::path::Path) -> Result<Self, PolicyError> {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| PolicyError::ValidationError(format!("cannot read {}: {e}", path.display())))?;
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            PolicyError::ValidationError(format!("cannot read {}: {e}", path.display()))
+        })?;
         Self::from_yaml(&contents)
     }
 
@@ -71,7 +72,9 @@ impl Policy {
             return Err(PolicyError::UnsupportedVersion(self.version));
         }
         if self.name.is_empty() {
-            return Err(PolicyError::ValidationError("policy name must not be empty".into()));
+            return Err(PolicyError::ValidationError(
+                "policy name must not be empty".into(),
+            ));
         }
         self.process.validate()?;
         self.network.validate()?;
@@ -110,9 +113,11 @@ pub enum Compatibility {
 /// Process containment policy — limits on the sandboxed process tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessPolicy {
+    /// Maximum process count. 0 disables process-count enforcement.
     #[serde(default = "default_max_processes")]
     pub max_processes: u32,
 
+    /// Maximum memory in MiB. 0 disables memory enforcement.
     #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: u64,
 
@@ -152,14 +157,6 @@ impl ProcessPolicy {
                 "cpu_rate_percent must be 0..=100, got {}",
                 self.cpu_rate_percent
             )));
-        }
-        if self.max_processes == 0 {
-            return Err(PolicyError::ValidationError("max_processes must be > 0".into()));
-        }
-        if self.max_memory_mb == 0 {
-            return Err(PolicyError::ValidationError(
-                "max_memory_mb must be > 0".into(),
-            ));
         }
         Ok(())
     }
@@ -562,12 +559,18 @@ amd:
 
         let budget = policy.inference.token_budget.as_ref().unwrap();
         assert_eq!(budget.max_tokens_per_hour, 500_000);
-        assert!(matches!(budget.action_on_exhaust, ExhaustAction::FallbackCloud));
+        assert!(matches!(
+            budget.action_on_exhaust,
+            ExhaustAction::FallbackCloud
+        ));
 
         let amd = policy.amd.as_ref().unwrap();
         assert!(amd.gpu_passthrough);
         assert!(!amd.npu_policy_offload);
-        assert_eq!(amd.apex_memory_policy.as_ref().unwrap().max_vram_mb, Some(16384));
+        assert_eq!(
+            amd.apex_memory_policy.as_ref().unwrap().max_vram_mb,
+            Some(16384)
+        );
     }
 
     #[test]
@@ -592,15 +595,17 @@ amd:
     }
 
     #[test]
-    fn reject_invalid_cpu_rate() {
-        let yaml = "version: 1\nname: test\nprocess:\n  cpu_rate_percent: 101\n";
-        let err = Policy::from_yaml(yaml).unwrap_err();
-        assert!(matches!(err, PolicyError::ValidationError(_)));
+    fn allow_zero_process_and_memory_limits_to_disable_resource_limits() {
+        let yaml = "version: 1\nname: test\nprocess:\n  max_processes: 0\n  max_memory_mb: 0\n  cpu_rate_percent: 0\n";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert_eq!(policy.process.max_processes, 0);
+        assert_eq!(policy.process.max_memory_mb, 0);
+        assert_eq!(policy.process.cpu_rate_percent, 0);
     }
 
     #[test]
-    fn reject_zero_memory_limit() {
-        let yaml = "version: 1\nname: test\nprocess:\n  max_memory_mb: 0\n";
+    fn reject_invalid_cpu_rate() {
+        let yaml = "version: 1\nname: test\nprocess:\n  cpu_rate_percent: 101\n";
         let err = Policy::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, PolicyError::ValidationError(_)));
     }
