@@ -592,7 +592,7 @@ fn start_managed_sandbox(
 ) -> Result<ManagedSandbox, String> {
     let mut all_env = env;
     all_env.extend(extra_env);
-    axis_core::sandbox_env::retain_linux_sandbox_env(&mut all_env);
+    apply_platform_sandbox_env_filter(&mut all_env);
 
     let timeout_sec = policy.process.timeout_sec;
     tracing::info!("sandbox {id}: spawning: {command} {}", args.join(" "));
@@ -917,6 +917,14 @@ where
         }
     }
     env
+}
+
+fn apply_platform_sandbox_env_filter(env: &mut Vec<(String, String)>) {
+    #[cfg(target_os = "linux")]
+    axis_core::sandbox_env::retain_linux_sandbox_env(env);
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = env;
 }
 
 fn allocate_port() -> u16 {
@@ -1598,6 +1606,38 @@ mod tests {
             vec![
                 ("PATH".into(), "/bin".into()),
                 ("CLAUDE_CODE_ENTRYPOINT".into(), "entrypoint".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_final_env_filter_is_platform_scoped() {
+        let mut env = vec![
+            ("PATH".into(), "/bin".into()),
+            ("CUSTOM_API_KEY".into(), "secret".into()),
+            ("https_proxy".into(), "http://proxy-with-creds".into()),
+            ("CUSTOM_CONFIG".into(), "value".into()),
+        ];
+
+        apply_platform_sandbox_env_filter(&mut env);
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("CUSTOM_CONFIG".into(), "value".into())
+            ]
+        );
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("CUSTOM_API_KEY".into(), "secret".into()),
+                ("https_proxy".into(), "http://proxy-with-creds".into()),
+                ("CUSTOM_CONFIG".into(), "value".into())
             ]
         );
     }

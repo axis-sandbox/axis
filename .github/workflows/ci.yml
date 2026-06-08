@@ -103,6 +103,7 @@ jobs:
       - name: Helper launch proof
         env:
           AXIS_RUN_PRIVILEGED_E2E: "1"
+          AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E: "1"
         run: bash e2e/linux/test_netns_helper_launch.sh
 
   test-windows:

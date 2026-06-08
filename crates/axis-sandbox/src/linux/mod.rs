@@ -58,6 +58,7 @@ enum ChildSetupErrorKind {
     DropCapabilities = 10,
     CloseFileDescriptors = 11,
     Seccomp = 12,
+    ParentDeathSignal = 13,
 }
 
 impl ChildSetupErrorKind {
@@ -75,6 +76,7 @@ impl ChildSetupErrorKind {
             Self::DropCapabilities => "drop capabilities",
             Self::CloseFileDescriptors => "close inherited file descriptors",
             Self::Seccomp => "apply seccomp",
+            Self::ParentDeathSignal => "install parent-death guard",
         }
     }
 
@@ -92,6 +94,7 @@ impl ChildSetupErrorKind {
             10 => Some(Self::DropCapabilities),
             11 => Some(Self::CloseFileDescriptors),
             12 => Some(Self::Seccomp),
+            13 => Some(Self::ParentDeathSignal),
             _ => None,
         }
     }
@@ -154,11 +157,127 @@ impl Drop for ChildSetupErrorPipe {
     }
 }
 
+#[derive(Debug)]
+struct ParentDeathGuardPipe {
+    read_fd: i32,
+    write_fd: i32,
+}
+
+impl ParentDeathGuardPipe {
+    fn new() -> Result<Self, io::Error> {
+        let mut fds = [0; 2];
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                read_fd: fds[0],
+                write_fd: fds[1],
+            })
+        }
+    }
+
+    fn child_fds(&self) -> (i32, i32) {
+        (self.read_fd, self.write_fd)
+    }
+
+    fn close_read(&mut self) {
+        if self.read_fd != CLOSED_FD {
+            unsafe {
+                libc::close(self.read_fd);
+            }
+            self.read_fd = CLOSED_FD;
+        }
+    }
+
+    fn close_write(&mut self) {
+        if self.write_fd != CLOSED_FD {
+            unsafe {
+                libc::close(self.write_fd);
+            }
+            self.write_fd = CLOSED_FD;
+        }
+    }
+}
+
+impl Drop for ParentDeathGuardPipe {
+    fn drop(&mut self) {
+        self.close_read();
+        self.close_write();
+    }
+}
+
+#[derive(Debug)]
+struct ParentDeathGuard {
+    write_fd: i32,
+    monitor_pid: libc::pid_t,
+}
+
+impl ParentDeathGuard {
+    fn spawn_for_process_group(
+        process_group: libc::pid_t,
+        mut pipe: ParentDeathGuardPipe,
+    ) -> Result<Self, io::Error> {
+        let monitor_pid = unsafe { libc::fork() };
+        if monitor_pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if monitor_pid == 0 {
+            unsafe {
+                libc::close(pipe.write_fd);
+                libc::setpgid(0, 0);
+                run_parent_death_monitor(pipe.read_fd, process_group);
+            }
+        }
+
+        pipe.close_read();
+        let write_fd = pipe.write_fd;
+        pipe.write_fd = CLOSED_FD;
+        Ok(Self {
+            write_fd,
+            monitor_pid,
+        })
+    }
+
+    fn finish(&mut self) {
+        if self.write_fd != CLOSED_FD {
+            unsafe {
+                libc::close(self.write_fd);
+            }
+            self.write_fd = CLOSED_FD;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            let mut status = 0;
+            let ret = unsafe { libc::waitpid(self.monitor_pid, &mut status, libc::WNOHANG) };
+            if ret == self.monitor_pid || ret < 0 {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(self.monitor_pid, libc::SIGKILL);
+                    libc::waitpid(self.monitor_pid, &mut status, 0);
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ParentDeathGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 /// Linux sandbox using native isolation primitives.
 pub(crate) struct LinuxSandbox {
     config: SandboxConfig,
     plan: strategy::LinuxIsolationPlan,
     child: Option<Child>,
+    parent_death_guard: Option<ParentDeathGuard>,
     exit_code: Option<i32>,
     netns_name: Option<String>,
     netns_helper_destroy_token: Option<String>,
@@ -179,6 +298,7 @@ impl LinuxSandbox {
             config,
             plan,
             child: None,
+            parent_death_guard: None,
             exit_code: None,
             netns_name: None,
             netns_helper_destroy_token: None,
@@ -253,6 +373,12 @@ impl LinuxSandbox {
         None
     }
 
+    fn finish_parent_death_guard(&mut self) {
+        if let Some(mut guard) = self.parent_death_guard.take() {
+            guard.finish();
+        }
+    }
+
     fn cleanup_after_process_exit(&mut self) -> Option<String> {
         self.cleanup_after_process_exit_with_handlers(
             netns::destroy_netns,
@@ -281,6 +407,7 @@ impl LinuxSandbox {
         H: FnOnce(SandboxId, &str) -> Result<(), String>,
     {
         let mut cleanup_errors = Vec::new();
+        self.finish_parent_death_guard();
         let netns_cleanup = if self.netns_helper_destroy_token.is_some() {
             self.cleanup_netns_with_helper_token(destroy_helper)
         } else {
@@ -518,6 +645,21 @@ impl LinuxSandbox {
             cmd.stderr(std::process::Stdio::from(stderr_file));
         }
 
+        let parent_death_guard_pipe = match ParentDeathGuardPipe::new() {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                close_fd(Some(seccomp_fd));
+                close_fd(cgroup_procs_fd);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                return Err(append_cleanup_failure(
+                    SandboxError::SpawnFailed(format!("parent-death guard pipe: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
+        let parent_death_child_fds = parent_death_guard_pipe.child_fds();
+        let owner_pid = unsafe { libc::getpid() };
+
         let mut child_error_pipe = match ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
             Err(e) => {
@@ -533,6 +675,14 @@ impl LinuxSandbox {
         let child_error_write_fd = child_error_pipe.write_fd;
         unsafe {
             cmd.pre_exec(move || {
+                if let Err(errno) = install_parent_death_signal(owner_pid) {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::ParentDeathSignal,
+                        errno,
+                    ));
+                }
+                close_parent_death_guard_child_fds(parent_death_child_fds);
                 if libc::setpgid(0, 0) < 0 {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -587,7 +737,7 @@ impl LinuxSandbox {
             });
         }
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => {
                 close_fd(Some(seccomp_fd));
                 close_fd(cgroup_procs_fd);
@@ -606,6 +756,23 @@ impl LinuxSandbox {
         };
 
         let pid = child.id();
+        let parent_death_guard =
+            match ParentDeathGuard::spawn_for_process_group(pid as i32, parent_death_guard_pipe) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    kill_process_group(pid as i32);
+                    let _ = wait_for_killed_child(&mut child, pid as i32);
+                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                    return Err(append_cleanup_failure(
+                        SandboxError::SpawnFailed(format!("parent-death guard monitor: {e}")),
+                        cleanup_error,
+                    ));
+                }
+            };
+        self.parent_death_guard = Some(parent_death_guard);
         self.child = Some(child);
         tracing::info!("sandbox {sandbox_id} started via bubblewrap fallback, pid={pid}");
         Ok(pid)
@@ -1224,6 +1391,54 @@ fn current_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
+fn run_parent_death_monitor(read_fd: i32, process_group: libc::pid_t) -> ! {
+    let mut byte = 0u8;
+    loop {
+        let ret = unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+        if ret == 0 {
+            break;
+        }
+        if ret < 0 && current_errno() != libc::EINTR {
+            break;
+        }
+    }
+
+    unsafe {
+        libc::close(read_fd);
+    }
+    if process_group > 1 {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    unsafe {
+        libc::_exit(0);
+    }
+}
+
+fn install_parent_death_signal(owner_pid: libc::pid_t) -> Result<(), i32> {
+    let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    if ret < 0 {
+        return Err(current_errno());
+    }
+
+    if unsafe { libc::getppid() } != owner_pid {
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        return Err(libc::ESRCH);
+    }
+
+    Ok(())
+}
+
+fn close_parent_death_guard_child_fds((read_fd, write_fd): (i32, i32)) {
+    unsafe {
+        libc::close(read_fd);
+        libc::close(write_fd);
+    }
+}
+
 impl SandboxImpl for LinuxSandbox {
     fn start(&mut self) -> Result<u32, SandboxError> {
         use std::os::unix::process::CommandExt;
@@ -1432,6 +1647,20 @@ impl SandboxImpl for LinuxSandbox {
             None => None,
         };
 
+        let parent_death_guard_pipe = match ParentDeathGuardPipe::new() {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                close_fd(cgroup_procs_fd);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(netns_fd);
+                return Err(append_cleanup_failure(
+                    SandboxError::SpawnFailed(format!("parent-death guard pipe: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
+        let parent_death_child_fds = parent_death_guard_pipe.child_fds();
+        let owner_pid = unsafe { libc::getpid() };
+
         // Safety: pre_exec runs after fork, before exec in the child process.
         let mut child_error_pipe = match ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
@@ -1447,7 +1676,17 @@ impl SandboxImpl for LinuxSandbox {
         let child_error_write_fd = child_error_pipe.write_fd;
         unsafe {
             cmd.pre_exec(move || {
-                // 1. Own process group.
+                // 1. Kill the sandbox child if its AXIS owner dies before normal cleanup.
+                if let Err(errno) = install_parent_death_signal(owner_pid) {
+                    return Err(child_setup_error(
+                        child_error_write_fd,
+                        ChildSetupErrorKind::ParentDeathSignal,
+                        errno,
+                    ));
+                }
+                close_parent_death_guard_child_fds(parent_death_child_fds);
+
+                // 2. Own process group.
                 if libc::setpgid(0, 0) < 0 {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -1456,7 +1695,7 @@ impl SandboxImpl for LinuxSandbox {
                     ));
                 }
 
-                // 2. Enter the prepared cgroup before the child can exec or fork workload code.
+                // 3. Enter the prepared cgroup before the child can exec or fork workload code.
                 if let Some(fd) = cgroup_procs_fd {
                     if let Err(errno) = enter_cgroup_from_child_fd(fd) {
                         libc::close(fd);
@@ -1469,7 +1708,7 @@ impl SandboxImpl for LinuxSandbox {
                     libc::close(fd);
                 }
 
-                // 3. Enter network namespace (if created by parent).
+                // 4. Enter network namespace (if created by parent).
                 if let Some(fd) = netns_fd {
                     let ret = libc::setns(fd, libc::CLONE_NEWNET);
                     libc::close(fd);
@@ -1482,7 +1721,7 @@ impl SandboxImpl for LinuxSandbox {
                     }
                 }
 
-                // 4. Prevent SUID escalation.
+                // 5. Prevent SUID escalation.
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -1491,7 +1730,7 @@ impl SandboxImpl for LinuxSandbox {
                     ));
                 }
 
-                // 5. Apply Landlock filesystem policy.
+                // 6. Apply Landlock filesystem policy.
                 if let Err(e) = prepared_landlock.restrict_current_process() {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -1500,7 +1739,7 @@ impl SandboxImpl for LinuxSandbox {
                     ));
                 }
 
-                // 6. Drop to the configured sandbox user after Landlock setup.
+                // 7. Drop to the configured sandbox user after Landlock setup.
                 if let Some(identity) = &resolved_identity {
                     if libc::setgroups(0, std::ptr::null()) < 0 {
                         return Err(child_setup_error(
@@ -1525,7 +1764,7 @@ impl SandboxImpl for LinuxSandbox {
                     }
                 }
 
-                // 7. Apply rlimit fallback after any UID switch.
+                // 8. Apply rlimit fallback after any UID switch.
                 if let Some(limits) = prepared_rlimits {
                     if let Err(errno) = apply_prepared_rlimits(limits) {
                         return Err(child_setup_error(
@@ -1536,7 +1775,7 @@ impl SandboxImpl for LinuxSandbox {
                     }
                 }
 
-                // 8. Drop Linux capabilities before exec so a privileged parent
+                // 9. Drop Linux capabilities before exec so a privileged parent
                 // cannot leave CAP_NET_ADMIN inside the sandbox netns.
                 if let Err(errno) = drop_process_capabilities() {
                     return Err(child_setup_error(
@@ -1546,7 +1785,7 @@ impl SandboxImpl for LinuxSandbox {
                     ));
                 }
 
-                // 9. Prevent inherited descriptors from surviving a successful exec.
+                // 10. Prevent inherited descriptors from surviving a successful exec.
                 if let Err(errno) = mark_unexpected_child_fds_close_on_exec() {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -1555,7 +1794,7 @@ impl SandboxImpl for LinuxSandbox {
                     ));
                 }
 
-                // 10. seccomp-BPF syscall filter (must be last — it restricts further syscalls).
+                // 11. seccomp-BPF syscall filter (must be last - it restricts further syscalls).
                 if let Err(e) = prepared_seccomp.apply_current_process() {
                     return Err(child_setup_error(
                         child_error_write_fd,
@@ -1568,7 +1807,7 @@ impl SandboxImpl for LinuxSandbox {
             });
         }
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => {
                 close_fd(netns_fd);
                 close_fd(cgroup_procs_fd);
@@ -1586,6 +1825,23 @@ impl SandboxImpl for LinuxSandbox {
         };
 
         let pid = child.id();
+        let parent_death_guard =
+            match ParentDeathGuard::spawn_for_process_group(pid as i32, parent_death_guard_pipe) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    kill_process_group(pid as i32);
+                    let _ = wait_for_killed_child(&mut child, pid as i32);
+                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                    return Err(append_cleanup_failure(
+                        SandboxError::SpawnFailed(format!("parent-death guard monitor: {e}")),
+                        cleanup_error,
+                    ));
+                }
+            };
+        self.parent_death_guard = Some(parent_death_guard);
         self.child = Some(child);
 
         tracing::info!("sandbox {sandbox_id} started, pid={pid}");
@@ -1682,6 +1938,7 @@ impl SandboxImpl for LinuxSandbox {
             self.exit_code = Some(wait_for_killed_child(&mut child, pid));
             kill_process_group(pid);
         }
+        self.finish_parent_death_guard();
 
         let mut cleanup_errors = Vec::new();
         if let Some(e) = self.cleanup_netns() {
@@ -2102,6 +2359,61 @@ mod tests {
         assert_eq!(code, 0);
         assert!(!marker.exists(), "background process survived sandbox wait");
         sandbox.destroy().unwrap();
+    }
+
+    #[test]
+    fn parent_death_guard_kills_process_group_descendants_on_owner_close() {
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_path = workspace.path().join("background.pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $! > \"$PID_PATH\"; wait")
+            .env("PID_PATH", &pid_path);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let process_group = child.id() as libc::pid_t;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !pid_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                kill_process_group(process_group);
+                let _ = wait_for_killed_child(&mut child, process_group);
+                panic!("background pid was not recorded");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let background_pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert!(process_exists(background_pid));
+
+        let pipe = ParentDeathGuardPipe::new().unwrap();
+        let mut guard = ParentDeathGuard::spawn_for_process_group(process_group, pipe).unwrap();
+        guard.finish();
+        let _ = wait_for_killed_child(&mut child, process_group);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while process_exists(background_pid) {
+            if std::time::Instant::now() >= deadline {
+                kill_process_group(process_group);
+                panic!("background process {background_pid} survived parent-death guard");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3137,6 +3449,7 @@ mod tests {
             },
             plan: test_plan(id, workspace),
             child,
+            parent_death_guard: None,
             exit_code: None,
             netns_name: None,
             netns_helper_destroy_token: None,

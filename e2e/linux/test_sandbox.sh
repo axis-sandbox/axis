@@ -193,16 +193,28 @@ echo "--- Block-mode network through axis run ---"
 if require_cmd python3 "block-mode network test"; then
     net_policy="$(write_policy block)"
     expect_axis_success_or_skip \
-        "AF_INET sockets are denied in block mode" \
+        "IPv4, IPv6, DNS, and packet sockets are denied in block mode" \
         --policy "$net_policy" -- python3 -c \
         'import socket, sys
-try:
-    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-except OSError as exc:
-    print(f"socket blocked: {exc}")
-    sys.exit(0)
-print("socket creation unexpectedly succeeded")
-sys.exit(42)'
+
+checks = [
+    ("ipv4-tcp", socket.AF_INET, socket.SOCK_STREAM, 0),
+    ("ipv4-udp-dns", socket.AF_INET, socket.SOCK_DGRAM, 0),
+    ("ipv6-tcp", socket.AF_INET6, socket.SOCK_STREAM, 0),
+]
+if hasattr(socket, "AF_PACKET"):
+    checks.append(("packet", socket.AF_PACKET, socket.SOCK_RAW, 0))
+
+for label, family, socktype, proto in checks:
+    try:
+        sock = socket.socket(family, socktype, proto)
+    except OSError as exc:
+        print(f"{label} blocked: {exc}")
+        continue
+    sock.close()
+    print(f"{label} socket unexpectedly succeeded")
+    sys.exit(42)
+sys.exit(0)'
 fi
 
 echo "--- Policy-aware seccomp through axis run ---"

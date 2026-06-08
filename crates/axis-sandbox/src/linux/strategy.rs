@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 const CAP_NET_ADMIN_BIT: u32 = 12;
 const SECCOMP_GET_ACTION_AVAIL: libc::c_long = 2;
+const MIN_LANDLOCK_CONTRACT_ABI: u32 = 3;
 
 /// Complete Linux isolation plan for a sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,9 +254,15 @@ fn plan_filesystem(
     policy: &Policy,
     caps: &CapabilitySnapshot,
 ) -> Result<FilesystemStrategy, StrategyError> {
-    if let Some(abi) = caps.landlock_abi {
-        return Ok(FilesystemStrategy::Landlock { abi });
-    }
+    let landlock_error = match caps.landlock_abi {
+        Some(abi) if abi >= MIN_LANDLOCK_CONTRACT_ABI => {
+            return Ok(FilesystemStrategy::Landlock { abi });
+        }
+        Some(abi) => format!(
+            "Landlock ABI {abi} cannot enforce the AXIS filesystem contract; require Landlock ABI >= {MIN_LANDLOCK_CONTRACT_ABI}"
+        ),
+        None => "Landlock unavailable".into(),
+    };
 
     let uid_dac_error = policy.process.run_as_user.as_ref().map(|username| {
         format!(
@@ -268,7 +275,7 @@ fn plan_filesystem(
             return Err(StrategyError::new(
                 "filesystem",
                 format!(
-                    "Landlock unavailable; bubblewrap fallback does not support run_as_user yet; {reason}"
+                    "{landlock_error}; bubblewrap fallback does not support run_as_user yet; {reason}"
                 ),
             ));
         }
@@ -276,12 +283,15 @@ fn plan_filesystem(
     }
 
     if let Some(reason) = uid_dac_error {
-        return Err(StrategyError::new("filesystem", reason));
+        return Err(StrategyError::new(
+            "filesystem",
+            format!("{landlock_error}; {reason}"),
+        ));
     }
 
     Err(StrategyError::new(
         "filesystem",
-        "Landlock unavailable and no valid filesystem fallback is available",
+        format!("{landlock_error} and no valid filesystem fallback is available"),
     ))
 }
 
@@ -1131,6 +1141,47 @@ mod tests {
 
         assert_eq!(plan.filesystem, FilesystemStrategy::Bubblewrap);
         assert_eq!(plan.network, NetworkStrategy::BlockedByBubblewrap);
+    }
+
+    #[test]
+    fn landlock_abi_below_contract_uses_bubblewrap_filesystem_fallback() {
+        let mut caps = full_caps();
+        caps.landlock_abi = Some(2);
+        caps.bubblewrap = true;
+
+        let plan = plan_with_probe(
+            &policy(NetworkMode::Allow),
+            SandboxId::new(),
+            tempfile::tempdir().unwrap().path(),
+            0,
+            None,
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap();
+
+        assert_eq!(plan.filesystem, FilesystemStrategy::Bubblewrap);
+        assert_eq!(plan.network, NetworkStrategy::AllowHost);
+    }
+
+    #[test]
+    fn landlock_abi_below_contract_without_fallback_is_fatal() {
+        let mut caps = full_caps();
+        caps.landlock_abi = Some(2);
+        caps.bubblewrap = false;
+
+        let err = plan_with_probe(
+            &policy(NetworkMode::Allow),
+            SandboxId::new(),
+            tempfile::tempdir().unwrap().path(),
+            0,
+            None,
+            &FakeProbe { snapshot: caps },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.area, "filesystem");
+        assert!(err.message.contains("Landlock ABI 2"));
+        assert!(err.message.contains("require Landlock ABI >= 3"));
     }
 
     #[test]

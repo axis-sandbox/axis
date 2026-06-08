@@ -173,6 +173,19 @@ cleanup_pid_if_alive() {
     fi
 }
 
+wait_for_pid_exit() {
+    local pid="$1"
+    local attempts="${2:-50}"
+    [ -n "$pid" ] || return 0
+    for _ in $(seq 1 "$attempts"); do
+        if ! pid_alive "$pid"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 summary() {
     echo ""
     echo "  ---------------------------------------------------------"
@@ -345,23 +358,78 @@ if command -v python3 >/dev/null 2>&1; then
         fi
         set +e
         axis_cli exec --sandbox "$block_id" -- python3 -c 'import socket, sys
-try:
-    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-except OSError:
-    sys.exit(0)
-sys.exit(42)' >/dev/null 2>&1
+checks = [
+    ("ipv4-tcp", socket.AF_INET, socket.SOCK_STREAM, 0),
+    ("ipv4-udp-dns", socket.AF_INET, socket.SOCK_DGRAM, 0),
+    ("ipv6-tcp", socket.AF_INET6, socket.SOCK_STREAM, 0),
+]
+if hasattr(socket, "AF_PACKET"):
+    checks.append(("packet", socket.AF_PACKET, socket.SOCK_RAW, 0))
+for label, family, socktype, proto in checks:
+    try:
+        sock = socket.socket(family, socktype, proto)
+    except OSError:
+        continue
+    sock.close()
+    print(f"{label} socket unexpectedly succeeded")
+    sys.exit(42)
+sys.exit(0)' >/dev/null 2>&1
         block_exec_status=$?
         set -e
         if [ "$block_exec_status" -eq 0 ]; then
-            pass "daemon exec preserves block-mode network denial"
+            pass "daemon exec preserves broad block-mode network denial"
         else
-            fail "daemon exec preserves block-mode network denial"
+            fail "daemon exec preserves broad block-mode network denial"
         fi
         axis_cli destroy "$block_id" >/dev/null 2>&1 || true
         cleanup_pid_if_alive "$block_pid"
     fi
 else
     skip "daemon block-mode exec requires python3 on PATH"
+fi
+
+echo "--- Daemon crash cleanup ---"
+crash_policy="$(write_policy allow)"
+set +e
+create_sandbox "$crash_policy" "(sleep 60) & echo \$! > sleep.pid; wait"
+crash_create_status=$?
+set -e
+if [ "$crash_create_status" -eq 77 ]; then
+    skip "daemon crash cleanup unavailable on this runner: ${CREATE_OUTPUT//$'\n'/ }"
+elif [ "$crash_create_status" -ne 0 ]; then
+    echo "$CREATE_OUTPUT"
+    fail "crash-cleanup sandbox created"
+else
+    crash_id="$SANDBOX_ID"
+    crash_dir="$(sandbox_workspace "$crash_id")"
+    crash_pid=""
+    if [ -n "$crash_dir" ]; then
+        for _ in $(seq 1 50); do
+            if [ -s "${crash_dir}/sleep.pid" ]; then
+                crash_pid="$(cat "${crash_dir}/sleep.pid")"
+                break
+            fi
+            sleep 0.1
+        done
+    fi
+    if [ -n "$crash_pid" ] && pid_alive "$crash_pid"; then
+        pass "crash-cleanup sandbox child process is running"
+    else
+        fail "crash-cleanup sandbox child process is running"
+    fi
+
+    if [ -n "$AXSD_PID" ]; then
+        kill -KILL "$AXSD_PID" 2>/dev/null || true
+        wait "$AXSD_PID" 2>/dev/null || true
+        AXSD_PID=""
+    fi
+
+    if wait_for_pid_exit "$crash_pid" 60; then
+        pass "daemon hard crash terminates sandbox process tree"
+    else
+        fail "daemon hard crash terminates sandbox process tree"
+        cleanup_pid_if_alive "$crash_pid"
+    fi
 fi
 
 summary || exit 1
