@@ -24,7 +24,7 @@ This document surveys the current landscape of agent sandboxing technologies, as
 
 | Framework | Isolation Mechanism | Startup | GPU | Network Isolation | Credential Protection | Root Required | Platforms |
 |---|---|---|---|---|---|---|---|
-| **AXIS** | Landlock + seccomp + netns (Linux), AppContainer + Job Object (Windows), Seatbelt (macOS) | **0.6ms** | **HIP Remote** (538 APIs, VRAM quotas) | netns + iptables + OPA proxy | Proxy-level injection + leak detection | **No** | Linux, macOS, Windows |
+| **AXIS** | Landlock + seccomp + optional netns proxy (Linux), AppContainer + Job Object (Windows), Seatbelt (macOS) | **0.6ms** | **HIP Remote** (538 APIs, VRAM quotas) | Linux block mode needs no root; proxy mode needs native capability or optional helper | Sandbox env filtering; proxy-level injection planned | Quickstart: no. Linux proxy mode: capability/helper. | Linux, macOS, Windows |
 | **Claude Code** | bubblewrap (Linux), Seatbelt (macOS) | ~ms | None | Proxy-based filtering | Allowlist-only FS | No | Linux, macOS |
 | **Codex CLI** | Seatbelt (macOS), bubblewrap (Linux), native (Windows) | ~ms | None | Disabled by default | Workspace-scoped FS | No | macOS, Linux, Windows |
 | **Cursor** | Seatbelt (macOS), Landlock+seccomp (Linux), WSL2 (Windows) | ~ms | None | Disabled by default | Workspace + overlay FS | No | macOS, Linux, Windows |
@@ -51,7 +51,7 @@ This document surveys the current landscape of agent sandboxing technologies, as
 
 | Technology | Mechanism | Startup | Memory | GPU | Root Required | Platform |
 |---|---|---|---|---|---|---|
-| **AXIS** | Landlock + seccomp + netns + OPA proxy | **0.6ms** | **1.6MB** | **HIP Remote** | **No** | Linux, macOS, Windows |
+| **AXIS** | Landlock + seccomp + block mode, with optional netns + OPA proxy | **0.6ms** | **1.6MB** | **HIP Remote** | Quickstart: no. Proxy mode: capability/helper. | Linux, macOS, Windows |
 | **Bubblewrap** | Linux user namespaces (pid/net/mount/uts) + seccomp | ~ms | Negligible | No | No | Linux |
 | **Firecracker** | KVM microVM (own kernel) | ~125ms | <5 MiB | **No** (no PCIe passthrough) | Yes (KVM) | Linux |
 | **gVisor** | User-space kernel (Go), syscall interception | ~seconds | ~84 MiB | NVIDIA only (nvproxy) | No (ptrace mode) | Linux |
@@ -60,7 +60,7 @@ This document surveys the current landscape of agent sandboxing technologies, as
 
 ### 3.2 Assessment
 
-**Bubblewrap** is the gold standard for lightweight Linux sandboxing — fast, no root, well-tested (used by Flatpak). AXIS uses it as a fallback when Landlock or netns aren't available. Its limitation: no network policy (it's all-or-nothing network deny), no GPU support, no credential injection.
+**Bubblewrap** is the gold standard for lightweight Linux sandboxing — fast, no root, well-tested (used by Flatpak). AXIS uses it only as a block-mode fallback when it can preserve the requested policy. It is not treated as a proxy-mode fallback unless proxy reachability and direct-egress denial can both be preserved. Its limitation: no fine-grained endpoint network policy by itself, no GPU support, no credential injection.
 
 **Firecracker** provides the strongest isolation (own kernel, own memory space) with impressive startup (~125ms, <5 MiB). However, it **cannot provide GPU access** — there is no PCIe passthrough in the microVM model. This is a fundamental limitation for AI agent workloads that need local inference. It also requires KVM (root/admin).
 
@@ -83,9 +83,13 @@ The Microsoft Defender Security Research article identifies six control domains 
 | Microsoft Defender Recommendation | Entra ID least-privilege + manual token rotation | Cloud-only, doesn't protect local credential files |
 | OpenClaw | Docker bind-mount hides host dirs | Can be bypassed via /proc/self/root ([Snyk, March 2026](https://labs.snyk.io/resources/bypass-openclaw-security-sandbox/)) |
 | Claude Code | Allowlist-only filesystem | Effective for tool execution, not full agent runtime |
-| **AXIS** | Landlock denies `~/.ssh`, `~/.aws`, `~/.gnupg` at kernel level + proxy-level credential injection | Agent never sees real credentials. Kernel-enforced, not bypassable. |
+| **AXIS** | Landlock denies `~/.ssh`, `~/.aws`, `~/.gnupg` at kernel level + sandbox env filtering | Default Linux sandbox env strips common provider secrets. Kernel-enforced filesystem denial prevents direct reads of known credential stores. |
 
-**AXIS advantage:** Credentials are injected by the proxy at the HTTP boundary using placeholders (`axis:resolve:env:KEY`). The sandbox process never has the real credential in memory. Additionally, the leak detector scans all outbound traffic (including L7-decrypted HTTPS) for 11 credential patterns and blocks exfiltration.
+**AXIS advantage:** Linux sandboxes do not receive common provider secrets from
+the host environment by default, and credential-store paths can be denied by
+Landlock policy. Host-boundary credential injection at the proxy is tracked as
+a follow-up so approved provider access can be restored without exposing raw
+secrets to the sandbox process.
 
 ### 4.2 Execution: Code Containment
 
@@ -105,9 +109,9 @@ The Microsoft Defender Security Research article identifies six control domains 
 | Microsoft Defender Recommendation | Defender URL filtering (user-mode) | Yes (raw sockets, DNS tunneling) |
 | OpenClaw | Docker `network: none` | All-or-nothing, no proxy |
 | Claude Code | HTTP/SOCKS5 proxy | Application-level (agent could bypass) |
-| **AXIS** | Kernel network namespace + veth + iptables + OPA proxy | **No** (kernel-enforced, iptables LOG detects bypass attempts) |
+| **AXIS** | Block-mode seccomp socket denial, or helper/native netns + veth + firewall + OPA proxy | Block mode is kernel-enforced. Proxy mode is kernel-enforced only when native capabilities or the optional helper can set up netns/firewall. |
 
-**AXIS advantage:** The sandbox has its own network stack (network namespace). The only route to the internet is through the AXIS proxy on 10.200.0.1. iptables rules LOG and REJECT any bypass attempt. Every CONNECT request is evaluated by the OPA engine against per-host, per-port, per-binary policy. On Windows, AppContainer with zero capabilities achieves the same kernel-level network deny. On macOS, Seatbelt profiles restrict network to localhost only.
+**AXIS advantage:** The Linux quickstart can deny outbound IP sockets without host privilege. When proxy mode is requested and native capabilities or the optional helper are available, the sandbox has its own network stack and firewall rules allow only the AXIS proxy path while logging and rejecting direct egress. Every CONNECT request is evaluated by the OPA engine against per-host, per-port, per-binary policy. On Windows, AppContainer with zero capabilities provides kernel-level deny. On macOS, Seatbelt profiles restrict network to localhost only.
 
 ### 4.4 Persistence: State Isolation
 
@@ -182,13 +186,18 @@ The agent sandboxing landscape is converging on OS-native primitives (Landlock, 
 AXIS is unique in four ways:
 
 1. **GPU isolation** — no other sandbox technology provides per-agent GPU access with VRAM quotas and API whitelisting
-2. **Credential injection** — the agent never sees real credentials; they're injected at the proxy boundary
+2. **Credential containment roadmap** — current Linux sandboxes strip common provider secrets from the environment; proxy-boundary credential injection is tracked as a follow-up
 3. **Default-deny seccomp** — the strictest syscall policy of any agent sandbox (142 of ~400 allowed)
-4. **Cross-platform from day one** — Linux (Landlock + seccomp + netns), Windows (AppContainer + Job Object), macOS (Seatbelt) with no admin privileges on any platform
+4. **Cross-platform direction** — Linux (Landlock + seccomp + optional netns proxy), Windows (AppContainer + Job Object), and macOS (Seatbelt), with a no-admin Linux block-mode quickstart and optional helper/capability requirements for stronger Linux proxy networking
 
 The VM-based approach recommended by Microsoft Defender provides strong isolation but at unacceptable cost (startup, memory, admin, licensing) for the agent use case where sandboxes are created and destroyed continuously. Firecracker offers a middle ground but cannot do GPU. gVisor handles NVIDIA GPUs but at 84 MiB per sandbox.
 
-AXIS provides kernel-level isolation at process-level cost: 0.6ms startup, 1.6MB memory, zero admin, zero licensing. For the specific threat model of AI agents — untrusted code + untrusted instructions + credential access + GPU compute — it is the most complete solution available.
+AXIS targets kernel-level isolation at process-level cost: 0.6ms startup and
+1.6MB memory in the measured Linux path, with zero admin for the block-mode
+quickstart and explicit capability/helper requirements for stronger Linux proxy
+networking. For the specific threat model of AI agents — untrusted code,
+untrusted instructions, credential access, and GPU compute — it is designed to
+provide a complete OS-native alternative to VM- or container-first approaches.
 
 ---
 

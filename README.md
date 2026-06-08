@@ -45,25 +45,38 @@ sudo dpkg -i axis_0.1.0_amd64.deb    # Debian/Ubuntu
 sudo rpm -i axis-0.1.0-1.x86_64.rpm  # Fedora/RHEL
 ```
 
+When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon`
+is enough for the local no-admin Linux quickstart and e2e tests.
+
 ## Quick Start
 
 ```bash
-# Run anything in a sandbox — one command, zero config
-axis run -- python -c "print('Hello from AXIS sandbox')"
+# Run anything in a block-mode sandbox — one command, zero config
+axis run -- python3 -c "print('Hello from AXIS sandbox')"
 ```
 
-That's it. The default `minimal` policy runs with Landlock filesystem isolation, seccomp syscall filtering, and block-mode network enforcement with no admin privileges.
+That's it. The default `minimal` policy is intentionally quickstart-friendly on
+Linux: Landlock filesystem isolation, seccomp syscall filtering, block-mode
+network denial, and no requested cgroup/resource limits. It does not require
+sudo, a setuid helper, a container, or a VM.
 
 ```bash
-# Run an agent with a policy
-axis run --policy coding-agent.yaml -- python my_agent.py
+# Run a resource-limited or proxy policy when the host can enforce it
+axis run --policy policies/coding-agent.yaml -- python3 my_agent.py
 
 # Or use the daemon for multi-sandbox management
 axisd &
-axis create --policy policies/coding-agent.yaml -- python my_agent.py
+axis create --policy policies/minimal.yaml -- python3 my_agent.py
 axis list
 axis destroy <sandbox-id>
 ```
+
+On Linux, policies that request CPU, memory, or process limits require writable
+cgroups v2 or a documented fallback. `network.mode: proxy` additionally needs
+native `CAP_NET_ADMIN` support or the optional AXIS netns helper. Missing
+capabilities are fatal for the requested policy rather than silently weakening
+the sandbox. See [Linux Setup](docs/linux-setup.md) for the mode matrix and
+test commands.
 
 ## Platform Details
 
@@ -80,11 +93,16 @@ No admin or root required. Works on macOS 12+ (Monterey and later).
 
 ### Linux (Landlock + seccomp + netns)
 
-Linux selects the strongest strategy that satisfies the requested policy and fails closed when a policy cannot be enforced:
-1. Landlock ABI V2+ — filesystem allowlist enforced by the kernel
-2. seccomp default-deny — 142 of ~400 syscalls whitelisted; everything else returns EPERM
-3. block-mode networking — seccomp denies IP socket domains when the policy requests no network
-4. proxy-mode networking — netns + veth + iptables routes traffic through the AXIS proxy when native `CAP_NET_ADMIN`, an installed AXIS helper, or another supported setup path is available
+Linux selects the strongest strategy that satisfies the requested policy and
+fails closed when a policy cannot be enforced:
+1. Landlock ABI V3+ — filesystem allowlist enforced by the kernel
+2. seccomp default-deny — policy-aware syscall and socket-domain filtering
+3. block-mode networking — IP socket domains denied without proxy env injection
+4. proxy-mode networking — netns + veth + firewall rules route traffic through
+   the AXIS proxy when native `CAP_NET_ADMIN` or the optional AXIS helper is
+   available
+5. bubblewrap fallback — block-mode fallback when Landlock is unavailable and a
+   safe system `bwrap` can preserve the requested semantics
 
 ### Windows (AppContainer + Job Object)
 
@@ -179,7 +197,11 @@ axis/
 
 ## Status
 
-Phase 0 (isolation) + Phase 1 (GPU) + Phase 2 (inference) complete. 86 unit/integration tests, 121 cross-platform e2e tests, all passing.
+Shared isolation semantics are documented in
+[AXIS Isolation Contract](docs/axis-isolation-contract.md). Linux behavior is
+documented in [Linux Setup](docs/linux-setup.md). Native process backend
+retention decisions are documented in
+[Native Backend Retention](docs/native-backend-retention.md).
 
 ## License
 

@@ -10,9 +10,9 @@ filesystem:
     - "{workspace}"
 
 process:
-  max_processes: 16
-  max_memory_mb: 4096
-  cpu_rate_percent: 50
+  max_processes: 0
+  max_memory_mb: 0
+  cpu_rate_percent: 0
 
 network:
   mode: block
