@@ -49,9 +49,13 @@ jobs:
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - 'e2e/linux/**'
+              - 'install.sh'
               - 'policies/**'
               - 'data/**'
+              - 'scripts/**'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/nightly.yml'
 
   test-linux:
     name: Test (Linux)
@@ -82,6 +86,9 @@ jobs:
           ./target/release/axis policy validate policies/minimal.yaml
           ./target/release/axis policy validate policies/coding-agent.yaml
           ./target/release/axis policy validate policies/gpu-agent.yaml
+
+      - name: Linux MXC packaging contract
+        run: bash scripts/check_linux_mxc_packaging.sh
 
       - name: Success metrics
         run: ./target/release/success-metrics

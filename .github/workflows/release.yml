@@ -9,6 +9,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.95.0
+  CARGO_DEB_VERSION: 3.6.4
+  CARGO_GENERATE_RPM_VERSION: 0.21.0
+  MXC_REPOSITORY: https://github.com/microsoft/mxc
+  MXC_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
 
 jobs:
   build:
@@ -33,9 +38,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install Rust toolchain (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install Rust toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target ${{ matrix.target }}
+          rustup default $env:RUST_TOOLCHAIN
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -44,6 +58,15 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Build MXC Linux executor
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
+          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+          git -C "$mxc_dir" checkout "$MXC_REF"
+          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+          cp "$mxc_dir/src/target/release/lxc-exec" target/${{ matrix.target }}/release/lxc-exec
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -51,6 +74,7 @@ jobs:
           cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
           cp target/${{ matrix.target }}/release/axisd dist/axis-${{ matrix.platform }}/
           if [ "${{ matrix.platform }}" = "linux-x86_64" ]; then
+            cp target/${{ matrix.target }}/release/lxc-exec dist/axis-${{ matrix.platform }}/
             cp target/${{ matrix.target }}/release/axis-seccomp-launcher dist/axis-${{ matrix.platform }}/
             cp target/${{ matrix.target }}/release/axis-netns-helper dist/axis-${{ matrix.platform }}/
           fi
@@ -58,6 +82,13 @@ jobs:
           cp README.md LICENSE dist/axis-${{ matrix.platform }}/
           cd dist
           tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
+
+      - name: Verify Linux release archive
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          tar tzf dist/axis-${{ matrix.platform }}.tar.gz | grep -F "axis-${{ matrix.platform }}/lxc-exec"
+          tar tzf dist/axis-${{ matrix.platform }}.tar.gz | grep -F "axis-${{ matrix.platform }}/axis-seccomp-launcher"
+          tar tzf dist/axis-${{ matrix.platform }}.tar.gz | grep -F "axis-${{ matrix.platform }}/axis-netns-helper"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -84,21 +115,59 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install package inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
 
       - name: Build release
         run: cargo build --release
 
+      - name: Build MXC Linux executor
+        run: |
+          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
+          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+          git -C "$mxc_dir" checkout "$MXC_REF"
+          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+          cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec
+
       - name: Build .deb
         run: |
-          cargo install cargo-deb
+          cargo install cargo-deb --version "$CARGO_DEB_VERSION" --locked
           cargo deb -p axis-daemon --no-build
+
+      - name: Verify .deb contents
+        run: |
+          deb="$(find target/debian -name '*.deb' -print -quit)"
+          test -n "$deb"
+          dpkg-deb -c "$deb" | grep -F "./usr/bin/lxc-exec"
+          dpkg-deb -c "$deb" | grep -F "./usr/libexec/axis/axis-seccomp-launcher"
+          if dpkg-deb -c "$deb" | grep -F "axis-netns-helper"; then
+            echo "axis-netns-helper must not be installed by the base package"
+            exit 1
+          fi
 
       - name: Build .rpm
         run: |
-          cargo install cargo-generate-rpm
-          cargo generate-rpm -p crates/axis-daemon || true
+          cargo install cargo-generate-rpm --version "$CARGO_GENERATE_RPM_VERSION" --locked
+          cargo generate-rpm -p crates/axis-daemon
+
+      - name: Verify .rpm contents
+        run: |
+          rpm_path="$(find target/generate-rpm -name '*.rpm' -print -quit)"
+          test -n "$rpm_path"
+          rpm -qpl "$rpm_path" | grep -F "/usr/bin/lxc-exec"
+          rpm -qpl "$rpm_path" | grep -F "/usr/libexec/axis/axis-seccomp-launcher"
+          if rpm -qpl "$rpm_path" | grep -F "axis-netns-helper"; then
+            echo "axis-netns-helper must not be installed by the base package"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

@@ -21,6 +21,7 @@ INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_DIR_EXPLICIT=0
 CHANNEL="release"
 VERSION=""
+LOCAL_ARCHIVE="${AXIS_INSTALL_ARCHIVE:-}"
 INSTALL_NETNS_HELPER=0
 ENABLE_CAP_NET_ADMIN=0
 HELPER_INSTALL_PATH="/usr/libexec/axis/axis-netns-helper"
@@ -166,6 +167,15 @@ enable_cap_net_admin() {
 
 # Get the download URL for the latest release.
 get_download_url() {
+    if [ -n "$LOCAL_ARCHIVE" ]; then
+        if [ ! -f "$LOCAL_ARCHIVE" ]; then
+            echo "Error: AXIS_INSTALL_ARCHIVE does not exist: $LOCAL_ARCHIVE"
+            exit 1
+        fi
+        URL="$LOCAL_ARCHIVE"
+        return
+    fi
+
     if [ "$CHANNEL" = "nightly" ]; then
         TAG="nightly"
     elif [ -n "$VERSION" ]; then
@@ -188,32 +198,12 @@ get_download_url() {
     URL="https://github.com/${REPO}/releases/download/${TAG}/axis-${PLATFORM}.${EXT}"
 }
 
-# Download and install.
-install() {
-    require_linux_privilege_options
-
-    echo "AXIS installer"
-    echo ""
-    echo "  Platform: ${PLATFORM}"
-    echo "  Channel:  ${CHANNEL}"
-    echo "  Install:  ${INSTALL_DIR}"
-    if [ "$INSTALL_NETNS_HELPER" -eq 1 ]; then
-        echo "  Netns:    helper (${HELPER_INSTALL_PATH})"
-    elif [ "$ENABLE_CAP_NET_ADMIN" -eq 1 ]; then
-        echo "  Netns:    CAP_NET_ADMIN on axis/axisd"
+download_archive() {
+    if [ -n "$LOCAL_ARCHIVE" ]; then
+        cp "$LOCAL_ARCHIVE" "${TMPDIR}/axis-archive"
+        return
     fi
-    echo ""
 
-    get_download_url
-
-    echo "  Download: ${URL}"
-    echo ""
-
-    TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT
-
-    # Download.
-    echo "Downloading..."
     if command -v curl >/dev/null 2>&1; then
         curl -sSfL -o "${TMPDIR}/axis-archive" "$URL" || {
             echo ""
@@ -232,6 +222,39 @@ install() {
         echo "Error: curl or wget required"
         exit 1
     fi
+}
+
+# Download and install.
+install() {
+    require_linux_privilege_options
+
+    echo "AXIS installer"
+    echo ""
+    echo "  Platform: ${PLATFORM}"
+    echo "  Channel:  ${CHANNEL}"
+    echo "  Install:  ${INSTALL_DIR}"
+    if [ "$INSTALL_NETNS_HELPER" -eq 1 ]; then
+        echo "  Netns:    helper (${HELPER_INSTALL_PATH})"
+    elif [ "$ENABLE_CAP_NET_ADMIN" -eq 1 ]; then
+        echo "  Netns:    CAP_NET_ADMIN on axis/axisd"
+    fi
+    echo ""
+
+    get_download_url
+
+    if [ -n "$LOCAL_ARCHIVE" ]; then
+        echo "  Archive:  ${URL}"
+    else
+        echo "  Download: ${URL}"
+    fi
+    echo ""
+
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+
+    # Download.
+    echo "Downloading..."
+    download_archive
 
     # Extract.
     echo "Extracting..."
@@ -249,12 +272,13 @@ install() {
         tar xf "${TMPDIR}/axis-archive" -C "${TMPDIR}/extracted"
     fi
 
-    # Install binaries. The Linux seccomp launcher is an ordinary unprivileged
-    # helper used by the MXC-backed sandbox path and must live beside axis/axisd
-    # for user-prefix installs.
+    # Install binaries. Linux MXC-backed sandboxing uses ordinary unprivileged
+    # runtime helpers that must be available from stable, safe executable paths.
+    # User-prefix installs keep them beside axis/axisd; package installs place
+    # them in system paths through package metadata.
     INSTALL_BINS="axis axisd"
     if [ "$OS" = "linux" ]; then
-        INSTALL_BINS="$INSTALL_BINS axis-seccomp-launcher"
+        INSTALL_BINS="$INSTALL_BINS axis-seccomp-launcher lxc-exec"
     fi
     for bin in $INSTALL_BINS; do
         if [ "$OS" = "windows" ]; then
@@ -267,9 +291,9 @@ install() {
         if [ -n "$SRC" ]; then
             install_user_binary "$SRC" "${INSTALL_DIR}/${BIN_NAME}"
             echo "  Installed: ${INSTALL_DIR}/${BIN_NAME}"
-        elif [ "$bin" = "axis-seccomp-launcher" ]; then
-            echo "Error: archive does not contain axis-seccomp-launcher"
-            echo "Use a Linux release archive that ships the MXC seccomp launcher."
+        elif [ "$OS" = "linux" ] && { [ "$bin" = "axis-seccomp-launcher" ] || [ "$bin" = "lxc-exec" ]; }; then
+            echo "Error: archive does not contain ${bin}"
+            echo "Use a Linux release archive that ships the MXC runtime helpers."
             exit 1
         fi
     done

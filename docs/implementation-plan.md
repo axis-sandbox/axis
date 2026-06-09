@@ -1174,7 +1174,7 @@ Network namespace creation (`ip netns add`) requires `CAP_NET_ADMIN`, which stan
 
 1. **Native privileges.** If the AXIS process already has `CAP_NET_ADMIN`, it can create the namespace, veth pair, routes, and firewall rules directly.
 
-2. **Optional setuid helper** (`axis-netns-helper`). A narrowly scoped helper installed to `/usr/libexec/axis/` during package install or explicit local setup. The helper must validate arguments strictly, avoid shell/PATH execution, use fixed root-owned command paths, authorize the caller, and supervise launch/entry so the main daemon remains unprivileged.
+2. **Optional setuid helper** (`axis-netns-helper`). A narrowly scoped helper installed to `/usr/libexec/axis/` only during explicit privileged setup. The helper must validate arguments strictly, avoid shell/PATH execution, use fixed root-owned command paths, authorize the caller, and supervise launch/entry so the main daemon remains unprivileged.
 
 3. **Future unprivileged user namespace path.** A userns design is acceptable only if it preserves the same host-veth proxy reachability and direct-egress denial semantics.
 

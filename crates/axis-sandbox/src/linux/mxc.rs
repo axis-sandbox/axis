@@ -13,6 +13,7 @@ use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
 use axis_core::types::SandboxId;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1609,6 +1610,10 @@ fn path_to_string(path: &Path) -> Result<String, MxcTranslationError> {
 }
 
 fn production_executor_candidates() -> Vec<PathBuf> {
+    production_executor_candidates_for_path(std::env::var_os("PATH").as_deref())
+}
+
+fn production_executor_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
@@ -1620,8 +1625,8 @@ fn production_executor_candidates() -> Vec<PathBuf> {
         );
     }
 
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
             if dir.as_os_str().is_empty() || !dir.is_absolute() {
                 continue;
             }
@@ -2588,6 +2593,49 @@ mod tests {
             MxcExecutor::resolve_from_candidates([root.path().join("missing")]).unwrap_err(),
             MxcExecutorError::Unavailable
         );
+    }
+
+    #[test]
+    fn production_executor_candidates_include_package_dirs_and_path_dirs() {
+        let candidates = production_executor_candidates_for_path(Some(OsStr::new(
+            "/home/test/.local/bin:relative:/usr/bin:/opt/axis/bin",
+        )));
+
+        let stable_dirs = MXC_EXECUTOR_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join(MXC_EXECUTOR_NAME))
+            .collect::<Vec<_>>();
+        assert_eq!(&candidates[..stable_dirs.len()], stable_dirs.as_slice());
+        assert!(candidates.contains(&Path::new("/home/test/.local/bin").join(MXC_EXECUTOR_NAME)));
+        assert!(candidates.contains(&Path::new("/opt/axis/bin").join(MXC_EXECUTOR_NAME)));
+        assert!(!candidates.contains(&Path::new("relative").join(MXC_EXECUTOR_NAME)));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|path| path.as_path() == Path::new("/usr/bin").join(MXC_EXECUTOR_NAME))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn production_seccomp_launcher_candidates_include_package_dirs_and_current_exe_dir() {
+        let candidates = production_seccomp_launcher_candidates();
+
+        for dir in AXIS_SECCOMP_LAUNCHER_DIRS {
+            assert!(
+                candidates.contains(&Path::new(dir).join(AXIS_SECCOMP_LAUNCHER_NAME)),
+                "missing packaged seccomp launcher dir: {dir}"
+            );
+        }
+
+        let current_exe = std::env::current_exe().unwrap();
+        let current_dir = current_exe.parent().unwrap();
+        assert!(candidates.contains(&current_dir.join(AXIS_SECCOMP_LAUNCHER_NAME)));
+        if current_dir.file_name().is_some_and(|name| name == "deps") {
+            let parent = current_dir.parent().unwrap();
+            assert!(candidates.contains(&parent.join(AXIS_SECCOMP_LAUNCHER_NAME)));
+        }
     }
 
     #[test]

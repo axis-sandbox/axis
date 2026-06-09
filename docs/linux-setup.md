@@ -11,6 +11,12 @@ Build from a checkout:
 cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 ```
 
+Linux release archives and packages include the MXC `lxc-exec` executor and
+the AXIS `axis-seccomp-launcher` helper. Source-tree builds produce the AXIS
+helper; real MXC runtime validation from a checkout also needs `lxc-exec`
+built from the pinned MXC revision and available on `PATH` from a safe,
+non-writable executable directory.
+
 Run the default block-mode sandbox:
 
 ```bash
@@ -73,19 +79,31 @@ binary-restricted proxy policies are rejected on helper-only hosts.
 
 ## Optional Netns Helper
 
+The Linux runtime uses two ordinary unprivileged helper binaries in the default
+install path:
+
+```text
+lxc-exec
+axis-seccomp-launcher
+```
+
+Release archives install both beside `axis` and `axisd` for user-prefix
+installs. Linux `.deb` and `.rpm` packages install `lxc-exec` into `/usr/bin`
+and `axis-seccomp-launcher` into `/usr/libexec/axis`. These helpers are not
+setuid and do not make the quickstart privileged.
+
 Proxy mode needs network namespace and firewall setup. Standard user processes
-usually lack `CAP_NET_ADMIN`, so production packages may install a narrow
+usually lack `CAP_NET_ADMIN`, so production packages may also install a narrow
 setuid-root helper at:
 
 ```text
 /usr/libexec/axis/axis-netns-helper
 ```
 
-The helper is not part of the quickstart requirement. Ordinary local tests and
-block-mode use do not depend on it. Linux `.deb` and `.rpm` packages install the
-helper as root-owned setuid content so normal `axis run` invocations can request
-proxy mode without runtime sudo. The curl installer keeps the default no-admin
-path, but can install the helper explicitly:
+The netns helper is not part of the quickstart requirement. Ordinary local tests
+and block-mode use do not depend on it, and base Linux `.deb` and `.rpm`
+packages do not install setuid content by default. The curl installer keeps the
+default no-admin path, but can install the helper explicitly:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh \

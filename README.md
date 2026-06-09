@@ -49,14 +49,20 @@ sudo dpkg -i axis_0.1.0_amd64.deb    # Debian/Ubuntu
 sudo rpm -i axis-0.1.0-1.x86_64.rpm  # Fedora/RHEL
 ```
 
-Linux packages install the optional netns helper used by stronger proxy-mode
-policies. The curl installer keeps the default no-admin path unless
-`--with-netns-helper` is requested. Advanced Linux users may choose
+Linux release archives and packages include the MXC `lxc-exec` executor and
+the AXIS seccomp launcher used by the Linux runtime. They install into ordinary
+user or system executable paths for the no-admin quickstart. Linux packages
+do not install the privileged netns helper by default. The curl installer keeps
+the default no-admin path unless `--with-netns-helper` is requested. Advanced
+Linux users may choose
 `--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
 narrower privileged path.
 
 When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins`
-is enough for the local no-admin Linux quickstart and e2e tests.
+builds the AXIS binaries and Linux helper binaries. Source-tree tests that
+exercise the real MXC runtime also need an `lxc-exec` binary built from the
+pinned MXC revision and placed on `PATH` from a safe, non-writable executable
+directory.
 
 ## Quick Start
 

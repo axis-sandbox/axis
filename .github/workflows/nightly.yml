@@ -10,6 +10,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.95.0
+  MXC_REPOSITORY: https://github.com/microsoft/mxc
+  MXC_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
 
 jobs:
   build:
@@ -33,9 +36,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install Rust toolchain (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install Rust toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target ${{ matrix.target }}
+          rustup default $env:RUST_TOOLCHAIN
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -43,6 +55,15 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build MXC Linux executor
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
+          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+          git -C "$mxc_dir" checkout "$MXC_REF"
+          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+          cp "$mxc_dir/src/target/release/lxc-exec" target/${{ matrix.target }}/release/lxc-exec
 
       - name: Test
         if: ${{ !matrix.cross }}
@@ -55,12 +76,20 @@ jobs:
           cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
           cp target/${{ matrix.target }}/release/axisd dist/axis-${{ matrix.platform }}/
           if [ "${{ matrix.platform }}" = "linux-x86_64" ]; then
+            cp target/${{ matrix.target }}/release/lxc-exec dist/axis-${{ matrix.platform }}/
             cp target/${{ matrix.target }}/release/axis-seccomp-launcher dist/axis-${{ matrix.platform }}/
             cp target/${{ matrix.target }}/release/axis-netns-helper dist/axis-${{ matrix.platform }}/
           fi
           cp policies/*.yaml dist/axis-${{ matrix.platform }}/
           cp LICENSE dist/axis-${{ matrix.platform }}/
           cd dist && tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
+
+      - name: Verify Linux nightly archive
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          tar tzf dist/axis-${{ matrix.platform }}.tar.gz | grep -F "axis-${{ matrix.platform }}/lxc-exec"
+          tar tzf dist/axis-${{ matrix.platform }}.tar.gz | grep -F "axis-${{ matrix.platform }}/axis-seccomp-launcher"
+          tar tzf dist/axis-${{ matrix.platform }}.tar.gz | grep -F "axis-${{ matrix.platform }}/axis-netns-helper"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
