@@ -340,10 +340,15 @@ pub(crate) struct MxcLinuxSandbox {
     id: SandboxId,
     spec: MxcExecutionSpec,
     executor: MxcExecutor,
+    process_policy: axis_core::policy::ProcessPolicy,
+    resource_strategy: super::strategy::ResourceStrategy,
     child: Option<Child>,
     exit_code: Option<i32>,
     config_file: Option<tempfile::NamedTempFile>,
     seccomp_filter_file: Option<tempfile::NamedTempFile>,
+    cgroup: Option<super::resources::CgroupHandle>,
+    #[cfg(test)]
+    cgroup_override: Option<super::resources::CgroupHandle>,
     workspace_dir: PathBuf,
     capture_output: bool,
     timeout_sec: Option<u64>,
@@ -367,6 +372,7 @@ impl MxcLinuxSandbox {
                     ))
                 })
             },
+            || resolve_mxc_resource_strategy(&config.policy.process),
         )
     }
 
@@ -376,18 +382,41 @@ impl MxcLinuxSandbox {
         executor: MxcExecutor,
         seccomp_launcher: MxcSeccompLauncher,
     ) -> Result<Self, SandboxError> {
-        Self::new_with_resolvers(config, || Ok(executor), || Ok(seccomp_launcher))
+        Self::new_with_resolvers(
+            config,
+            || Ok(executor),
+            || Ok(seccomp_launcher),
+            || Ok(no_resource_limits_strategy()),
+        )
     }
 
-    fn new_with_resolvers<F, G>(
+    #[cfg(test)]
+    fn new_with_executor_and_resource_strategy(
+        config: &SandboxConfig,
+        executor: MxcExecutor,
+        seccomp_launcher: MxcSeccompLauncher,
+        resource_strategy: super::strategy::ResourceStrategy,
+    ) -> Result<Self, SandboxError> {
+        Self::new_with_resolvers(
+            config,
+            || Ok(executor),
+            || Ok(seccomp_launcher),
+            || Ok(resource_strategy),
+        )
+    }
+
+    fn new_with_resolvers<F, G, H>(
         config: &SandboxConfig,
         resolve_executor: F,
         resolve_seccomp_launcher: G,
+        resolve_resources: H,
     ) -> Result<Self, SandboxError>
     where
         F: FnOnce() -> Result<MxcExecutor, SandboxError>,
         G: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
+        H: FnOnce() -> Result<super::strategy::ResourceStrategy, SandboxError>,
     {
+        let resource_strategy = resolve_resources()?;
         let mut tmpdir_active = false;
         if super::landlock::policy_uses_tmpdir(&config.policy.filesystem) {
             super::landlock::create_tmpdir(&config.workspace_dir)
@@ -434,10 +463,15 @@ impl MxcLinuxSandbox {
             id: config.id,
             spec,
             executor,
+            process_policy: config.policy.process.clone(),
+            resource_strategy,
             child: None,
             exit_code: None,
             config_file: None,
             seccomp_filter_file: Some(seccomp_filter_file),
+            cgroup: None,
+            #[cfg(test)]
+            cgroup_override: None,
             workspace_dir: config.workspace_dir.clone(),
             capture_output: config.capture_output,
             timeout_sec: config.timeout_sec,
@@ -448,7 +482,18 @@ impl MxcLinuxSandbox {
     fn cleanup_after_stop(&mut self) -> Result<(), SandboxError> {
         self.config_file.take();
         self.seccomp_filter_file.take();
-        self.cleanup_tmpdir()
+        let mut cleanup_errors = Vec::new();
+        if let Some(error) = self.cleanup_cgroup() {
+            cleanup_errors.push(format!("cgroup cleanup failed: {error}"));
+        }
+        if let Err(error) = self.cleanup_tmpdir() {
+            cleanup_errors.push(format!("tmpdir cleanup failed: {error}"));
+        }
+        if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(SandboxError::IsolationFailed(cleanup_errors.join("; ")))
+        }
     }
 
     fn cleanup_tmpdir(&mut self) -> Result<(), SandboxError> {
@@ -461,11 +506,81 @@ impl MxcLinuxSandbox {
         Ok(())
     }
 
+    fn cleanup_cgroup(&mut self) -> Option<String> {
+        let cgroup = self.cgroup.clone()?;
+        let path = cgroup.path().to_path_buf();
+        if let Err(err) = cgroup.cleanup() {
+            tracing::warn!("failed to remove MXC cgroup '{}': {err}", path.display());
+            return Some(format!("cgroup '{}': {err}", path.display()));
+        }
+        self.cgroup = None;
+        None
+    }
+
     fn cleanup_for_start_failure(&mut self, error: SandboxError) -> SandboxError {
         self.config_file.take();
         self.seccomp_filter_file.take();
-        let cleanup_error = self.cleanup_tmpdir().err().map(|err| err.to_string());
-        append_cleanup_failure(error, cleanup_error)
+        let mut cleanup_errors = Vec::new();
+        if let Some(error) = self.cleanup_cgroup() {
+            cleanup_errors.push(format!("cgroup cleanup failed: {error}"));
+        }
+        if let Err(error) = self.cleanup_tmpdir() {
+            cleanup_errors.push(format!("tmpdir cleanup failed: {error}"));
+        }
+        append_cleanup_failure(
+            error,
+            (!cleanup_errors.is_empty()).then(|| cleanup_errors.join("; ")),
+        )
+    }
+
+    fn create_cgroup_for_start(&mut self) -> Result<super::resources::CgroupHandle, String> {
+        #[cfg(test)]
+        if let Some(cgroup) = self.cgroup_override.take() {
+            return Ok(cgroup);
+        }
+
+        super::resources::create_cgroup(self.id, &self.process_policy)
+    }
+}
+
+fn resolve_mxc_resource_strategy(
+    policy: &axis_core::policy::ProcessPolicy,
+) -> Result<super::strategy::ResourceStrategy, SandboxError> {
+    let (resources, fallbacks) = super::strategy::build_resource_strategy(policy)
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC Linux resources: {err}")))?;
+    for fallback in fallbacks {
+        tracing::debug!(
+            "MXC Linux resource fallback for {}: {}",
+            fallback.area,
+            fallback.reason
+        );
+    }
+    validate_mxc_resource_strategy(&resources)?;
+    Ok(resources)
+}
+
+fn validate_mxc_resource_strategy(
+    resources: &super::strategy::ResourceStrategy,
+) -> Result<(), SandboxError> {
+    if let super::strategy::ResourceStrategy::RlimitFallback {
+        process_limit: super::strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser,
+        ..
+    } = resources
+    {
+        return Err(SandboxError::IsolationFailed(
+            "MXC Linux resources: process-count rlimit fallback requires a safe MXC run_as_user path; writable cgroups v2 are required for process limits on the current MXC backend"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn no_resource_limits_strategy() -> super::strategy::ResourceStrategy {
+    super::strategy::ResourceStrategy::RlimitFallback {
+        memory_limit: false,
+        process_limit: super::strategy::ProcessLimitFallback::NotRequested,
+        cpu_limit: super::strategy::CpuLimitFallback::NotRequested,
     }
 }
 
@@ -487,6 +602,48 @@ impl SandboxImpl for MxcLinuxSandbox {
                 );
             }
         };
+        let prepared_rlimits =
+            match super::prepare_rlimits_for_plan(&self.process_policy, &self.resource_strategy) {
+                Ok(limits) => limits,
+                Err(err) => {
+                    return Err(
+                        self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                            "MXC resource limits: {err}"
+                        ))),
+                    );
+                }
+            };
+
+        if matches!(
+            self.resource_strategy,
+            super::strategy::ResourceStrategy::CgroupsV2 { .. }
+        ) {
+            match self.create_cgroup_for_start() {
+                Ok(cgroup) => self.cgroup = Some(cgroup),
+                Err(err) => {
+                    return Err(
+                        self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                            "MXC cgroup: creation failed: {err}"
+                        ))),
+                    );
+                }
+            }
+        }
+
+        let cgroup_procs_fd = match &self.cgroup {
+            Some(cgroup) => match cgroup.open_procs_fd() {
+                Ok(fd) => Some(fd),
+                Err(err) => {
+                    return Err(
+                        self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                            "MXC cgroup: cannot open procs: {err}"
+                        ))),
+                    );
+                }
+            },
+            None => None,
+        };
+
         let mut command = Command::new(self.executor.path());
         command
             .arg("--experimental")
@@ -502,6 +659,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             let stdout = match File::create(self.workspace_dir.join("stdout.log")) {
                 Ok(stdout) => stdout,
                 Err(err) => {
+                    super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
                         format!("stdout log: {err}"),
                     )));
@@ -510,6 +668,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             let stderr = match File::create(self.workspace_dir.join("stderr.log")) {
                 Ok(stderr) => stderr,
                 Err(err) => {
+                    super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
                         format!("stderr log: {err}"),
                     )));
@@ -519,25 +678,73 @@ impl SandboxImpl for MxcLinuxSandbox {
             command.stderr(Stdio::from(stderr));
         }
 
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-        }
-
-        let child =
-            match command.spawn() {
-                Ok(child) => child,
+        let mut child_error_pipe =
+            match super::ChildSetupErrorPipe::new() {
+                Ok(pipe) => pipe,
                 Err(err) => {
+                    super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
-                        format!("MXC executor: {err}"),
+                        format!("child setup error pipe: {err}"),
                     )));
                 }
             };
+        let child_error_write_fd = child_error_pipe.write_fd;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(super::child_setup_error(
+                        child_error_write_fd,
+                        super::ChildSetupErrorKind::SetProcessGroup,
+                        super::current_errno(),
+                    ));
+                }
+
+                if let Some(fd) = cgroup_procs_fd {
+                    if let Err(errno) = super::enter_cgroup_from_child_fd(fd) {
+                        libc::close(fd);
+                        return Err(super::child_setup_error(
+                            child_error_write_fd,
+                            super::ChildSetupErrorKind::EnterCgroup,
+                            errno,
+                        ));
+                    }
+                    libc::close(fd);
+                }
+
+                if let Some(limits) = prepared_rlimits
+                    && let Err(errno) = super::apply_prepared_rlimits(limits)
+                {
+                    return Err(super::child_setup_error(
+                        child_error_write_fd,
+                        super::ChildSetupErrorKind::ApplyResourceLimits,
+                        errno,
+                    ));
+                }
+
+                Ok(())
+            });
+        }
+
+        let child = match command.spawn() {
+            Ok(child) => {
+                super::close_fd(cgroup_procs_fd);
+                drop(child_error_pipe);
+                child
+            }
+            Err(err) => {
+                super::close_fd(cgroup_procs_fd);
+                let err = match super::spawn_error(err, &mut child_error_pipe) {
+                    SandboxError::IsolationFailed(message) => {
+                        SandboxError::IsolationFailed(format!("MXC executor setup: {message}"))
+                    }
+                    SandboxError::SpawnFailed(message) => {
+                        SandboxError::SpawnFailed(format!("MXC executor: {message}"))
+                    }
+                    other => other,
+                };
+                return Err(self.cleanup_for_start_failure(err));
+            }
+        };
         let pid = child.id();
         self.config_file = Some(config);
         self.child = Some(child);
@@ -568,7 +775,11 @@ impl SandboxImpl for MxcLinuxSandbox {
                 Err(err) => {
                     self.exit_code = Some(-1);
                     kill_process_group(pid);
-                    self.cleanup_after_stop()?;
+                    if let Err(cleanup_error) = self.cleanup_after_stop() {
+                        return Err(SandboxError::IsolationFailed(format!(
+                            "process cleanup failed after wait error {err}: {cleanup_error}"
+                        )));
+                    }
                     return Err(SandboxError::Io(err));
                 }
             };
@@ -1429,6 +1640,7 @@ fn process_group_exists(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux::{resources, strategy};
     use axis_core::policy::{
         Access, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy, InferencePolicy,
         NetworkPolicy, ProcessPolicy, SshPolicy,
@@ -2275,6 +2487,7 @@ mod tests {
             &config,
             || panic!("executor must not be resolved after seccomp preparation failure"),
             || panic!("launcher must not be resolved after seccomp preparation failure"),
+            || Ok(no_resource_limits_strategy()),
         );
         let Err(err) = result else {
             panic!("expected seccomp preparation failure");
@@ -2306,6 +2519,7 @@ mod tests {
             &config,
             || panic!("executor must not be resolved when seccomp support path is denied"),
             || Ok(launcher),
+            || Ok(no_resource_limits_strategy()),
         );
         let Err(err) = result else {
             panic!("expected denied seccomp launcher path failure");
@@ -2519,6 +2733,322 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resource_strategy_rejects_process_rlimit_fallback_for_mxc() {
+        let process_fallback = strategy::ResourceStrategy::RlimitFallback {
+            memory_limit: true,
+            process_limit: strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser,
+            cpu_limit: strategy::CpuLimitFallback::NotRequested,
+        };
+
+        let err = validate_mxc_resource_strategy(&process_fallback).unwrap_err();
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("process-count rlimit fallback"));
+        assert!(err.to_string().contains("writable cgroups v2"));
+
+        let memory_only = strategy::ResourceStrategy::RlimitFallback {
+            memory_limit: true,
+            process_limit: strategy::ProcessLimitFallback::NotRequested,
+            cpu_limit: strategy::CpuLimitFallback::NotRequested,
+        };
+        validate_mxc_resource_strategy(&memory_only).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_enters_cgroup_before_mxc_executor_runs() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 0\n",
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            strategy::ResourceStrategy::CgroupsV2 {
+                support: strategy::CgroupV2Support::Writable,
+            },
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+
+        let pid = SandboxImpl::start(&mut sandbox).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(cgroup_path.join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            pid.to_string()
+        );
+        fs::write(cgroup_path.join("cgroup.procs"), "").unwrap();
+        assert_eq!(SandboxImpl::wait(&mut sandbox).await.unwrap(), 0);
+        assert!(!cgroup_path.exists(), "MXC cgroup should be cleaned");
+    }
+
+    #[test]
+    fn runtime_start_failure_cleans_cgroup() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\necho '{}'\n", MXC_DRY_RUN_SUCCESS),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            strategy::ResourceStrategy::CgroupsV2 {
+                support: strategy::CgroupV2Support::Writable,
+            },
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+        fs::create_dir(workspace.path().join("stdout.log")).unwrap();
+
+        let err = SandboxImpl::start(&mut sandbox).unwrap_err();
+
+        assert!(matches!(err, SandboxError::SpawnFailed(_)));
+        assert!(
+            !cgroup_path.exists(),
+            "start failure should clean cgroup; error={err}; remaining={:?}",
+            remaining_dir_entries(&cgroup_path)
+        );
+    }
+
+    #[test]
+    fn runtime_start_failure_reports_cgroup_cleanup_failure() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\necho '{}'\n", MXC_DRY_RUN_SUCCESS),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        fs::write(cgroup_path.join("cgroup.procs"), "1234\n").unwrap();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            strategy::ResourceStrategy::CgroupsV2 {
+                support: strategy::CgroupV2Support::Writable,
+            },
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+        fs::remove_file(&executable).unwrap();
+
+        let err = SandboxImpl::start(&mut sandbox).unwrap_err();
+
+        assert!(err.to_string().contains("cleanup failed"));
+        assert!(err.to_string().contains("cgroup cleanup failed"));
+        assert!(
+            cgroup_path.exists(),
+            "failed cleanup should leave cgroup inspectable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_wait_reports_cgroup_cleanup_failure() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            cgroup_resource_strategy(),
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+
+        let err = SandboxImpl::wait(&mut sandbox).await.unwrap_err();
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("cgroup cleanup failed"));
+        assert!(
+            cgroup_path.exists(),
+            "failed cleanup should leave cgroup inspectable"
+        );
+    }
+
+    #[test]
+    fn runtime_try_wait_reports_cgroup_cleanup_failure() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            cgroup_resource_strategy(),
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = loop {
+            match SandboxImpl::try_wait(&mut sandbox) {
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => panic!("MXC executor did not exit before try_wait deadline"),
+                Ok(Some(code)) => {
+                    panic!("try_wait should report cgroup cleanup failure, got code {code}")
+                }
+                Err(err) => break err,
+            }
+        };
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("cgroup cleanup failed"));
+        assert!(
+            cgroup_path.exists(),
+            "failed cleanup should leave cgroup inspectable"
+        );
+    }
+
+    #[test]
+    fn runtime_destroy_reports_cgroup_cleanup_failure() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "sleep 30");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            cgroup_resource_strategy(),
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+
+        let err = SandboxImpl::destroy(&mut sandbox).unwrap_err();
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("cgroup cleanup failed"));
+        assert!(
+            cgroup_path.exists(),
+            "failed cleanup should leave cgroup inspectable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_wait_error_preserves_cgroup_cleanup_failure() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup = temp_cgroup(cgroup_root.path(), &config);
+        let cgroup_path = cgroup.path().to_path_buf();
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            cgroup_resource_strategy(),
+        )
+        .unwrap();
+        sandbox.cgroup_override = Some(cgroup);
+
+        let pid = SandboxImpl::start(&mut sandbox).unwrap();
+        reap_child(pid);
+
+        let err = SandboxImpl::wait(&mut sandbox).await.unwrap_err();
+        let message = err.to_string();
+        let expected_wait_error = std::io::Error::from_raw_os_error(libc::ECHILD).to_string();
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(message.contains("process cleanup failed after wait error"));
+        assert!(
+            message.contains(&expected_wait_error),
+            "wait error was not preserved in '{message}'"
+        );
+        assert!(message.contains("cgroup cleanup failed"));
+        assert!(
+            cgroup_path.exists(),
+            "failed cleanup should leave cgroup inspectable"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_allow_and_block_runtime_parity() {
         if MxcExecutor::resolve().is_err() {
@@ -2706,13 +3236,81 @@ mod tests {
         policy
     }
 
+    fn temp_cgroup(root: &Path, config: &SandboxConfig) -> resources::CgroupHandle {
+        let cgroup = resources::create_cgroup_at(root, config.id, &config.policy.process)
+            .expect("temp cgroup should be created");
+        fs::write(cgroup.path().join("cgroup.procs"), "").unwrap();
+        cgroup
+    }
+
+    fn cgroup_resource_strategy() -> strategy::ResourceStrategy {
+        strategy::ResourceStrategy::CgroupsV2 {
+            support: strategy::CgroupV2Support::Writable,
+        }
+    }
+
+    fn fake_mxc_runtime_executor(root: &tempfile::TempDir, run_script: &str) -> MxcExecutor {
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 {run_script}\n",
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        MxcExecutor::from_injected_path(&executable).unwrap()
+    }
+
+    fn reap_child(pid: u32) {
+        loop {
+            let ret = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+            if ret == pid as libc::pid_t {
+                return;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("waitpid({pid}) failed: {err}");
+        }
+    }
+
+    fn remaining_dir_entries(path: &Path) -> Vec<String> {
+        match fs::read_dir(path) {
+            Ok(entries) => entries
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .unwrap_or_else(|err| format!("<error: {err}>"))
+                })
+                .collect(),
+            Err(err) => vec![format!("<read_dir: {err}>")],
+        }
+    }
+
     fn path_string(path: &Path) -> String {
         path.to_string_lossy().into_owned()
     }
 
     fn write_executable(path: &Path, script: &str, mode: u32) {
-        fs::write(path, script).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        let parent = path.parent().expect("test executable should have a parent");
+        let mut file = tempfile::NamedTempFile::new_in(parent).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .unwrap();
+        file.persist(path).unwrap();
     }
 
     fn fake_seccomp_launcher(root: &tempfile::TempDir) -> MxcSeccompLauncher {

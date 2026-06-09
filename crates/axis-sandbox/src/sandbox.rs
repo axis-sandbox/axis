@@ -922,6 +922,7 @@ mod tests {
             config.policy.network.mode = NetworkMode::Proxy;
             config.policy.filesystem.read_write = vec!["~/.codex".into()];
             config.workspace_dir = workspace.path().join("workspace");
+            disable_resource_limits(&mut config);
 
             let err = match Sandbox::create_inner_with_backend(
                 config,
@@ -1829,6 +1830,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = test_config();
         config.workspace_dir = workspace.path().join("workspace");
+        disable_resource_limits(&mut config);
 
         let err =
             match create_platform_sandbox_with_backend(&config, PlatformBackendSelection::LinuxMxc)

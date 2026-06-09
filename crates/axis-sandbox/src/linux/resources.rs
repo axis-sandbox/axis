@@ -71,7 +71,7 @@ pub(crate) fn probe_cgroup_v2_delegation(root: &Path) -> Result<(), String> {
     cleanup_result
 }
 
-fn create_cgroup_at(
+pub(crate) fn create_cgroup_at(
     root: &Path,
     sandbox_id: SandboxId,
     policy: &ProcessPolicy,
@@ -165,6 +165,26 @@ fn write_file(path: impl AsRef<Path>, value: String) -> Result<(), String> {
 }
 
 fn remove_cgroup_dir(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if !path.starts_with(CGROUP_ROOT) {
+        // Unit tests model cgroup controller files as regular files under a
+        // temp root; real cgroup v2 controller files are removed by rmdir.
+        for file in [
+            "cgroup.procs",
+            "cgroup.kill",
+            "memory.max",
+            "pids.max",
+            "cpu.max",
+        ] {
+            let file_path = path.join(file);
+            match std::fs::remove_file(&file_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", file_path.display())),
+            }
+        }
+    }
+
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

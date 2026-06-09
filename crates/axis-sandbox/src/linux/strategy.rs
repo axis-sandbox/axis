@@ -213,6 +213,23 @@ pub(crate) fn build_isolation_plan(
     )
 }
 
+pub(crate) fn build_resource_strategy(
+    policy: &ProcessPolicy,
+) -> Result<(ResourceStrategy, Vec<PlanFallback>), StrategyError> {
+    let probe = DefaultCapabilityProbe;
+    plan_resource_strategy(policy, &probe)
+}
+
+pub(crate) fn plan_resource_strategy(
+    policy: &ProcessPolicy,
+    probe: &dyn CapabilityProbe,
+) -> Result<(ResourceStrategy, Vec<PlanFallback>), StrategyError> {
+    let caps = probe.snapshot();
+    let mut fallbacks = Vec::new();
+    let resources = plan_resources(policy, &caps, &mut fallbacks)?;
+    Ok((resources, fallbacks))
+}
+
 pub(crate) fn plan_with_probe(
     policy: &Policy,
     sandbox_id: SandboxId,
