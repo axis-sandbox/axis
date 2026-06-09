@@ -464,7 +464,7 @@ fn set_close_on_exec(fd: RawFd) -> Result<(), String> {
     }
 }
 
-fn expand_filesystem_policy(
+pub(crate) fn expand_filesystem_policy(
     policy: &FilesystemPolicy,
     workspace: &Path,
 ) -> Result<ExpandedFilesystemPolicy, String> {

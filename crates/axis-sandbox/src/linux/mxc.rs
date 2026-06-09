@@ -14,7 +14,7 @@ use axis_core::types::SandboxId;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ const MXC_EXECUTOR_NAME: &str = "lxc-exec";
 const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
 const MXC_DRY_RUN_SUCCESS: &str = "Dry run completed. Result: validation passed";
 const MAX_DRY_RUN_OUTPUT_BYTES: u64 = 64 * 1024;
+const POST_TIMEOUT_REAP_GRACE_SEC: u64 = 5;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MxcTranslationError {
@@ -68,10 +69,10 @@ pub enum MxcExecutorError {
     #[error("unsafe MXC executor candidate '{}': {reason}", path.display())]
     UnsafeCandidate { path: PathBuf, reason: String },
 
-    #[error("MXC dry-run config contains environment entry filtered by AXIS sandbox policy: {key}")]
+    #[error("MXC config contains environment entry filtered by AXIS sandbox policy: {key}")]
     FilteredEnv { key: String },
 
-    #[error("MXC dry-run config contains malformed environment entry")]
+    #[error("MXC config contains malformed environment entry")]
     MalformedEnv,
 
     #[error("failed to serialize MXC dry-run config: {0}")]
@@ -170,25 +171,7 @@ impl MxcExecutor {
         spec: &MxcExecutionSpec,
         timeout: Duration,
     ) -> Result<MxcDryRunResult, MxcExecutorError> {
-        validate_spec_env_for_dry_run(spec)?;
-
-        let json =
-            serde_json::to_vec(spec).map_err(|err| MxcExecutorError::Serialize(err.to_string()))?;
-        let mut config = tempfile::Builder::new()
-            .prefix("axis-mxc-")
-            .suffix(".json")
-            .tempfile()
-            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
-        config
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
-        config
-            .write_all(&json)
-            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
-        config
-            .flush()
-            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        let config = self.write_private_config(spec)?;
 
         let mut stdout_file =
             tempfile::tempfile().map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
@@ -243,6 +226,32 @@ impl MxcExecutor {
 
         Ok(MxcDryRunResult { stdout, stderr })
     }
+
+    fn write_private_config(
+        &self,
+        spec: &MxcExecutionSpec,
+    ) -> Result<tempfile::NamedTempFile, MxcExecutorError> {
+        validate_spec_env_for_launch(spec)?;
+
+        let json =
+            serde_json::to_vec(spec).map_err(|err| MxcExecutorError::Serialize(err.to_string()))?;
+        let mut config = tempfile::Builder::new()
+            .prefix("axis-mxc-")
+            .suffix(".json")
+            .tempfile()
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        config
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        config
+            .write_all(&json)
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        config
+            .flush()
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,33 +262,187 @@ pub struct MxcDryRunResult {
 
 pub(crate) struct MxcLinuxSandbox {
     id: SandboxId,
+    spec: MxcExecutionSpec,
+    executor: MxcExecutor,
+    child: Option<Child>,
+    exit_code: Option<i32>,
+    config_file: Option<tempfile::NamedTempFile>,
+    workspace_dir: PathBuf,
+    capture_output: bool,
+    timeout_sec: Option<u64>,
+    tmpdir_active: bool,
 }
 
 impl MxcLinuxSandbox {
     pub(crate) fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
         std::fs::create_dir_all(&config.workspace_dir)?;
+        Self::new_with_executor_resolver(config, || {
+            MxcExecutor::resolve().map_err(|err| {
+                SandboxError::IsolationFailed(format!("MXC Linux executor unavailable: {err}"))
+            })
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_executor(
+        config: &SandboxConfig,
+        executor: MxcExecutor,
+    ) -> Result<Self, SandboxError> {
+        Self::new_with_executor_resolver(config, || Ok(executor))
+    }
+
+    fn new_with_executor_resolver<F>(
+        config: &SandboxConfig,
+        resolve_executor: F,
+    ) -> Result<Self, SandboxError>
+    where
+        F: FnOnce() -> Result<MxcExecutor, SandboxError>,
+    {
+        let mut tmpdir_active = false;
+        if super::landlock::policy_uses_tmpdir(&config.policy.filesystem) {
+            super::landlock::create_tmpdir(&config.workspace_dir)
+                .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))?;
+            tmpdir_active = true;
+        }
+
         let spec = MxcExecutionSpec::from_sandbox_config(config).map_err(|err| {
-            SandboxError::IsolationFailed(format!("MXC Linux backend unsupported: {err}"))
+            let cleanup_error =
+                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+            append_cleanup_failure(
+                SandboxError::IsolationFailed(format!("MXC Linux backend unsupported: {err}")),
+                cleanup_error,
+            )
         })?;
-        let executor = MxcExecutor::resolve().map_err(|err| {
-            SandboxError::IsolationFailed(format!("MXC Linux executor unavailable: {err}"))
+        let executor = resolve_executor().map_err(|err| {
+            let cleanup_error =
+                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+            append_cleanup_failure(err, cleanup_error)
         })?;
         executor
             .dry_run(&spec, Duration::from_secs(5))
             .map_err(|err| {
-                SandboxError::IsolationFailed(format!("MXC Linux dry-run validation failed: {err}"))
+                let cleanup_error =
+                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                append_cleanup_failure(
+                    SandboxError::IsolationFailed(format!(
+                        "MXC Linux dry-run validation failed: {err}"
+                    )),
+                    cleanup_error,
+                )
             })?;
 
-        Ok(Self { id: config.id })
+        Ok(Self {
+            id: config.id,
+            spec,
+            executor,
+            child: None,
+            exit_code: None,
+            config_file: None,
+            workspace_dir: config.workspace_dir.clone(),
+            capture_output: config.capture_output,
+            timeout_sec: config.timeout_sec,
+            tmpdir_active,
+        })
+    }
+
+    fn cleanup_after_stop(&mut self) -> Result<(), SandboxError> {
+        self.config_file.take();
+        self.cleanup_tmpdir()
+    }
+
+    fn cleanup_tmpdir(&mut self) -> Result<(), SandboxError> {
+        if !self.tmpdir_active {
+            return Ok(());
+        }
+        super::landlock::cleanup_tmpdir(&self.workspace_dir)
+            .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir cleanup: {err}")))?;
+        self.tmpdir_active = false;
+        Ok(())
+    }
+
+    fn cleanup_for_start_failure(&mut self, error: SandboxError) -> SandboxError {
+        let cleanup_error = self.cleanup_tmpdir().err().map(|err| err.to_string());
+        append_cleanup_failure(error, cleanup_error)
     }
 }
 
 impl SandboxImpl for MxcLinuxSandbox {
     fn start(&mut self) -> Result<u32, SandboxError> {
-        Err(SandboxError::Unsupported(format!(
-            "MXC Linux backend start is not implemented for sandbox {}",
+        if self.child.is_some() {
+            return Err(SandboxError::SpawnFailed(
+                "MXC Linux backend is already running".into(),
+            ));
+        }
+
+        let config = match self.executor.write_private_config(&self.spec) {
+            Ok(config) => config,
+            Err(err) => {
+                return Err(
+                    self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                        "MXC config: {err}"
+                    ))),
+                );
+            }
+        };
+        let mut command = Command::new(self.executor.path());
+        command
+            .arg("--experimental")
+            .arg("--config")
+            .arg(config.path())
+            .current_dir(&self.workspace_dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C");
+
+        if self.capture_output {
+            command.stdin(Stdio::null());
+            let stdout = match File::create(self.workspace_dir.join("stdout.log")) {
+                Ok(stdout) => stdout,
+                Err(err) => {
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("stdout log: {err}"),
+                    )));
+                }
+            };
+            let stderr = match File::create(self.workspace_dir.join("stderr.log")) {
+                Ok(stderr) => stderr,
+                Err(err) => {
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("stderr log: {err}"),
+                    )));
+                }
+            };
+            command.stdout(Stdio::from(stdout));
+            command.stderr(Stdio::from(stderr));
+        }
+
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+
+        let child =
+            match command.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("MXC executor: {err}"),
+                    )));
+                }
+            };
+        let pid = child.id();
+        self.config_file = Some(config);
+        self.child = Some(child);
+        tracing::info!(
+            "sandbox {} started via MXC Linux backend, pid={pid}",
             self.id
-        )))
+        );
+        Ok(pid)
     }
 
     fn wait(
@@ -287,50 +450,126 @@ impl SandboxImpl for MxcLinuxSandbox {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>
     {
         Box::pin(async {
-            Err(SandboxError::Unsupported(
-                "MXC Linux backend wait is not implemented".into(),
-            ))
+            if let Some(code) = self.exit_code {
+                self.cleanup_after_stop()?;
+                return Ok(code);
+            }
+
+            let child = self
+                .child
+                .take()
+                .ok_or_else(|| SandboxError::SpawnFailed("no MXC child process".into()))?;
+            let pid = child.id() as i32;
+            let status = match wait_runtime_child_with_timeout(child, self.timeout_sec).await {
+                Ok(status) => status,
+                Err(err) => {
+                    self.exit_code = Some(-1);
+                    kill_process_group(pid);
+                    self.cleanup_after_stop()?;
+                    return Err(SandboxError::Io(err));
+                }
+            };
+            let code = status.code().unwrap_or(-1);
+            self.exit_code = Some(code);
+            kill_process_group(pid);
+            self.cleanup_after_stop()?;
+            Ok(code)
         })
     }
 
     fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
-        Ok(None)
+        if let Some(code) = self.exit_code {
+            self.cleanup_after_stop()?;
+            return Ok(Some(code));
+        }
+
+        let Some(child) = self.child.as_mut() else {
+            return Err(SandboxError::SpawnFailed("no MXC child process".into()));
+        };
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+
+        let pid = child.id() as i32;
+        self.child.take();
+        let code = status.code().unwrap_or(-1);
+        self.exit_code = Some(code);
+        kill_process_group(pid);
+        self.cleanup_after_stop()?;
+        Ok(Some(code))
     }
 
     fn destroy(&mut self) -> Result<(), SandboxError> {
+        if let Some(mut child) = self.child.take() {
+            let pid = child.id() as i32;
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            self.exit_code = Some(wait_for_killed_child(&mut child, pid));
+            kill_process_group(pid);
+        }
+        self.cleanup_after_stop()?;
+        tracing::info!("sandbox {} destroyed via MXC Linux backend", self.id);
         Ok(())
     }
 }
 
 impl MxcExecutionSpec {
     pub fn from_sandbox_config(config: &SandboxConfig) -> Result<Self, MxcTranslationError> {
-        let spec = translate_sandbox_config(config)?;
-        reject_current_bubblewrap_filesystem_substrate(&spec.filesystem)?;
-        Ok(spec)
+        let translated = translate_sandbox_config_with_metadata(config)?;
+        validate_current_bubblewrap_filesystem_substrate(
+            translated.root_read_substrate_acknowledged,
+        )?;
+        Ok(translated.spec)
     }
 }
 
+#[cfg(test)]
 fn translate_sandbox_config(
     config: &SandboxConfig,
 ) -> Result<MxcExecutionSpec, MxcTranslationError> {
+    Ok(translate_sandbox_config_with_metadata(config)?.spec)
+}
+
+struct MxcTranslatedConfig {
+    spec: MxcExecutionSpec,
+    root_read_substrate_acknowledged: bool,
+}
+
+struct MxcTranslatedFilesystem {
+    filesystem: MxcFilesystem,
+    root_read_substrate_acknowledged: bool,
+}
+
+fn translate_sandbox_config_with_metadata(
+    config: &SandboxConfig,
+) -> Result<MxcTranslatedConfig, MxcTranslationError> {
     let process = translate_process(config)?;
     let network = translate_network(&config.policy)?;
     let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
 
-    Ok(MxcExecutionSpec {
-        version: MXC_SCHEMA_VERSION.into(),
-        platform: MXC_LINUX_PLATFORM.into(),
-        containment: MXC_BUBBLEWRAP_CONTAINMENT.into(),
-        process,
-        filesystem,
-        network,
+    Ok(MxcTranslatedConfig {
+        spec: MxcExecutionSpec {
+            version: MXC_SCHEMA_VERSION.into(),
+            platform: MXC_LINUX_PLATFORM.into(),
+            containment: MXC_BUBBLEWRAP_CONTAINMENT.into(),
+            process,
+            filesystem: filesystem.filesystem,
+            network,
+        },
+        root_read_substrate_acknowledged: filesystem.root_read_substrate_acknowledged,
     })
 }
 
-fn reject_current_bubblewrap_filesystem_substrate(
-    _filesystem: &MxcFilesystem,
+fn validate_current_bubblewrap_filesystem_substrate(
+    root_read_substrate_acknowledged: bool,
 ) -> Result<(), MxcTranslationError> {
-    Err(MxcTranslationError::FilesystemDefaultDenyUnsupported)
+    if root_read_substrate_acknowledged {
+        Ok(())
+    } else {
+        Err(MxcTranslationError::FilesystemDefaultDenyUnsupported)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -388,8 +627,8 @@ fn translate_process(config: &SandboxConfig) -> Result<MxcProcess, MxcTranslatio
 fn translate_filesystem(
     policy: &FilesystemPolicy,
     workspace: &Path,
-) -> Result<MxcFilesystem, MxcTranslationError> {
-    let expanded = super::landlock::expand_and_validate_filesystem_policy(policy, workspace)
+) -> Result<MxcTranslatedFilesystem, MxcTranslationError> {
+    let expanded = super::landlock::expand_filesystem_policy(policy, workspace)
         .map_err(MxcTranslationError::Filesystem)?;
     let workspace = std::fs::canonicalize(workspace).map_err(|e| {
         MxcTranslationError::Filesystem(format!(
@@ -397,13 +636,22 @@ fn translate_filesystem(
             workspace.display()
         ))
     })?;
+    validate_mxc_filesystem_overlays(&expanded, &workspace)
+        .map_err(MxcTranslationError::Filesystem)?;
+    let root_read_substrate_acknowledged =
+        expanded_paths_grant_root_read(&expanded.read_only, &expanded.read_write);
     let mut readwrite_paths = represented_paths(policy, &expanded.read_write)?;
     push_unique(&mut readwrite_paths, path_to_string(&workspace)?);
+    let mut readonly_paths = represented_paths(policy, &expanded.read_only)?;
+    readonly_paths.retain(|path| Path::new(path) != Path::new("/"));
 
-    Ok(MxcFilesystem {
-        readwrite_paths,
-        readonly_paths: represented_paths(policy, &expanded.read_only)?,
-        denied_paths: represented_paths(policy, &expanded.deny)?,
+    Ok(MxcTranslatedFilesystem {
+        filesystem: MxcFilesystem {
+            readwrite_paths,
+            readonly_paths,
+            denied_paths: represented_paths(policy, &expanded.deny)?,
+        },
+        root_read_substrate_acknowledged,
     })
 }
 
@@ -451,6 +699,77 @@ fn push_unique(paths: &mut Vec<String>, path: String) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+fn validate_mxc_filesystem_overlays(
+    policy: &super::landlock::ExpandedFilesystemPolicy,
+    workspace: &Path,
+) -> Result<(), String> {
+    for read_only in &policy.read_only {
+        for read_write in &policy.read_write {
+            if read_only.path == read_write.path {
+                return Err(format!(
+                    "read-only path '{}' expanded to '{}' also appears as read-write path '{}' expanded to '{}'; this filesystem policy is ambiguous under MXC Bubblewrap overlays",
+                    read_only.original,
+                    read_only.path.display(),
+                    read_write.original,
+                    read_write.path.display()
+                ));
+            }
+
+            if read_only.path != Path::new("/")
+                && path_contains_or_equal(&read_only.path, &read_write.path)
+            {
+                return Err(format!(
+                    "read-only path '{}' expanded to '{}' contains read-write path '{}' expanded to '{}'; current MXC Bubblewrap overlay order would shadow the read-write grant",
+                    read_only.original,
+                    read_only.path.display(),
+                    read_write.original,
+                    read_write.path.display()
+                ));
+            }
+        }
+    }
+
+    for deny in &policy.deny {
+        if path_contains_or_equal(workspace, &deny.path)
+            || path_contains_or_equal(&deny.path, workspace)
+        {
+            return Err(format!(
+                "deny path '{}' expanded to '{}' conflicts with the sandbox workspace '{}'",
+                deny.original,
+                deny.path.display(),
+                workspace.display()
+            ));
+        }
+
+        for allowed in policy.read_only.iter().chain(policy.read_write.iter()) {
+            if path_contains_or_equal(&deny.path, &allowed.path) {
+                return Err(format!(
+                    "deny path '{}' expanded to '{}' contains allowed path '{}' expanded to '{}'; this filesystem policy is ambiguous under MXC Bubblewrap overlays",
+                    deny.original,
+                    deny.path.display(),
+                    allowed.original,
+                    allowed.path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expanded_paths_grant_root_read(
+    read_only: &[super::landlock::ExpandedPath],
+    read_write: &[super::landlock::ExpandedPath],
+) -> bool {
+    read_only
+        .iter()
+        .chain(read_write.iter())
+        .any(|path| path.path == Path::new("/"))
+}
+
+fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
+    child == parent || child.starts_with(parent)
 }
 
 fn translate_network(policy: &Policy) -> Result<MxcNetwork, MxcTranslationError> {
@@ -694,7 +1013,7 @@ fn unsafe_candidate(path: &Path, reason: impl Into<String>) -> MxcExecutorError 
     }
 }
 
-fn validate_spec_env_for_dry_run(spec: &MxcExecutionSpec) -> Result<(), MxcExecutorError> {
+fn validate_spec_env_for_launch(spec: &MxcExecutionSpec) -> Result<(), MxcExecutorError> {
     let mut parsed = Vec::with_capacity(spec.process.env.len());
     for entry in &spec.process.env {
         let Some((key, value)) = entry.split_once('=') else {
@@ -734,15 +1053,13 @@ fn wait_child_with_timeout(
 
         if started.elapsed() >= timeout {
             if process_group > 0 {
-                // SAFETY: kill(2) is called with a negative process-group id
-                // derived from the child pid after the child was placed into
-                // its own group by the pre_exec setpgid hook.
-                unsafe {
-                    libc::kill(-process_group, libc::SIGKILL);
-                }
+                kill_process_group_until_stopped(process_group, Duration::from_millis(500));
             }
             let _ = child.kill();
             let _ = child.wait();
+            if process_group > 0 {
+                kill_process_group_until_stopped(process_group, Duration::from_millis(500));
+            }
             return Err(MxcExecutorError::Timeout {
                 timeout_ms: timeout.as_millis(),
             });
@@ -767,6 +1084,114 @@ fn read_limited_output(file: &mut File) -> Result<String, MxcExecutorError> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn cleanup_tmpdir_on_setup_failure(workspace: &Path, tmpdir_active: bool) -> Option<String> {
+    if !tmpdir_active {
+        return None;
+    }
+    super::landlock::cleanup_tmpdir(workspace).err()
+}
+
+fn append_cleanup_failure(error: SandboxError, cleanup_error: Option<String>) -> SandboxError {
+    let Some(cleanup_error) = cleanup_error else {
+        return error;
+    };
+    match error {
+        SandboxError::IsolationFailed(message) => {
+            SandboxError::IsolationFailed(format!("{message}; cleanup failed: {cleanup_error}"))
+        }
+        SandboxError::SpawnFailed(message) => {
+            SandboxError::SpawnFailed(format!("{message}; cleanup failed: {cleanup_error}"))
+        }
+        other => other,
+    }
+}
+
+async fn wait_runtime_child_with_timeout(
+    mut child: Child,
+    timeout_sec: Option<u64>,
+) -> Result<ExitStatus, io::Error> {
+    let pid = child.id() as i32;
+    let mut wait_task = tokio::task::spawn_blocking(move || child.wait());
+
+    let Some(timeout_sec) = timeout_sec else {
+        return join_child_wait(wait_task.await);
+    };
+
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_sec));
+    tokio::pin!(timeout);
+    tokio::select! {
+        result = &mut wait_task => join_child_wait(result),
+        _ = &mut timeout => {
+            tracing::warn!("MXC sandbox child pid={pid} exceeded timeout of {timeout_sec}s");
+            kill_process_group_until_stopped(pid, Duration::from_millis(500));
+            let reap_grace = Duration::from_secs(POST_TIMEOUT_REAP_GRACE_SEC);
+            match tokio::time::timeout(reap_grace, &mut wait_task).await {
+                Ok(result) => {
+                    kill_process_group_until_stopped(pid, Duration::from_millis(500));
+                    join_child_wait(result)
+                }
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "MXC child pid={pid} did not exit within {POST_TIMEOUT_REAP_GRACE_SEC}s after SIGKILL"
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+fn join_child_wait(
+    result: Result<Result<ExitStatus, io::Error>, tokio::task::JoinError>,
+) -> Result<ExitStatus, io::Error> {
+    result.map_err(|err| io::Error::other(format!("wait task: {err}")))?
+}
+
+fn wait_for_killed_child(child: &mut Child, pid: i32) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(POST_TIMEOUT_REAP_GRACE_SEC);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(-1),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "MXC sandbox child pid={pid} did not exit within {POST_TIMEOUT_REAP_GRACE_SEC}s after destroy SIGKILL"
+                );
+                return -1;
+            }
+            Err(err) => {
+                tracing::warn!("MXC sandbox child pid={pid}: wait after destroy failed: {err}");
+                return -1;
+            }
+        }
+    }
+}
+
+fn kill_process_group(pid: i32) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        while libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
+    }
+}
+
+fn kill_process_group_until_stopped(pid: i32, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    loop {
+        kill_process_group(pid);
+        if !process_group_exists(pid) || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn process_group_exists(pid: i32) -> bool {
+    let ret = unsafe { libc::kill(-pid, 0) };
+    ret == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,6 +1201,7 @@ mod tests {
     };
     use axis_core::types::SandboxId;
     use std::ffi::OsString;
+    use std::net::{Ipv4Addr, TcpListener};
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -1048,6 +1474,92 @@ mod tests {
             spec.filesystem.readwrite_paths,
             vec![path_string(workspace.path())]
         );
+    }
+
+    #[test]
+    fn full_spec_allows_explicit_root_read_grant_for_mxc_bubblewrap() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let denied = root.path().join("outside-denied");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&denied).unwrap();
+        let mut policy = policy(NetworkMode::Block);
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec!["/".into()],
+            read_write: vec!["{workspace}".into()],
+            deny: vec![denied.to_string_lossy().into_owned()],
+            compatibility: Compatibility::HardRequirement,
+        };
+
+        let spec =
+            MxcExecutionSpec::from_sandbox_config(&config(policy, workspace.clone())).unwrap();
+
+        assert!(
+            !spec
+                .filesystem
+                .readonly_paths
+                .iter()
+                .any(|path| path == "/"),
+            "root read acknowledgement must not become a late MXC readonly bind"
+        );
+        assert!(
+            spec.filesystem
+                .readwrite_paths
+                .iter()
+                .any(|path| path == &path_string(&workspace))
+        );
+        assert_eq!(spec.filesystem.denied_paths, vec![path_string(&denied)]);
+    }
+
+    #[test]
+    fn readonly_parent_containing_readwrite_child_fails_closed_for_mxc_bubblewrap_order() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let readonly_parent = root.path().join("readonly-parent");
+        let readwrite_child = readonly_parent.join("readwrite-child");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&readonly_parent).unwrap();
+        std::fs::create_dir(&readwrite_child).unwrap();
+        let mut policy = policy(NetworkMode::Block);
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec!["/".into(), readonly_parent.to_string_lossy().into_owned()],
+            read_write: vec![
+                "{workspace}".into(),
+                readwrite_child.to_string_lossy().into_owned(),
+            ],
+            compatibility: Compatibility::HardRequirement,
+            ..FilesystemPolicy::default()
+        };
+
+        let err = MxcExecutionSpec::from_sandbox_config(&config(policy, workspace)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("would shadow the read-write grant")
+        );
+    }
+
+    #[test]
+    fn deny_path_containing_allowed_path_fails_closed_for_mxc_bubblewrap() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let denied = root.path().join("denied-parent");
+        let allowed = denied.join("allowed-child");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
+        let mut policy = policy(NetworkMode::Allow);
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec!["/".into(), allowed.to_string_lossy().into_owned()],
+            read_write: vec!["{workspace}".into()],
+            deny: vec![denied.to_string_lossy().into_owned()],
+            compatibility: Compatibility::HardRequirement,
+        };
+
+        let err = MxcExecutionSpec::from_sandbox_config(&config(policy, workspace)).unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Filesystem(_)));
+        assert!(err.to_string().contains("contains allowed path"));
     }
 
     #[test]
@@ -1448,6 +1960,333 @@ mod tests {
         assert!(!err.to_string().contains("super-secret"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_captures_output_exit_code_and_removes_private_config() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let config_path_record = root.path().join("config-path");
+        let config_copy = root.path().join("config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 printf '%s\\n' \"$config\" > {}\n\
+                 cat \"$config\" > {}\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 if IFS= read -r _line; then\n\
+                   echo stdin was not closed >&2\n\
+                   exit 8\n\
+                 fi\n\
+                 echo mxc-stdout\n\
+                 echo mxc-stderr >&2\n\
+                 exit 7\n",
+                shell_quote_path(&config_path_record),
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.capture_output = true;
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 7);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("stdout.log")).unwrap(),
+            "mxc-stdout\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("stderr.log")).unwrap(),
+            "mxc-stderr\n"
+        );
+        let config_path = fs::read_to_string(config_path_record).unwrap();
+        assert!(
+            !Path::new(config_path.trim()).exists(),
+            "private MXC config file should be removed after wait"
+        );
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        assert!(!config_json.contains("ANTHROPIC_API_KEY"));
+        assert!(!config_json.contains("proxy-with-creds"));
+        assert!(!config_json.contains("secret"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_non_capture_mode_does_not_create_daemon_logs() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let marker = root.path().join("ran");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 echo ran > {}\n",
+                MXC_DRY_RUN_SUCCESS,
+                shell_quote_path(&marker)
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.capture_output = false;
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert!(marker.exists());
+        assert!(!workspace.path().join("stdout.log").exists());
+        assert!(!workspace.path().join("stderr.log").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_timeout_kills_executor_process_group_and_cleans_tmpdir() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let descendant_pid = root.path().join("descendant.pid");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 sleep 30 &\n\
+                 echo $! > {}\n\
+                 wait\n",
+                MXC_DRY_RUN_SUCCESS,
+                shell_quote_path(&descendant_pid)
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Block);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let mut config = config(policy, workspace.path().into());
+        config.timeout_sec = Some(1);
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        assert!(tmpdir.exists(), "MXC setup should create AXIS tmpdir");
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, -1);
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_process_stopped(pid);
+        assert!(!tmpdir.exists(), "MXC wait should clean AXIS tmpdir");
+    }
+
+    #[test]
+    fn runtime_start_failure_cleans_tmpdir() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\necho '{}'\n", MXC_DRY_RUN_SUCCESS),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Allow);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let config = config(policy, workspace.path().into());
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        assert!(tmpdir.exists(), "MXC setup should create AXIS tmpdir");
+        std::fs::remove_file(&executable).unwrap();
+
+        let err = SandboxImpl::start(&mut sandbox).unwrap_err();
+
+        assert!(matches!(err, SandboxError::SpawnFailed(_)));
+        assert!(!tmpdir.exists(), "start failure should clean AXIS tmpdir");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_real_mxc_allow_and_block_runtime_parity() {
+        if MxcExecutor::resolve().is_err() {
+            eprintln!("safe lxc-exec unavailable (test skipped)");
+            return;
+        }
+        if find_on_path("bwrap").is_none() {
+            eprintln!("bubblewrap unavailable for MXC backend (test skipped)");
+            return;
+        }
+        if fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            .map(|value| value.trim() != "1")
+            .unwrap_or(true)
+        {
+            eprintln!("unprivileged user namespaces unavailable (test skipped)");
+            return;
+        }
+
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+        let Ok(baseline) = Command::new(&python).arg("-c").arg("pass").status() else {
+            eprintln!("python3 baseline failed to start (test skipped)");
+            return;
+        };
+        if !baseline.success() {
+            eprintln!("python3 baseline failed (test skipped)");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("ro");
+        let rw_dir = root.path().join("rw");
+        let denied_dir = root.path().join("denied");
+        let allow_workspace = root.path().join("allow-workspace");
+        let block_workspace = root.path().join("block-workspace");
+        for dir in [
+            &ro_dir,
+            &rw_dir,
+            &denied_dir,
+            &allow_workspace,
+            &block_workspace,
+        ] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let ro_file = ro_dir.join("ro.txt");
+        let denied_file = denied_dir.join("secret.txt");
+        std::fs::write(&ro_file, "read-only").unwrap();
+        std::fs::write(&denied_file, "denied").unwrap();
+
+        let allow_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        allow_listener.set_nonblocking(true).unwrap();
+        let allow_port = allow_listener.local_addr().unwrap().port();
+        let mut allow_config = config(
+            mxc_filesystem_policy(NetworkMode::Allow, &rw_dir, &denied_dir),
+            allow_workspace.clone(),
+        );
+        allow_config.command = python.to_string_lossy().into_owned();
+        allow_config.args = vec!["-c".into(), real_mxc_allow_probe().into()];
+        allow_config.working_dir = Some(allow_workspace.clone());
+        allow_config.capture_output = true;
+        allow_config.timeout_sec = Some(10);
+        allow_config.env = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CUSTOM".into(), "kept".into()),
+            ("RO_FILE".into(), ro_file.to_string_lossy().into_owned()),
+            ("RW_DIR".into(), rw_dir.to_string_lossy().into_owned()),
+            (
+                "DENIED_FILE".into(),
+                denied_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "DENIED_DIR".into(),
+                denied_dir.to_string_lossy().into_owned(),
+            ),
+            ("ALLOW_PORT".into(), allow_port.to_string()),
+            ("ANTHROPIC_API_KEY".into(), "secret".into()),
+            ("HTTPS_PROXY".into(), "http://proxy-with-creds".into()),
+        ];
+
+        let mut allow_sandbox = MxcLinuxSandbox::new(&allow_config).unwrap();
+        SandboxImpl::start(&mut allow_sandbox).unwrap();
+        let allow_code = SandboxImpl::wait(&mut allow_sandbox).await.unwrap();
+        let allow_stderr =
+            fs::read_to_string(allow_workspace.join("stderr.log")).unwrap_or_default();
+        assert_eq!(
+            allow_code, 0,
+            "MXC allow-mode probe failed:\n{allow_stderr}"
+        );
+        assert!(
+            listener_observed_probe(&allow_listener),
+            "MXC allow-mode sandbox did not reach host loopback listener"
+        );
+        assert_eq!(
+            fs::read_to_string(allow_workspace.join("stdout.log")).unwrap(),
+            "allow-stdout\n"
+        );
+        assert_eq!(fs::read_to_string(rw_dir.join("rw.txt")).unwrap(), "rw");
+        assert_eq!(
+            fs::read_to_string(allow_workspace.join("workspace.txt")).unwrap(),
+            "workspace"
+        );
+        allow_sandbox.destroy().unwrap();
+
+        let block_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let block_port = block_listener.local_addr().unwrap().port();
+        let mut block_config = config(
+            mxc_filesystem_policy(NetworkMode::Block, &rw_dir, &denied_dir),
+            block_workspace.clone(),
+        );
+        block_config.command = python.to_string_lossy().into_owned();
+        block_config.args = vec!["-c".into(), real_mxc_block_probe().into()];
+        block_config.working_dir = Some(block_workspace.clone());
+        block_config.capture_output = true;
+        block_config.timeout_sec = Some(10);
+        block_config.env = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("BLOCK_PORT".into(), block_port.to_string()),
+            ("HTTP_PROXY".into(), "http://proxy-with-creds".into()),
+        ];
+
+        let mut block_sandbox = MxcLinuxSandbox::new(&block_config).unwrap();
+        SandboxImpl::start(&mut block_sandbox).unwrap();
+        let block_code = SandboxImpl::wait(&mut block_sandbox).await.unwrap();
+        let block_stderr =
+            fs::read_to_string(block_workspace.join("stderr.log")).unwrap_or_default();
+        assert_eq!(
+            block_code, 0,
+            "MXC block-mode probe failed:\n{block_stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(block_workspace.join("stdout.log")).unwrap(),
+            "block-stdout\n"
+        );
+        assert!(block_workspace.join("block-ok").exists());
+        block_sandbox.destroy().unwrap();
+    }
+
     fn endpoint_policy() -> EndpointPolicy {
         EndpointPolicy {
             name: "github".into(),
@@ -1460,6 +2299,34 @@ mod tests {
             }],
             binaries: Vec::new(),
         }
+    }
+
+    fn mxc_representable_policy(network_mode: NetworkMode) -> Policy {
+        let mut policy = policy(network_mode);
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec!["/".into()],
+            read_write: vec!["{workspace}".into()],
+            compatibility: Compatibility::HardRequirement,
+            ..FilesystemPolicy::default()
+        };
+        policy
+    }
+
+    fn mxc_filesystem_policy(
+        network_mode: NetworkMode,
+        rw_dir: &Path,
+        denied_dir: &Path,
+    ) -> Policy {
+        let mut policy = mxc_representable_policy(network_mode);
+        policy
+            .filesystem
+            .read_write
+            .push(rw_dir.to_string_lossy().into_owned());
+        policy
+            .filesystem
+            .deny
+            .push(denied_dir.to_string_lossy().into_owned());
+        policy
     }
 
     fn path_string(path: &Path) -> String {
@@ -1490,6 +2357,114 @@ mod tests {
 
     fn shell_quote_path(path: &Path) -> String {
         shell_quote_arg(&path.to_string_lossy())
+    }
+
+    fn find_on_path(binary: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(binary);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn listener_observed_probe(listener: &TcpListener) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((_stream, _addr)) => return true,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("listener accept failed: {err}"),
+            }
+        }
+    }
+
+    fn real_mxc_allow_probe() -> &'static str {
+        r#"
+import os
+import pathlib
+import socket
+import sys
+
+assert os.environ["CUSTOM"] == "kept"
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    if key in os.environ:
+        print(f"unexpected proxy env: {key}", file=sys.stderr)
+        sys.exit(10)
+assert sys.stdin.read() == ""
+
+ro_file = pathlib.Path(os.environ["RO_FILE"])
+rw_dir = pathlib.Path(os.environ["RW_DIR"])
+denied_file = pathlib.Path(os.environ["DENIED_FILE"])
+denied_dir = pathlib.Path(os.environ["DENIED_DIR"])
+assert ro_file.read_text() == "read-only"
+try:
+    ro_file.write_text("mutated")
+except OSError:
+    pass
+else:
+    print("read-only file was writable", file=sys.stderr)
+    sys.exit(11)
+rw_dir.joinpath("rw.txt").write_text("rw")
+pathlib.Path("workspace.txt").write_text("workspace")
+try:
+    denied_file.read_text()
+except OSError:
+    pass
+else:
+    print("denied file was readable", file=sys.stderr)
+    sys.exit(12)
+try:
+    denied_dir.joinpath("new.txt").write_text("denied-write")
+except OSError:
+    pass
+else:
+    print("denied directory was writable", file=sys.stderr)
+    sys.exit(13)
+
+sock = socket.create_connection(("127.0.0.1", int(os.environ["ALLOW_PORT"])), 3)
+sock.sendall(b"allow-probe")
+sock.close()
+print("allow-stdout")
+"#
+    }
+
+    fn real_mxc_block_probe() -> &'static str {
+        r#"
+import os
+import pathlib
+import socket
+import sys
+
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
+    if key in os.environ:
+        print(f"unexpected proxy env: {key}", file=sys.stderr)
+        sys.exit(20)
+
+port = int(os.environ["BLOCK_PORT"])
+for address in (("127.0.0.1", port), ("::1", port)):
+    try:
+        sock = socket.create_connection(address, 1)
+    except OSError:
+        pass
+    else:
+        sock.close()
+        print(f"network connection unexpectedly succeeded: {address}", file=sys.stderr)
+        sys.exit(21)
+
+left, right = socket.socketpair()
+left.close()
+right.close()
+pathlib.Path("block-ok").write_text("ok")
+print("block-stdout")
+"#
     }
 
     fn with_parent_secret_env<T>(f: impl FnOnce() -> T) -> T {
