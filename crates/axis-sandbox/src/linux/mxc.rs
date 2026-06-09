@@ -11,12 +11,24 @@
 use crate::sandbox::SandboxConfig;
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
 use serde::Serialize;
-use std::path::Path;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MXC_SCHEMA_VERSION: &str = "0.6.0-alpha";
 const MXC_LINUX_PLATFORM: &str = "linux";
 const MXC_BUBBLEWRAP_CONTAINMENT: &str = "bubblewrap";
+const MXC_EXECUTOR_NAME: &str = "lxc-exec";
+const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
+const MXC_DRY_RUN_SUCCESS: &str = "Dry run completed. Result: validation passed";
+const MAX_DRY_RUN_OUTPUT_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MxcTranslationError {
@@ -47,6 +59,39 @@ pub enum MxcTranslationError {
     TimeoutOverflow { seconds: u64 },
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MxcExecutorError {
+    #[error("no safe MXC executor found in stable install locations or PATH")]
+    Unavailable,
+
+    #[error("unsafe MXC executor candidate '{}': {reason}", path.display())]
+    UnsafeCandidate { path: PathBuf, reason: String },
+
+    #[error("MXC dry-run config contains environment entry filtered by AXIS sandbox policy: {key}")]
+    FilteredEnv { key: String },
+
+    #[error("MXC dry-run config contains malformed environment entry")]
+    MalformedEnv,
+
+    #[error("failed to serialize MXC dry-run config: {0}")]
+    Serialize(String),
+
+    #[error("failed to prepare MXC dry-run config: {0}")]
+    ConfigIo(String),
+
+    #[error("failed to spawn MXC executor: {0}")]
+    Spawn(String),
+
+    #[error("MXC dry-run timed out after {timeout_ms}ms")]
+    Timeout { timeout_ms: u128 },
+
+    #[error("MXC dry-run failed with exit code {code:?}")]
+    DryRunFailed { code: Option<i32> },
+
+    #[error("MXC dry-run exited successfully without reporting validation success")]
+    MalformedDryRunOutput,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MxcExecutionSpec {
     pub version: String,
@@ -55,6 +100,154 @@ pub struct MxcExecutionSpec {
     pub process: MxcProcess,
     pub filesystem: MxcFilesystem,
     pub network: MxcNetwork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcExecutor {
+    path: PathBuf,
+}
+
+impl MxcExecutor {
+    pub fn resolve() -> Result<Self, MxcExecutorError> {
+        Self::resolve_from_candidates(production_executor_candidates())
+    }
+
+    pub fn resolve_from_candidates<I, P>(candidates: I) -> Result<Self, MxcExecutorError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        for candidate in candidates {
+            if let Ok(executor) = Self::from_path(candidate) {
+                return Ok(executor);
+            }
+        }
+
+        Err(MxcExecutorError::Unavailable)
+    }
+
+    pub fn from_path<P>(path: P) -> Result<Self, MxcExecutorError>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        validate_executor_path(&path, ExecutorPathMode::Production)?;
+        Ok(Self { path })
+    }
+
+    #[cfg(test)]
+    fn from_injected_path<P>(path: P) -> Result<Self, MxcExecutorError>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        validate_executor_path(&path, ExecutorPathMode::TestInjected)?;
+        Ok(Self { path })
+    }
+
+    #[cfg(test)]
+    fn resolve_from_injected_candidates<I, P>(candidates: I) -> Result<Self, MxcExecutorError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        for candidate in candidates {
+            if let Ok(executor) = Self::from_injected_path(candidate) {
+                return Ok(executor);
+            }
+        }
+
+        Err(MxcExecutorError::Unavailable)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn dry_run(
+        &self,
+        spec: &MxcExecutionSpec,
+        timeout: Duration,
+    ) -> Result<MxcDryRunResult, MxcExecutorError> {
+        validate_spec_env_for_dry_run(spec)?;
+
+        let json =
+            serde_json::to_vec(spec).map_err(|err| MxcExecutorError::Serialize(err.to_string()))?;
+        let mut config = tempfile::Builder::new()
+            .prefix("axis-mxc-")
+            .suffix(".json")
+            .tempfile()
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        config
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        config
+            .write_all(&json)
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        config
+            .flush()
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+
+        let mut stdout_file =
+            tempfile::tempfile().map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        let mut stderr_file =
+            tempfile::tempfile().map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        let stdout = stdout_file
+            .try_clone()
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+        let stderr = stderr_file
+            .try_clone()
+            .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+
+        let mut command = Command::new(&self.path);
+        command
+            .arg("--experimental")
+            .arg("--dry-run")
+            .arg("--config")
+            .arg(config.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        // SAFETY: this pre_exec hook only calls async-signal-safe setpgid(2)
+        // and returns the OS error directly when it fails.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+
+        let child = command
+            .spawn()
+            .map_err(|err| MxcExecutorError::Spawn(err.to_string()))?;
+        let status = wait_child_with_timeout(child, timeout)?;
+        let stdout = read_limited_output(&mut stdout_file)?;
+        let stderr = read_limited_output(&mut stderr_file)?;
+
+        if !status.success() {
+            return Err(MxcExecutorError::DryRunFailed {
+                code: status.code(),
+            });
+        }
+        if !stdout.contains(MXC_DRY_RUN_SUCCESS) {
+            return Err(MxcExecutorError::MalformedDryRunOutput);
+        }
+
+        Ok(MxcDryRunResult { stdout, stderr })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcDryRunResult {
+    pub stdout: String,
+    pub stderr: String,
 }
 
 impl MxcExecutionSpec {
@@ -318,6 +511,210 @@ fn path_to_string(path: &Path) -> Result<String, MxcTranslationError> {
         .ok_or_else(|| MxcTranslationError::NonUtf8Path(path.display().to_string()))
 }
 
+fn production_executor_candidates() -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for dir in MXC_EXECUTOR_DIRS {
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            Path::new(dir).join(MXC_EXECUTOR_NAME),
+        );
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() || !dir.is_absolute() {
+                continue;
+            }
+            push_candidate(&mut candidates, &mut seen, dir.join(MXC_EXECUTOR_NAME));
+        }
+    }
+
+    candidates
+}
+
+fn push_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, candidate: PathBuf) {
+    if seen.insert(candidate.clone()) {
+        candidates.push(candidate);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorPathMode {
+    Production,
+    #[allow(dead_code)]
+    TestInjected,
+}
+
+fn validate_executor_path(
+    path: &Path,
+    validation_mode: ExecutorPathMode,
+) -> Result<(), MxcExecutorError> {
+    if !path.is_absolute() {
+        return Err(unsafe_candidate(path, "path must be absolute"));
+    }
+
+    // SAFETY: geteuid(2) has no preconditions and only reads process state.
+    let trusted_uid = unsafe { libc::geteuid() };
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|err| {
+            if current == path && err.kind() == std::io::ErrorKind::NotFound {
+                unsafe_candidate(path, "candidate does not exist")
+            } else {
+                unsafe_candidate(
+                    path,
+                    format!("could not inspect '{}': {err}", current.display()),
+                )
+            }
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            return Err(unsafe_candidate(
+                path,
+                format!("path component '{}' is a symlink", current.display()),
+            ));
+        }
+        let mode_bits = metadata.permissions().mode();
+        let uid = metadata.uid();
+        let injected_sticky_ancestor = current != path
+            && metadata.is_dir()
+            && allows_sticky_writable_ancestor(mode_bits, validation_mode);
+        if current != Path::new("/") && uid != 0 && uid != trusted_uid && !injected_sticky_ancestor
+        {
+            return Err(unsafe_candidate(
+                path,
+                format!(
+                    "path component '{}' is not owned by root or the current user",
+                    current.display()
+                ),
+            ));
+        }
+
+        if current == path {
+            if !metadata.is_file() {
+                return Err(unsafe_candidate(path, "candidate is not a regular file"));
+            }
+            if mode_bits & 0o111 == 0 {
+                return Err(unsafe_candidate(path, "candidate is not executable"));
+            }
+            if mode_bits & 0o022 != 0 {
+                return Err(unsafe_candidate(
+                    path,
+                    format!(
+                        "path component '{}' is group- or world-writable",
+                        current.display()
+                    ),
+                ));
+            }
+        } else if !metadata.is_dir() {
+            return Err(unsafe_candidate(
+                path,
+                format!("path component '{}' is not a directory", current.display()),
+            ));
+        } else if mode_bits & 0o022 != 0
+            && !allows_sticky_writable_ancestor(mode_bits, validation_mode)
+        {
+            return Err(unsafe_candidate(
+                path,
+                format!(
+                    "path component '{}' is group- or world-writable",
+                    current.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn allows_sticky_writable_ancestor(mode_bits: u32, validation_mode: ExecutorPathMode) -> bool {
+    matches!(validation_mode, ExecutorPathMode::TestInjected) && mode_bits & 0o1000 != 0
+}
+
+fn unsafe_candidate(path: &Path, reason: impl Into<String>) -> MxcExecutorError {
+    MxcExecutorError::UnsafeCandidate {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+fn validate_spec_env_for_dry_run(spec: &MxcExecutionSpec) -> Result<(), MxcExecutorError> {
+    let mut parsed = Vec::with_capacity(spec.process.env.len());
+    for entry in &spec.process.env {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(MxcExecutorError::MalformedEnv);
+        };
+        parsed.push((key.to_string(), value.to_string()));
+    }
+
+    let original = parsed.clone();
+    axis_core::sandbox_env::retain_linux_sandbox_env(&mut parsed);
+    if parsed == original {
+        return Ok(());
+    }
+
+    let filtered_key = original
+        .iter()
+        .find(|candidate| !parsed.iter().any(|retained| retained.0 == candidate.0))
+        .map(|(key, _)| key.clone())
+        .unwrap_or_else(|| "<unknown>".into());
+    Err(MxcExecutorError::FilteredEnv { key: filtered_key })
+}
+
+fn wait_child_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<ExitStatus, MxcExecutorError> {
+    let started = Instant::now();
+    let process_group = child.id() as i32;
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| MxcExecutorError::Spawn(err.to_string()))?
+        {
+            return Ok(status);
+        }
+
+        if started.elapsed() >= timeout {
+            if process_group > 0 {
+                // SAFETY: kill(2) is called with a negative process-group id
+                // derived from the child pid after the child was placed into
+                // its own group by the pre_exec setpgid hook.
+                unsafe {
+                    libc::kill(-process_group, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MxcExecutorError::Timeout {
+                timeout_ms: timeout.as_millis(),
+            });
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_limited_output(file: &mut File) -> Result<String, MxcExecutorError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_DRY_RUN_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
+
+    if bytes.len() > MAX_DRY_RUN_OUTPUT_BYTES as usize {
+        bytes.truncate(MAX_DRY_RUN_OUTPUT_BYTES as usize);
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +726,7 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
 
     fn policy(network_mode: NetworkMode) -> Policy {
         Policy {
@@ -737,6 +1135,267 @@ mod tests {
         assert!(json["filesystem"]["deniedPaths"].is_array());
     }
 
+    #[test]
+    fn executor_from_path_accepts_safe_executable() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o700);
+
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+
+        assert_eq!(executor.path(), executable);
+    }
+
+    #[test]
+    fn executor_from_path_rejects_unsafe_candidates() {
+        let root = secure_tempdir();
+
+        let missing = root.path().join("missing");
+        assert_unsafe_candidate(&missing, "does not exist");
+
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert_unsafe_candidate(&directory, "regular file");
+
+        let non_executable = root.path().join("non-executable");
+        write_executable(&non_executable, "#!/bin/sh\nexit 0\n", 0o600);
+        assert_unsafe_candidate(&non_executable, "not executable");
+
+        let group_writable = root.path().join("group-writable");
+        write_executable(&group_writable, "#!/bin/sh\nexit 0\n", 0o720);
+        assert_unsafe_candidate(&group_writable, "group- or world-writable");
+
+        let world_writable = root.path().join("world-writable");
+        write_executable(&world_writable, "#!/bin/sh\nexit 0\n", 0o702);
+        assert_unsafe_candidate(&world_writable, "group- or world-writable");
+    }
+
+    #[test]
+    fn executor_from_path_rejects_writable_ancestor() {
+        let root = secure_tempdir();
+        let writable_dir = root.path().join("writable");
+        fs::create_dir(&writable_dir).unwrap();
+        fs::set_permissions(&writable_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let executable = writable_dir.join("lxc-exec");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o700);
+
+        assert_unsafe_candidate(&executable, "group- or world-writable");
+    }
+
+    #[test]
+    fn executor_resolver_uses_first_safe_candidate_and_reports_unavailable() {
+        let root = secure_tempdir();
+        let unsafe_candidate = root.path().join("unsafe-lxc-exec");
+        write_executable(&unsafe_candidate, "#!/bin/sh\nexit 0\n", 0o777);
+        let safe_candidate = root.path().join("safe-lxc-exec");
+        write_executable(&safe_candidate, "#!/bin/sh\nexit 0\n", 0o700);
+
+        let executor = MxcExecutor::resolve_from_injected_candidates([
+            unsafe_candidate,
+            safe_candidate.clone(),
+        ])
+        .unwrap();
+
+        assert_eq!(executor.path(), safe_candidate);
+        assert_eq!(
+            MxcExecutor::resolve_from_candidates([root.path().join("missing")]).unwrap_err(),
+            MxcExecutorError::Unavailable
+        );
+    }
+
+    #[test]
+    fn production_resolver_rejects_sticky_tmp_candidates() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o700);
+
+        let err = MxcExecutor::resolve_from_candidates([executable]).unwrap_err();
+
+        assert_eq!(err, MxcExecutorError::Unavailable);
+    }
+
+    #[test]
+    fn dry_run_success_uses_private_config_path_without_secret_leakage() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let argv_path = root.path().join("argv");
+        let config_copy = root.path().join("config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 printf '%s\\n' \"$@\" > {}\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 cat \"$config\" > {}\n\
+                 echo '{}'\n",
+                shell_quote_path(&argv_path),
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let spec =
+            translate_sandbox_config(&config(policy(NetworkMode::Block), workspace.path().into()))
+                .unwrap();
+
+        let result = executor
+            .dry_run(&spec, Duration::from_secs(1))
+            .expect("fake executor should report dry-run success");
+
+        let argv = fs::read_to_string(argv_path).unwrap();
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        assert!(argv.contains("--experimental"));
+        assert!(argv.contains("--dry-run"));
+        assert!(argv.contains("--config"));
+        for captured in [&argv, &config_json, &result.stdout, &result.stderr] {
+            assert!(!captured.contains("ANTHROPIC_API_KEY"));
+            assert!(!captured.contains("proxy-with-creds"));
+            assert!(!captured.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn dry_run_clears_inherited_parent_environment() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"${{ANTHROPIC_API_KEY+x}}\" = x ]; then\n\
+                   echo inherited-secret-leaked >&2\n\
+                   exit 9\n\
+                 fi\n\
+                 echo '{}'\n",
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let spec =
+            translate_sandbox_config(&config(policy(NetworkMode::Block), workspace.path().into()))
+                .unwrap();
+
+        let result = with_parent_secret_env(|| {
+            executor
+                .dry_run(&spec, Duration::from_secs(1))
+                .expect("dry-run should not inherit provider secrets")
+        });
+
+        assert!(!result.stderr.contains("inherited-secret-leaked"));
+    }
+
+    #[test]
+    fn dry_run_failure_reports_status_without_reflecting_output() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            "#!/bin/sh\necho super-secret-token\nexit 7\n",
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let spec =
+            translate_sandbox_config(&config(policy(NetworkMode::Block), workspace.path().into()))
+                .unwrap();
+
+        let err = executor.dry_run(&spec, Duration::from_secs(1)).unwrap_err();
+
+        assert_eq!(err, MxcExecutorError::DryRunFailed { code: Some(7) });
+        assert!(!err.to_string().contains("super-secret-token"));
+    }
+
+    #[test]
+    fn dry_run_malformed_success_output_is_rejected() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(&executable, "#!/bin/sh\necho unexpected\nexit 0\n", 0o700);
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let spec =
+            translate_sandbox_config(&config(policy(NetworkMode::Block), workspace.path().into()))
+                .unwrap();
+
+        let err = executor.dry_run(&spec, Duration::from_secs(1)).unwrap_err();
+
+        assert_eq!(err, MxcExecutorError::MalformedDryRunOutput);
+    }
+
+    #[test]
+    fn dry_run_timeout_kills_executor() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let descendant_pid = root.path().join("descendant.pid");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\nsleep 5 &\necho $! > {}\nwait\n",
+                shell_quote_path(&descendant_pid)
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let spec =
+            translate_sandbox_config(&config(policy(NetworkMode::Block), workspace.path().into()))
+                .unwrap();
+
+        let err = executor
+            .dry_run(&spec, Duration::from_millis(200))
+            .unwrap_err();
+
+        assert_eq!(err, MxcExecutorError::Timeout { timeout_ms: 200 });
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_process_stopped(pid);
+    }
+
+    #[test]
+    fn dry_run_rejects_manual_specs_with_filtered_or_malformed_env() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\necho '{}'\n", MXC_DRY_RUN_SUCCESS),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut spec =
+            translate_sandbox_config(&config(policy(NetworkMode::Block), workspace.path().into()))
+                .unwrap();
+
+        spec.process
+            .env
+            .push("ANTHROPIC_API_KEY=super-secret".into());
+        let err = executor.dry_run(&spec, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(
+            err,
+            MxcExecutorError::FilteredEnv {
+                key: "ANTHROPIC_API_KEY".into()
+            }
+        );
+
+        spec.process.env = vec!["ANTHROPIC_API_KEY-super-secret".into()];
+        let err = executor.dry_run(&spec, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err, MxcExecutorError::MalformedEnv);
+        assert!(!err.to_string().contains("super-secret"));
+    }
+
     fn endpoint_policy() -> EndpointPolicy {
         EndpointPolicy {
             name: "github".into(),
@@ -753,5 +1412,79 @@ mod tests {
 
     fn path_string(path: &Path) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    fn write_executable(path: &Path, script: &str, mode: u32) {
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn secure_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn assert_unsafe_candidate(path: &Path, expected_reason: &str) {
+        let err = MxcExecutor::from_injected_path(path).unwrap_err();
+        let MxcExecutorError::UnsafeCandidate { reason, .. } = err else {
+            panic!("expected unsafe candidate error, got {err:?}");
+        };
+        assert!(
+            reason.contains(expected_reason),
+            "expected reason containing '{expected_reason}', got '{reason}'"
+        );
+    }
+
+    fn shell_quote_path(path: &Path) -> String {
+        shell_quote_arg(&path.to_string_lossy())
+    }
+
+    fn with_parent_secret_env<T>(f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        struct EnvGuard(Option<OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: guarded by ENV_LOCK for the duration of the test.
+                unsafe {
+                    if let Some(value) = &self.0 {
+                        std::env::set_var("ANTHROPIC_API_KEY", value);
+                    } else {
+                        std::env::remove_var("ANTHROPIC_API_KEY");
+                    }
+                }
+            }
+        }
+
+        let previous = std::env::var_os("ANTHROPIC_API_KEY");
+        // SAFETY: this test serializes process-environment mutation with a
+        // module-local mutex and restores the variable before releasing it.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "inherited-secret");
+        }
+        let _env_guard = EnvGuard(previous);
+        f()
+    }
+
+    fn assert_process_stopped(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_running(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_is_running(pid), "process {pid} is still running");
+    }
+
+    fn process_is_running(pid: i32) -> bool {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some((_, rest)) = stat.rsplit_once(") ")
+            && let Some(state) = rest.split_whitespace().next()
+        {
+            return state != "Z";
+        }
+
+        // SAFETY: kill(pid, 0) performs existence/permission probing only and
+        // does not deliver a signal.
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 }
