@@ -650,7 +650,13 @@ fn recv_fd(socket_fd: i32) -> io::Result<i32> {
     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = control.len();
 
-    let ret = unsafe { libc::recvmsg(socket_fd, &mut msg as *mut libc::msghdr, 0) };
+    let ret = unsafe {
+        libc::recvmsg(
+            socket_fd,
+            &mut msg as *mut libc::msghdr,
+            libc::MSG_CMSG_CLOEXEC,
+        )
+    };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -660,16 +666,29 @@ fn recv_fd(socket_fd: i32) -> io::Result<i32> {
             "listener fd channel closed",
         ));
     }
+    if ret != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "listener fd message has unexpected payload length",
+        ));
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "listener fd control message was truncated",
+        ));
+    }
 
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr);
         if cmsg.is_null()
             || (*cmsg).cmsg_level != libc::SOL_SOCKET
             || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+            || (*cmsg).cmsg_len != libc::CMSG_LEN(size_of::<i32>() as libc::c_uint) as usize
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "listener fd message missing SCM_RIGHTS",
+                "listener fd message missing valid SCM_RIGHTS payload",
             ));
         }
         Ok(std::ptr::read(libc::CMSG_DATA(cmsg) as *const i32))
@@ -774,12 +793,37 @@ mod tests {
         close_fd(Some(read_fd));
 
         let received = pair.recv_listener_fd().unwrap();
+        assert!(
+            fd_cloexec(received),
+            "received listener fd should be close-on-exec"
+        );
         write_end.write_all(b"x").unwrap();
         let mut byte = [0u8; 1];
         let n = unsafe { libc::read(received, byte.as_mut_ptr() as *mut libc::c_void, byte.len()) };
         assert_eq!(n, 1);
         assert_eq!(byte, [b'x']);
         close_fd(Some(received));
+    }
+
+    #[test]
+    fn listener_fd_pair_rejects_message_without_fd() {
+        let mut pair = SeccompListenerPair::new().unwrap();
+        let child_fd = pair.child_fd().unwrap();
+        let byte = [b'x'];
+        let sent = unsafe {
+            libc::send(
+                child_fd,
+                byte.as_ptr() as *const libc::c_void,
+                byte.len(),
+                0,
+            )
+        };
+        assert_eq!(sent, 1);
+
+        let err = pair.recv_listener_fd().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("SCM_RIGHTS"));
     }
 
     #[test]
@@ -827,7 +871,9 @@ mod tests {
             return;
         }
 
-        let Some(python) = find_on_path("python3") else {
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
             panic!("AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 requires python3 on PATH");
         };
         let Some(shell) = find_on_path("sh") else {
@@ -921,11 +967,7 @@ os.execv(shell, [shell, "-c", "sleep 1"])
             record.executable_path, canonical_shell,
             "connect-time attribution used post-connect exec identity"
         );
-        assert!(
-            record.executable_path.to_string_lossy().contains("python"),
-            "expected python connect identity, got {}",
-            record.executable_path.display()
-        );
+        assert_eq!(record.executable_path, python);
     }
 
     fn accept_with_deadline(
@@ -979,5 +1021,11 @@ os.execv(shell, [shell, "-c", "sleep 1"])
         let fd = unsafe { libc::socket(domain, socket_type | libc::SOCK_CLOEXEC, protocol) };
         assert!(fd >= 0, "socket failed: {}", io::Error::last_os_error());
         fd
+    }
+
+    fn fd_cloexec(fd: i32) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed: {}", io::Error::last_os_error());
+        flags & libc::FD_CLOEXEC != 0
     }
 }

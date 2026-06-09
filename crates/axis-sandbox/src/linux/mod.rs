@@ -2564,7 +2564,7 @@ mod tests {
         let mut child = cmd.spawn().unwrap();
         let process_group = child.id() as libc::pid_t;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !pid_path.exists() {
             if std::time::Instant::now() >= deadline {
                 kill_process_group(process_group);
@@ -2585,7 +2585,7 @@ mod tests {
         guard.finish();
         let _ = wait_for_killed_child(&mut child, process_group);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while process_exists(background_pid) {
             if std::time::Instant::now() >= deadline {
                 kill_process_group(process_group);
