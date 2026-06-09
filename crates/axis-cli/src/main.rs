@@ -774,7 +774,7 @@ async fn main() -> Result<()> {
 
                     let policy = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
                     let sandbox_id = axis_core::types::SandboxId::new();
-                    let workspace = tempfile::tempdir()?;
+                    let workspace = std::env::current_dir()?;
                     let connect_attribution =
                         if axis_core::connect_attribution::policy_requires_connect_attribution(
                             &policy,
@@ -835,8 +835,8 @@ async fn main() -> Result<()> {
                         policy,
                         command: cmd.to_string(),
                         args: args.to_vec(),
-                        working_dir: None,
-                        workspace_dir: workspace.path().to_path_buf(),
+                        working_dir: Some(workspace.clone()),
+                        workspace_dir: workspace,
                         env,
                         proxy_port,
                         proxy_addr,

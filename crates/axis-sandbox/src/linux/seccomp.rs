@@ -44,6 +44,7 @@ const SYS_SETPGID: u32 = 109;
 const SYS_SETSID: u32 = 112;
 const SYS_TKILL: u32 = 200;
 const SYS_UNSHARE: u32 = 272;
+const SYS_SET_ROBUST_LIST: u32 = 273;
 const SYS_EXECVEAT: u32 = 322;
 const SYS_CLONE3: u32 = 435;
 
@@ -182,6 +183,7 @@ const WHITELIST: &[(u32, &str)] = &[
     (269, "faccessat"),
     (270, "pselect6"),
     (271, "ppoll"),
+    (SYS_SET_ROBUST_LIST, "set_robust_list"),
     (280, "utimensat"),
     (281, "epoll_pwait"),
     (284, "eventfd"),
@@ -298,6 +300,12 @@ struct FlagDenyRule {
     reason: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyscallErrnoRule {
+    syscall_nr: u32,
+    errno: i32,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SocketDomainPolicy {
@@ -349,16 +357,19 @@ struct SeccompFilterSpec {
     allowed_syscalls: Vec<u32>,
     socket_domain_policy: SocketDomainPolicy,
     notify_connect: bool,
+    syscall_errno_rules: Vec<SyscallErrnoRule>,
     flag_deny_rules: Vec<FlagDenyRule>,
 }
 
 impl SeccompFilterSpec {
     fn from_policy(policy: &ProcessPolicy, options: SeccompOptions) -> Result<Self, String> {
         let mut allowed_syscalls: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
+        let mut blocked_syscalls = Vec::new();
 
         for name in &policy.blocked_syscalls {
             let nr = syscall_number(name)
                 .ok_or_else(|| format!("unknown syscall in blocked_syscalls: '{name}'"))?;
+            blocked_syscalls.push(nr);
             allowed_syscalls.retain(|&n| n != nr);
         }
 
@@ -372,6 +383,14 @@ impl SeccompFilterSpec {
             allowed_syscalls,
             socket_domain_policy: options.socket_domain_policy,
             notify_connect,
+            syscall_errno_rules: if blocked_syscalls.contains(&SYS_CLONE3) {
+                Vec::new()
+            } else {
+                vec![SyscallErrnoRule {
+                    syscall_nr: SYS_CLONE3,
+                    errno: libc::ENOSYS,
+                }]
+            },
             flag_deny_rules: vec![
                 FlagDenyRule {
                     syscall_nr: SYS_CLONE,
@@ -407,6 +426,12 @@ impl SeccompFilterSpec {
 
         if self.notify_connect && syscall_nr == SYS_CONNECT {
             return FilterDecision::UserNotify;
+        }
+
+        for rule in &self.syscall_errno_rules {
+            if rule.syscall_nr == syscall_nr {
+                return FilterDecision::Errno(rule.errno);
+            }
         }
 
         for rule in &self.flag_deny_rules {
@@ -445,6 +470,9 @@ impl SeccompFilterSpec {
         append_socket_domain_denies(&mut insns, &self.socket_domain_policy);
         for rule in &self.flag_deny_rules {
             append_flag_deny(&mut insns, *rule);
+        }
+        for rule in &self.syscall_errno_rules {
+            append_syscall_return(&mut insns, rule.syscall_nr, errno_return_for(rule.errno));
         }
         if self.notify_connect {
             append_syscall_return(&mut insns, SYS_CONNECT, user_notify_return());
@@ -537,10 +565,11 @@ fn append_flag_deny(insns: &mut Vec<BpfInsn>, rule: FlagDenyRule) {
 }
 
 fn errno_return() -> BpfInsn {
-    bpf_stmt(
-        BPF_RET | BPF_K,
-        SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0xFFFF),
-    )
+    errno_return_for(libc::EPERM)
+}
+
+fn errno_return_for(errno: i32) -> BpfInsn {
+    bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (errno as u32 & 0xFFFF))
 }
 
 fn user_notify_return() -> BpfInsn {
@@ -661,6 +690,10 @@ mod tests {
         assert!(nrs.contains(&231), "exit_group missing");
         assert!(nrs.contains(&9), "mmap missing");
         assert!(nrs.contains(&56), "clone missing");
+        assert!(
+            nrs.contains(&SYS_SET_ROBUST_LIST),
+            "set_robust_list missing"
+        );
     }
 
     #[test]
@@ -748,7 +781,6 @@ mod tests {
             "process_vm_readv",
             "process_vm_writev",
             "userfaultfd",
-            "clone3",
         ] {
             let nr = syscall_number(syscall).unwrap();
             assert_eq!(
@@ -757,6 +789,41 @@ mod tests {
                 "{syscall} should be denied"
             );
         }
+    }
+
+    #[test]
+    fn clone3_defaults_to_enosys_for_thread_runtime_fallback() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
+            FilterDecision::Errno(libc::ENOSYS)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
+            FilterDecision::Errno(libc::ENOSYS)
+        );
+        assert!(!spec.allowed_syscalls.contains(&SYS_CLONE3));
+    }
+
+    #[test]
+    fn policy_blocked_clone3_preserves_hard_eperm_denial() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["clone3".into()],
+            ..Default::default()
+        };
+        let spec = SeccompFilterSpec::from_policy(&policy, SeccompOptions::default()).unwrap();
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
     }
 
     #[test]
@@ -940,7 +1007,6 @@ mod tests {
             "process_vm_readv",
             "process_vm_writev",
             "userfaultfd",
-            "clone3",
         ] {
             let nr = syscall_number(syscall).unwrap();
             assert_eq!(
@@ -1134,6 +1200,19 @@ mod tests {
     }
 
     #[test]
+    fn runtime_clone3_returns_enosys_for_thread_runtime_fallback() {
+        assert_eq!(
+            run_seccomp_errno_probe(
+                &ProcessPolicy::default(),
+                SeccompOptions::default(),
+                probe_clone3_unavailable,
+                libc::ENOSYS,
+            ),
+            PROBE_ALLOWED
+        );
+    }
+
+    #[test]
     fn runtime_socket_domain_filter_denies_ip_sockets_and_preserves_unix() {
         let options = SeccompOptions::deny_network_socket_domains();
 
@@ -1189,6 +1268,35 @@ mod tests {
             .expect("python3 should exist after baseline check");
 
         assert!(status.success(), "python smoke failed: {status}");
+    }
+
+    #[test]
+    fn runtime_node_smoke_under_filter_when_available() {
+        let Some(node) = find_on_path("node") else {
+            eprintln!("node unavailable (test skipped)");
+            return;
+        };
+        let Ok(baseline) = Command::new(&node)
+            .arg("-e")
+            .arg("console.log('node-seccomp-baseline')")
+            .status()
+        else {
+            eprintln!("node baseline failed to start (test skipped)");
+            return;
+        };
+        if !baseline.success() {
+            eprintln!("node baseline failed (test skipped)");
+            return;
+        }
+
+        let status = run_with_seccomp(
+            &node,
+            &["-e", "console.log('node-seccomp-smoke')"],
+            &ProcessPolicy::default(),
+        )
+        .expect("node should exist after baseline check");
+
+        assert!(status.success(), "node smoke failed: {status}");
     }
 
     #[test]
@@ -1284,6 +1392,57 @@ mod tests {
         }
     }
 
+    fn run_seccomp_errno_probe(
+        policy: &ProcessPolicy,
+        options: SeccompOptions,
+        probe: unsafe fn() -> libc::c_long,
+        expected_errno: i32,
+    ) -> i32 {
+        let filter =
+            prepare_seccomp_with_options(policy, options).expect("test policy should prepare");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                    libc::_exit(PROBE_NO_NEW_PRIVS_FAILED);
+                }
+            }
+            if filter.apply_current_process().is_err() {
+                unsafe {
+                    libc::_exit(PROBE_SECCOMP_SETUP_FAILED);
+                }
+            }
+
+            let ret = unsafe { probe() };
+            if ret == -1 {
+                let code = if current_errno() == expected_errno {
+                    PROBE_ALLOWED
+                } else {
+                    PROBE_UNEXPECTED_ERRNO
+                };
+                unsafe {
+                    libc::_exit(code);
+                }
+            }
+
+            unsafe {
+                libc::_exit(PROBE_UNEXPECTED_ERRNO);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid failed for seccomp errno probe");
+
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            PROBE_SIGNALLED
+        }
+    }
+
     unsafe fn probe_execveat_empty_path() -> libc::c_long {
         unsafe {
             libc::syscall(
@@ -1293,6 +1452,16 @@ mod tests {
                 std::ptr::null::<*const libc::c_char>(),
                 std::ptr::null::<*const libc::c_char>(),
                 AT_EMPTY_PATH,
+            )
+        }
+    }
+
+    unsafe fn probe_clone3_unavailable() -> libc::c_long {
+        unsafe {
+            libc::syscall(
+                SYS_CLONE3 as libc::c_long,
+                std::ptr::null::<libc::c_void>(),
+                0,
             )
         }
     }

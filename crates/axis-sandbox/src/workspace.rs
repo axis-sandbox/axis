@@ -45,10 +45,7 @@ pub fn prepare_agent_workspace(
         .map_err(|_| "cannot determine HOME directory".to_string())?;
     let home = PathBuf::from(home);
 
-    // Create the contained agent state root.
     let agent_root = home.join(".axis").join("agents").join(policy_name);
-    std::fs::create_dir_all(&agent_root)
-        .map_err(|e| format!("cannot create {}: {e}", agent_root.display()))?;
 
     let mut symlinks = Vec::new();
 
@@ -83,17 +80,8 @@ pub fn prepare_agent_workspace(
             Err(_) => continue,
         };
 
-        // Look up the mapping for this path.
-        let dir_name = AGENT_DIR_MAPPINGS
-            .iter()
-            .find(|(expected, _)| relative == Path::new(expected))
-            .map(|(_, contained)| *contained);
-
-        let contained_dir = if let Some(name) = dir_name {
-            agent_root.join(name)
-        } else {
-            // Use the relative path as the contained dir name.
-            agent_root.join(relative.to_string_lossy().replace('/', "-"))
+        let Some(contained_dir) = contained_agent_dir_for_relative(&relative, &agent_root) else {
+            continue;
         };
 
         // Create the contained directory.
@@ -171,6 +159,13 @@ pub fn prepare_agent_workspace(
     }
 
     Ok(symlinks)
+}
+
+fn contained_agent_dir_for_relative(relative: &Path, agent_root: &Path) -> Option<PathBuf> {
+    AGENT_DIR_MAPPINGS
+        .iter()
+        .find(|(expected, _)| relative == Path::new(expected))
+        .map(|(_, contained)| agent_root.join(contained))
 }
 
 /// Remove symlinks created by prepare_agent_workspace.
@@ -381,5 +376,23 @@ mod tests {
                 "missing mapping for {agent}"
             );
         }
+    }
+
+    #[test]
+    fn only_known_agent_state_paths_are_contained() {
+        let agent_root = Path::new("/home/user/.axis/agents/test");
+
+        assert_eq!(
+            contained_agent_dir_for_relative(Path::new(".codex"), agent_root),
+            Some(agent_root.join("codex"))
+        );
+        assert_eq!(
+            contained_agent_dir_for_relative(Path::new(".config"), agent_root),
+            Some(agent_root.join("config"))
+        );
+        assert_eq!(
+            contained_agent_dir_for_relative(Path::new("fixture/project"), agent_root),
+            None
+        );
     }
 }
