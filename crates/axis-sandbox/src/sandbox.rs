@@ -287,6 +287,7 @@ fn prepare_mxc_managed_home_workspace(config: &mut SandboxConfig) -> Result<(), 
         reject_unmanaged_home_grants_for_mxc_managed_home(config)?;
         crate::workspace::prepare_ssh_workspace_at(&policy_name, &config.policy.ssh, &ssh_dir)
             .map_err(|err| format!("scoped SSH workspace: {err}"))?;
+        push_unique_policy_path(&mut config.policy.filesystem.read_only, &ssh_dir)?;
         set_managed_home_env(&mut config.env, &managed_home)?;
         Ok(())
     })
@@ -397,12 +398,16 @@ fn reject_unmanaged_home_grants_for_mxc_managed_home(config: &SandboxConfig) -> 
     let private_setup = normalize_existing_or_absolute_path(
         &crate::workspace::ssh_workspace_staging_parent_checked(&config.policy.name)?,
     )?;
+    let generated_ssh = normalize_existing_or_absolute_path(
+        &crate::workspace::managed_home_path(&config.policy.name).join(".ssh"),
+    )?;
     let workspace = normalize_existing_or_absolute_path(&config.workspace_dir)?;
     let tmpdir = normalize_existing_or_absolute_path(&sandbox_tmpdir_path(&config.workspace_dir))?;
     let guard = ManagedHomeGrantGuard {
         home: &home,
         agent_root: &agent_root,
         private_setup: &private_setup,
+        generated_ssh: &generated_ssh,
         workspace: &workspace,
         tmpdir: &tmpdir,
         raw_workspace: &config.workspace_dir,
@@ -416,6 +421,7 @@ struct ManagedHomeGrantGuard<'a> {
     home: &'a Path,
     agent_root: &'a Path,
     private_setup: &'a Path,
+    generated_ssh: &'a Path,
     workspace: &'a Path,
     tmpdir: &'a Path,
     raw_workspace: &'a Path,
@@ -433,6 +439,13 @@ fn reject_unmanaged_home_grants(
         if paths_overlap(&expanded, guard.private_setup) {
             return Err(format!(
                 "MXC managed HOME cannot grant private agent setup {section} path '{}' (expanded '{}')",
+                path,
+                expanded.display()
+            ));
+        }
+        if section == "read_write" && path_contains_or_equal(guard.generated_ssh, &expanded) {
+            return Err(format!(
+                "MXC managed HOME cannot grant generated SSH {section} path '{}' (expanded '{}')",
                 path,
                 expanded.display()
             ));
@@ -991,6 +1004,7 @@ mod tests {
             let mut config = test_config();
             config.policy.name = "agent-ssh".into();
             config.workspace_dir = workspace.path().join("workspace");
+            std::fs::create_dir_all(&config.workspace_dir).unwrap();
             config.policy.filesystem.deny = vec!["~/.ssh".into()];
             config.policy.ssh = SshPolicy {
                 allowed_keys: vec![SshKeySpec {
@@ -1072,6 +1086,7 @@ mod tests {
             let claude_share_target = home.path().join(".axis/agents/agent-ssh/claude-share");
             let config_target = home.path().join(".axis/agents/agent-ssh/config");
             let codex_target = home.path().join(".axis/agents/agent-ssh/codex");
+            let managed_ssh = managed_home.join(".ssh");
 
             assert!(symlinks.is_empty());
             assert!(real_ssh.is_dir());
@@ -1171,6 +1186,22 @@ mod tests {
                 "known agent state target should remain mounted separately"
             );
             assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_only
+                    .contains(&managed_ssh.to_string_lossy().into_owned()),
+                "generated managed SSH state must be readonly in the sandbox"
+            );
+            assert!(
+                !config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&managed_ssh.to_string_lossy().into_owned()),
+                "generated managed SSH state must not be directly writable"
+            );
+            assert!(
                 !config.policy.filesystem.read_write.iter().any(|path| {
                     path == "~/.axis"
                         || path == "~/.local/share/claude"
@@ -1196,6 +1227,19 @@ mod tests {
                 spec.filesystem
                     .readwrite_paths
                     .contains(&managed_home.to_string_lossy().into_owned())
+            );
+            assert!(
+                spec.filesystem
+                    .readonly_paths
+                    .contains(&managed_ssh.to_string_lossy().into_owned()),
+                "MXC must mount generated SSH state readonly after the writable HOME bind"
+            );
+            assert!(
+                !spec
+                    .filesystem
+                    .readwrite_paths
+                    .contains(&managed_ssh.to_string_lossy().into_owned()),
+                "MXC must not mount generated SSH state readwrite"
             );
             assert!(
                 spec.filesystem
@@ -1251,6 +1295,7 @@ mod tests {
             let mut config = test_config();
             config.policy.name = "agent-ssh".into();
             config.workspace_dir = workspace.path().join("workspace");
+            std::fs::create_dir_all(&config.workspace_dir).unwrap();
             config.policy.filesystem.deny = vec!["~/.ssh".into()];
             config.policy.ssh = SshPolicy {
                 allowed_keys: vec![SshKeySpec {
@@ -1269,6 +1314,7 @@ mod tests {
             )
             .unwrap();
             let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+            let managed_ssh = managed_home.join(".ssh");
 
             assert!(symlinks.is_empty());
             assert!(real_ssh.is_dir());
@@ -1284,6 +1330,19 @@ mod tests {
                     .find(|(key, _)| key == "HOME")
                     .map(|(_, value)| value.as_str()),
                 Some(managed_home.to_str().unwrap())
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_only
+                    .contains(&managed_ssh.to_string_lossy().into_owned())
+            );
+            let spec = crate::linux::mxc::translate_sandbox_config_for_test(&config).unwrap();
+            assert!(
+                spec.filesystem
+                    .readonly_paths
+                    .contains(&managed_ssh.to_string_lossy().into_owned())
             );
         });
     }
@@ -1562,6 +1621,73 @@ mod tests {
                 assert!(
                     !managed_home.join(".ssh/id_ed25519").exists(),
                     "private setup grant {label} must be rejected before copying SSH keys"
+                );
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_generated_ssh_readwrite_grants_before_copying_keys() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+            let generated_ssh = home.path().join(".axis/agents/agent-ssh/home/.ssh");
+
+            let grants = [
+                (
+                    generated_ssh.to_string_lossy().into_owned(),
+                    "generated SSH root",
+                ),
+                (
+                    generated_ssh
+                        .join("id_ed25519")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "generated SSH child",
+                ),
+                (
+                    "{workspace}/../.axis/agents/agent-ssh/home/.ssh/config".to_string(),
+                    "token-expanded generated SSH child",
+                ),
+            ];
+
+            for (index, (grant, label)) in grants.into_iter().enumerate() {
+                let workspace = home.path().join(format!("workspace-ssh-{index}"));
+                std::fs::create_dir(&workspace).unwrap();
+                let mut config = test_config();
+                config.policy.name = "agent-ssh".into();
+                config.workspace_dir = workspace;
+                config.policy.filesystem.read_write = vec![grant.clone()];
+                config.policy.ssh = SshPolicy {
+                    allowed_keys: vec![SshKeySpec {
+                        name: "github".into(),
+                        private_key: "~/.ssh/id_ed25519".into(),
+                        allowed_hosts: vec!["github.com".into()],
+                    }],
+                    generate_config: true,
+                    generate_known_hosts: false,
+                };
+
+                let err = prepare_managed_agent_workspace(
+                    &mut config,
+                    true,
+                    PlatformBackendSelection::LinuxMxc,
+                )
+                .unwrap_err();
+
+                assert!(matches!(err, SandboxError::CreationFailed(_)));
+                assert!(
+                    err.to_string()
+                        .contains("cannot grant generated SSH read_write path"),
+                    "unexpected error for {label} grant {grant}: {err}"
+                );
+                assert!(
+                    !generated_ssh.join("id_ed25519").exists(),
+                    "generated SSH readwrite grant {label} must be rejected before copying keys"
                 );
             }
         });
