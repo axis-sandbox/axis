@@ -6,7 +6,7 @@
 use axis_core::connect_attribution::ConnectAttributionStore;
 use axis_core::policy::Policy;
 use axis_core::types::{SandboxId, SandboxStatus};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -86,7 +86,7 @@ impl Sandbox {
     }
 
     fn create_inner_with_backend(
-        config: SandboxConfig,
+        mut config: SandboxConfig,
         manage_agent_workspace: bool,
         backend: PlatformBackendSelection,
     ) -> Result<Self, SandboxError> {
@@ -95,47 +95,15 @@ impl Sandbox {
             .validate()
             .map_err(|e| SandboxError::CreationFailed(format!("invalid sandbox policy: {e}")))?;
 
-        // Prepare agent workspace: create ~/.axis/agents/<name>/ and
-        // symlink agent-expected directories (e.g., ~/.claude) to it.
-        let mut agent_symlinks = if manage_agent_workspace {
-            crate::workspace::prepare_agent_workspace(
-                &config.policy.name,
-                &config.policy.filesystem.read_write,
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!("workspace prep: {e}");
-                Vec::new()
-            })
-        } else {
-            Vec::new()
-        };
+        let agent_symlinks = prepare_managed_agent_workspace(&mut config, manage_agent_workspace)?;
 
-        // Prepare scoped SSH if policy has SSH key specs.
-        if manage_agent_workspace
-            && !config.policy.ssh.allowed_keys.is_empty()
-            && let Ok(Some(ssh_dir)) =
-                crate::workspace::prepare_ssh_workspace(&config.policy.name, &config.policy.ssh)
-        {
-            // Symlink ~/.ssh -> contained ssh dir (only if real ~/.ssh doesn't exist).
-            if let Ok(home) = std::env::var("HOME") {
-                let ssh_link = PathBuf::from(&home).join(".ssh");
-                if !ssh_link.exists() || ssh_link.is_symlink() {
-                    let _ = std::fs::remove_file(&ssh_link);
-                    #[cfg(unix)]
-                    {
-                        let _ = std::os::unix::fs::symlink(&ssh_dir, &ssh_link)
-                            .map(|()| agent_symlinks.push((ssh_link, ssh_dir)));
-                    }
-                    #[cfg(windows)]
-                    {
-                        let _ = std::os::windows::fs::symlink_dir(&ssh_dir, &ssh_link)
-                            .map(|()| agent_symlinks.push((ssh_link, ssh_dir)));
-                    }
-                }
+        let inner = match create_platform_sandbox_with_backend(&config, backend) {
+            Ok(inner) => inner,
+            Err(err) => {
+                crate::workspace::cleanup_agent_symlinks(&agent_symlinks);
+                return Err(err);
             }
-        }
-
-        let inner = create_platform_sandbox_with_backend(&config, backend)?;
+        };
         Ok(Self {
             id: config.id,
             status: SandboxStatus::Creating,
@@ -190,6 +158,172 @@ impl Sandbox {
         self.status = SandboxStatus::Stopped;
         Ok(())
     }
+}
+
+fn prepare_managed_agent_workspace(
+    config: &mut SandboxConfig,
+    manage_agent_workspace: bool,
+) -> Result<Vec<(PathBuf, PathBuf)>, SandboxError> {
+    if !manage_agent_workspace {
+        let agent_symlinks = Vec::new();
+        if let Err(err) = rewrite_read_write_paths_for_agent_targets(
+            &config.policy.name,
+            &mut config.policy.filesystem.read_write,
+            &agent_symlinks,
+        ) {
+            return Err(SandboxError::CreationFailed(format!(
+                "agent workspace preparation: {err}"
+            )));
+        }
+        prepare_existing_scoped_ssh_for_exec(config)?;
+        return Ok(agent_symlinks);
+    }
+
+    let mut agent_symlinks = crate::workspace::prepare_agent_workspace(
+        &config.policy.name,
+        &config.policy.filesystem.read_write,
+    )
+    .map_err(|e| SandboxError::CreationFailed(format!("agent workspace preparation: {e}")))?;
+
+    if let Err(err) = rewrite_read_write_paths_for_agent_targets(
+        &config.policy.name,
+        &mut config.policy.filesystem.read_write,
+        &agent_symlinks,
+    ) {
+        crate::workspace::cleanup_agent_symlinks(&agent_symlinks);
+        return Err(SandboxError::CreationFailed(format!(
+            "agent workspace preparation: {err}"
+        )));
+    }
+
+    if !config.policy.ssh.allowed_keys.is_empty() {
+        let ssh_dir = crate::workspace::ssh_workspace_path(&config.policy.name);
+        match crate::workspace::link_scoped_ssh_workspace(&ssh_dir) {
+            Ok(link) => agent_symlinks.push(link),
+            Err(err) => {
+                crate::workspace::cleanup_agent_symlinks(&agent_symlinks);
+                return Err(SandboxError::CreationFailed(format!(
+                    "scoped SSH workspace: {err}"
+                )));
+            }
+        }
+
+        match crate::workspace::prepare_ssh_workspace(&config.policy.name, &config.policy.ssh) {
+            Ok(Some(prepared_ssh_dir)) => {
+                if let Err(err) = push_unique_policy_path(
+                    &mut config.policy.filesystem.read_write,
+                    &prepared_ssh_dir,
+                )
+                .and_then(|()| {
+                    remove_policy_path(
+                        &mut config.policy.filesystem.deny,
+                        &agent_symlinks
+                            .last()
+                            .expect("SSH symlink should have been recorded")
+                            .0,
+                    )
+                }) {
+                    crate::workspace::cleanup_agent_symlinks(&agent_symlinks);
+                    return Err(SandboxError::CreationFailed(format!(
+                        "scoped SSH workspace: {err}"
+                    )));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                crate::workspace::cleanup_agent_symlinks(&agent_symlinks);
+                return Err(SandboxError::CreationFailed(format!(
+                    "scoped SSH workspace: {err}"
+                )));
+            }
+        }
+    }
+
+    Ok(agent_symlinks)
+}
+
+fn prepare_existing_scoped_ssh_for_exec(config: &mut SandboxConfig) -> Result<(), SandboxError> {
+    if config.policy.ssh.allowed_keys.is_empty() {
+        return Ok(());
+    }
+
+    let ssh_dir = crate::workspace::ssh_workspace_path(&config.policy.name);
+    match crate::workspace::scoped_ssh_link_points_to(&ssh_dir) {
+        Ok(true) => {
+            let ssh_link = crate::workspace::scoped_ssh_link_path().map_err(|err| {
+                SandboxError::CreationFailed(format!("scoped SSH workspace: {err}"))
+            })?;
+            push_unique_policy_path(&mut config.policy.filesystem.read_write, &ssh_dir)
+                .and_then(|()| remove_policy_path(&mut config.policy.filesystem.deny, &ssh_link))
+                .map_err(|err| SandboxError::CreationFailed(format!("scoped SSH workspace: {err}")))
+        }
+        Ok(false) => Err(SandboxError::CreationFailed(
+            "scoped SSH workspace is not prepared for exec".into(),
+        )),
+        Err(err) => Err(SandboxError::CreationFailed(format!(
+            "scoped SSH workspace: {err}"
+        ))),
+    }
+}
+
+fn rewrite_read_write_paths_for_agent_targets(
+    policy_name: &str,
+    read_write_paths: &mut Vec<String>,
+    symlinks: &[(PathBuf, PathBuf)],
+) -> Result<(), String> {
+    for path in read_write_paths.iter_mut() {
+        let expanded = crate::workspace::expand_home_or_absolute_path(path)?;
+        let mut target = expanded.as_ref().and_then(|expanded| {
+            symlinks
+                .iter()
+                .find_map(|(link, target)| (expanded == link).then_some(target.clone()))
+        });
+        if target.is_none() {
+            target = crate::workspace::agent_state_mapping_for_policy_path(policy_name, path)?
+                .map(|(_, target)| target);
+        }
+
+        if let Some(target) = target {
+            *path = policy_path_string(&target)?;
+        }
+    }
+
+    for path in read_write_paths.clone() {
+        if let Some((_, target)) =
+            crate::workspace::agent_state_mapping_for_policy_path(policy_name, &path)?
+        {
+            push_unique_policy_path(read_write_paths, &target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_policy_path(paths: &mut Vec<String>, remove: &Path) -> Result<(), String> {
+    let mut retained = Vec::with_capacity(paths.len());
+    for path in paths.drain(..) {
+        let should_remove = crate::workspace::expand_home_or_absolute_path(&path)?
+            .is_some_and(|expanded| expanded == *remove);
+        if !should_remove {
+            retained.push(path);
+        }
+    }
+    *paths = retained;
+    Ok(())
+}
+
+fn push_unique_policy_path(paths: &mut Vec<String>, path: &Path) -> Result<(), String> {
+    let path = policy_path_string(path)?;
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+    Ok(())
+}
+
+fn policy_path_string(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("policy path '{}' is not valid UTF-8", path.display()))
 }
 
 #[allow(dead_code)]
@@ -281,8 +415,11 @@ mod tests {
     use super::*;
     use axis_core::policy::{
         FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, ProcessPolicy,
-        SshPolicy,
+        SshKeySpec, SshPolicy,
     };
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
 
     fn test_config() -> SandboxConfig {
         SandboxConfig {
@@ -342,6 +479,262 @@ mod tests {
         assert!(err.to_string().contains("cpu_rate_percent"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_workspace_preparation_rewrites_known_paths_and_ignores_unknown_home_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let mut config = test_config();
+            config.policy.name = "agent-codex".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.read_write = vec![
+                "~/.codex".into(),
+                "~/Documents".into(),
+                "~/.unknown-agent".into(),
+                "{workspace}".into(),
+            ];
+
+            let symlinks = prepare_managed_agent_workspace(&mut config, true).unwrap();
+            let codex_link = home.path().join(".codex");
+            let codex_target = home.path().join(".axis/agents/agent-codex/codex");
+
+            assert_eq!(symlinks, vec![(codex_link.clone(), codex_target.clone())]);
+            assert!(codex_link.is_symlink());
+            assert_eq!(std::fs::read_link(&codex_link).unwrap(), codex_target);
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&codex_target.to_string_lossy().into_owned()),
+                "backend policy should grant the contained target, not only the symlink alias"
+            );
+            assert!(
+                !config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&"~/.codex".into()),
+                "backend policy should not rely on MXC representing symlink aliases"
+            );
+            assert!(
+                !home.path().join("Documents").is_symlink(),
+                "broad user directories must not be redirected"
+            );
+            assert!(
+                !home.path().join(".unknown-agent").exists(),
+                "unknown agent state paths must not be redirected"
+            );
+
+            crate::workspace::cleanup_agent_symlinks(&symlinks);
+            assert!(!codex_link.exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_ssh_preparation_uses_generated_ssh_dir_and_removes_real_home_deny() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_dir = home.path().join("keys");
+            std::fs::create_dir(&key_dir).unwrap();
+            let key_path = key_dir.join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.deny = vec!["~/.ssh".into(), "~/.aws".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let symlinks = prepare_managed_agent_workspace(&mut config, true).unwrap();
+            let ssh_link = home.path().join(".ssh");
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+
+            assert!(ssh_link.is_symlink());
+            assert_eq!(std::fs::read_link(&ssh_link).unwrap(), ssh_dir);
+            assert_eq!(
+                std::fs::read_to_string(ssh_dir.join("id_ed25519")).unwrap(),
+                "private-key"
+            );
+            let generated_config = std::fs::read_to_string(ssh_dir.join("config")).unwrap();
+            assert!(generated_config.contains("Host github.com"));
+            assert!(generated_config.contains("IdentityFile ~/.ssh/id_ed25519"));
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&ssh_dir.to_string_lossy().into_owned()),
+                "scoped SSH target must be writable inside the backend sandbox"
+            );
+            assert!(
+                !config.policy.filesystem.deny.contains(&"~/.ssh".into()),
+                "the backend policy must not deny the generated ~/.ssh symlink target"
+            );
+            assert!(config.policy.filesystem.deny.contains(&"~/.aws".into()));
+
+            crate::workspace::cleanup_agent_symlinks(&symlinks);
+            assert!(!ssh_link.exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_ssh_preparation_refuses_to_replace_real_user_ssh() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            let key_path = real_ssh.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_managed_agent_workspace(&mut config, true).unwrap_err();
+
+            assert!(matches!(err, SandboxError::CreationFailed(_)));
+            assert!(
+                err.to_string()
+                    .contains("refusing to replace existing ~/.ssh")
+            );
+            assert!(real_ssh.is_dir());
+            assert!(!real_ssh.is_symlink());
+            assert_eq!(
+                std::fs::read_to_string(real_ssh.join("id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_cleans_agent_symlink_when_mxc_backend_setup_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let mut config = test_config();
+            config.policy.name = "agent-codex".into();
+            config.policy.network.mode = NetworkMode::Proxy;
+            config.policy.filesystem.read_write = vec!["~/.codex".into()];
+            config.workspace_dir = workspace.path().join("workspace");
+
+            let err = match Sandbox::create_inner_with_backend(
+                config,
+                true,
+                PlatformBackendSelection::LinuxMxc,
+            ) {
+                Ok(_) => panic!("MXC backend setup should fail for unsupported proxy mode"),
+                Err(err) => err,
+            };
+
+            assert!(matches!(err, SandboxError::IsolationFailed(_)));
+            assert!(err.to_string().contains("cooperative"));
+            assert!(
+                !home.path().join(".codex").exists(),
+                "agent symlink should be cleaned when backend setup fails"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_workspace_preparation_rewrites_known_paths_without_creating_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let primary_symlinks =
+                crate::workspace::prepare_agent_workspace("agent-codex", &["~/.codex".into()])
+                    .unwrap();
+            let codex_link = home.path().join(".codex");
+            let codex_target = home.path().join(".axis/agents/agent-codex/codex");
+
+            let mut config = test_config();
+            config.policy.name = "agent-codex".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.read_write = vec!["~/.codex".into()];
+
+            let exec_symlinks = prepare_managed_agent_workspace(&mut config, false).unwrap();
+
+            assert!(exec_symlinks.is_empty());
+            assert!(codex_link.is_symlink());
+            assert_eq!(
+                config.policy.filesystem.read_write,
+                vec![codex_target.to_string_lossy().into_owned()]
+            );
+
+            crate::workspace::cleanup_agent_symlinks(&primary_symlinks);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_scoped_ssh_reuses_existing_generated_link_without_replacing_home_ssh() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let ssh_dir = crate::workspace::ssh_workspace_path("agent-ssh");
+            let ssh_link_pair = crate::workspace::link_scoped_ssh_workspace(&ssh_dir).unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.deny = vec!["~/.ssh".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "/tmp/nonexistent-key-for-exec".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let exec_symlinks = prepare_managed_agent_workspace(&mut config, false).unwrap();
+
+            assert!(exec_symlinks.is_empty());
+            assert!(home.path().join(".ssh").is_symlink());
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&ssh_dir.to_string_lossy().into_owned())
+            );
+            assert!(!config.policy.filesystem.deny.contains(&"~/.ssh".into()));
+
+            crate::workspace::cleanup_agent_symlinks(&[ssh_link_pair]);
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn public_create_for_exec_uses_default_linux_backend() {
@@ -391,5 +784,33 @@ mod tests {
         config.policy.process.max_processes = 0;
         config.policy.process.max_memory_mb = 0;
         config.policy.process.cpu_rate_percent = 0;
+    }
+
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        struct EnvGuard {
+            home: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.home {
+                        Some(value) => std::env::set_var("HOME", value),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        let _env_guard = EnvGuard { home: previous };
+
+        f()
     }
 }

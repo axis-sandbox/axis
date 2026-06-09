@@ -71,15 +71,34 @@ impl Policy {
         if self.version != 1 {
             return Err(PolicyError::UnsupportedVersion(self.version));
         }
-        if self.name.is_empty() {
-            return Err(PolicyError::ValidationError(
-                "policy name must not be empty".into(),
-            ));
-        }
+        validate_policy_name_component(&self.name)?;
         self.process.validate()?;
         self.network.validate()?;
         Ok(())
     }
+}
+
+/// Validate a policy name before it is used as a filesystem path component.
+pub fn validate_policy_name_component(name: &str) -> Result<(), PolicyError> {
+    if name.is_empty() {
+        return Err(PolicyError::ValidationError(
+            "policy name must not be empty".into(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(PolicyError::ValidationError(
+            "policy name must be a safe path component".into(),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(PolicyError::ValidationError(
+            "policy name must contain only ASCII letters, digits, '.', '_' and '-'".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Filesystem access policy — controls what paths the sandboxed process can read/write.
@@ -585,6 +604,33 @@ amd:
         let yaml = "version: 1\nname: \"\"\n";
         let err = Policy::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, PolicyError::ValidationError(_)));
+    }
+
+    #[test]
+    fn reject_policy_name_that_is_not_safe_path_component() {
+        for name in [
+            ".",
+            "..",
+            "../escape",
+            "/absolute",
+            "nested/name",
+            "nested\\name",
+            "bad name",
+        ] {
+            let yaml = format!("version: 1\nname: {name:?}\n");
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(
+                matches!(err, PolicyError::ValidationError(_)),
+                "expected invalid policy name {name:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_policy_name_safe_path_component() {
+        let yaml = "version: 1\nname: agent.codex_1-test\n";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert_eq!(policy.name, "agent.codex_1-test");
     }
 
     #[test]

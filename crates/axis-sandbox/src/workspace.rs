@@ -8,7 +8,7 @@
 //! This ensures all agent-writable data is contained in a single
 //! directory tree that can be inspected, backed up, and destroyed.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Agent state directory mappings.
 /// Maps the path agents expect to write to → the directory name under .axis/agents/<name>/.
@@ -40,55 +40,22 @@ pub fn prepare_agent_workspace(
     policy_name: &str,
     read_write_paths: &[String],
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| "cannot determine HOME directory".to_string())?;
-    let home = PathBuf::from(home);
+    let home = user_home()?;
 
-    let agent_root = home.join(".axis").join("agents").join(policy_name);
+    let agent_root = agent_state_root_checked(policy_name)?;
 
     let mut symlinks = Vec::new();
 
     for rw_path in read_write_paths {
-        // Expand ~ to home.
-        let expanded = rw_path.replace('~', &home.to_string_lossy());
-
-        // Skip non-home paths (workspace, tmpdir, etc.).
-        if !expanded.starts_with(home.to_string_lossy().as_ref()) {
-            continue;
-        }
-
-        // Never symlink ~/.axis itself (that's the containment root).
-        if expanded.ends_with("/.axis") || expanded.contains("/.axis/") {
-            continue;
-        }
-
-        // Never symlink large/dangerous directories.
-        let rel_check = expanded
-            .trim_start_matches(&*home.to_string_lossy())
-            .trim_start_matches('/');
-        if NEVER_SYMLINK
-            .iter()
-            .any(|&blocked| rel_check == blocked || rel_check.starts_with(&format!("{blocked}/")))
-        {
-            continue;
-        }
-
-        // Find the relative path from home.
-        let relative = match PathBuf::from(&expanded).strip_prefix(&home) {
-            Ok(r) => r.to_path_buf(),
-            Err(_) => continue,
-        };
-
-        let Some(contained_dir) = contained_agent_dir_for_relative(&relative, &agent_root) else {
+        let Some((symlink_path, contained_dir)) =
+            agent_state_mapping_for_policy_path_with_home(rw_path, &home, &agent_root)?
+        else {
             continue;
         };
 
         // Create the contained directory.
         std::fs::create_dir_all(&contained_dir)
             .map_err(|e| format!("cannot create {}: {e}", contained_dir.display()))?;
-
-        let symlink_path = home.join(&relative);
 
         // If the expected path already exists and is not a symlink, skip it
         // (don't clobber real user data).
@@ -114,6 +81,7 @@ pub fn prepare_agent_workspace(
                     copy_dir_contents(&symlink_path, &contained_dir)?;
                 }
                 // Rename original to .bak, then create symlink.
+                let relative = symlink_path.strip_prefix(&home).unwrap_or(&symlink_path);
                 let backup = home.join(format!("{}.axis-backup", relative.display()));
                 if !backup.exists() {
                     let _ = std::fs::rename(&symlink_path, &backup);
@@ -184,13 +152,94 @@ pub fn cleanup_agent_symlinks(symlinks: &[(PathBuf, PathBuf)]) {
 
 /// Get the agent state root directory.
 pub fn agent_state_root(policy_name: &str) -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".axis")
-        .join("agents")
-        .join(policy_name)
+    agent_state_root_checked(policy_name).unwrap_or_else(|_| {
+        user_home()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join(".axis")
+            .join("agents")
+            .join("invalid-policy-name")
+    })
+}
+
+/// Get the scoped SSH directory for a policy.
+pub fn ssh_workspace_path(policy_name: &str) -> PathBuf {
+    agent_state_root(policy_name).join("ssh")
+}
+
+/// Create ~/.ssh as a symlink to the scoped SSH directory.
+///
+/// This refuses to replace any existing ~/.ssh path, including an existing
+/// symlink, because doing so could hide or disturb the user's real SSH state.
+pub fn link_scoped_ssh_workspace(ssh_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let home = user_home()?;
+    let ssh_link = home.join(".ssh");
+    if ssh_link.exists() || ssh_link.is_symlink() {
+        return Err(format!(
+            "refusing to replace existing ~/.ssh at {}",
+            ssh_link.display()
+        ));
+    }
+    std::fs::create_dir_all(ssh_dir).map_err(|e| format!("create ssh dir: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(ssh_dir, &ssh_link).map_err(|e| {
+            format!(
+                "symlink {} -> {}: {e}",
+                ssh_link.display(),
+                ssh_dir.display()
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(ssh_dir, &ssh_link).map_err(|e| {
+            format!(
+                "symlink {} -> {}: {e}",
+                ssh_link.display(),
+                ssh_dir.display()
+            )
+        })?;
+    }
+
+    Ok((ssh_link, ssh_dir.to_path_buf()))
+}
+
+pub(crate) fn expand_home_or_absolute_path(path: &str) -> Result<Option<PathBuf>, String> {
+    let home = user_home()?;
+    expand_home_or_absolute_path_with_home(path, &home)
+}
+
+pub(crate) fn scoped_ssh_link_path() -> Result<PathBuf, String> {
+    Ok(user_home()?.join(".ssh"))
+}
+
+pub(crate) fn agent_state_mapping_for_policy_path(
+    policy_name: &str,
+    path: &str,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let home = user_home()?;
+    let agent_root = agent_state_root_checked(policy_name)?;
+    agent_state_mapping_for_policy_path_with_home(path, &home, &agent_root)
+}
+
+pub(crate) fn scoped_ssh_link_points_to(ssh_dir: &Path) -> Result<bool, String> {
+    let home = user_home()?;
+    let ssh_link = home.join(".ssh");
+    if !ssh_link.is_symlink() {
+        return Ok(false);
+    }
+    let target = std::fs::read_link(&ssh_link)
+        .map_err(|e| format!("read scoped SSH symlink '{}': {e}", ssh_link.display()))?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        ssh_link
+            .parent()
+            .unwrap_or_else(|| Path::new(std::path::MAIN_SEPARATOR_STR))
+            .join(target)
+    };
+    Ok(normalize_path(target) == normalize_path(ssh_dir.to_path_buf()))
 }
 
 /// Prepare a scoped SSH directory for the sandbox.
@@ -205,29 +254,38 @@ pub fn prepare_ssh_workspace(
     policy_name: &str,
     ssh_policy: &axis_core::policy::SshPolicy,
 ) -> Result<Option<PathBuf>, String> {
+    prepare_ssh_workspace_with_permissions(policy_name, ssh_policy, set_private_permissions)
+}
+
+fn prepare_ssh_workspace_with_permissions<F>(
+    policy_name: &str,
+    ssh_policy: &axis_core::policy::SshPolicy,
+    mut set_permissions: F,
+) -> Result<Option<PathBuf>, String>
+where
+    F: FnMut(&Path, u32) -> Result<(), String>,
+{
     if ssh_policy.allowed_keys.is_empty() {
         return Ok(None);
     }
 
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| "cannot determine HOME".to_string())?;
-    let home = PathBuf::from(&home);
+    let home = user_home()?;
 
-    let ssh_dir = agent_state_root(policy_name).join("ssh");
+    let ssh_dir = agent_state_root_checked(policy_name)?.join("ssh");
     std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create ssh dir: {e}"))?;
 
-    // Set restrictive permissions on the ssh directory.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700));
-    }
+    set_permissions(&ssh_dir, 0o700)?;
 
     // Copy each allowed key.
     let mut config_entries = Vec::new();
     for key_spec in &ssh_policy.allowed_keys {
-        let src_path = PathBuf::from(key_spec.private_key.replace('~', &home.to_string_lossy()));
+        let src_path = expand_home_or_absolute_path_with_home(&key_spec.private_key, &home)?
+            .ok_or_else(|| {
+                format!(
+                    "ssh: key '{}' path must be absolute or start with ~/; got {}",
+                    key_spec.name, key_spec.private_key
+                )
+            })?;
 
         if !src_path.exists() {
             tracing::warn!(
@@ -248,11 +306,9 @@ pub fn prepare_ssh_workspace(
         std::fs::copy(&src_path, &dst_path)
             .map_err(|e| format!("copy key '{}': {e}", key_spec.name))?;
 
-        // Set key permissions to 600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(0o600));
+        if let Err(err) = set_permissions(&dst_path, 0o600) {
+            let _ = std::fs::remove_file(&dst_path);
+            return Err(err);
         }
 
         // Copy public key too if it exists.
@@ -336,6 +392,121 @@ pub fn prepare_ssh_workspace(
     Ok(Some(ssh_dir))
 }
 
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("set permissions {mode:o} on '{}': {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+fn user_home() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot determine HOME directory".to_string())?;
+    if !home.is_absolute() {
+        return Err(format!(
+            "HOME directory is not absolute: {}",
+            home.display()
+        ));
+    }
+    Ok(normalize_path(home))
+}
+
+fn agent_state_root_checked(policy_name: &str) -> Result<PathBuf, String> {
+    validate_policy_name_component(policy_name)?;
+    Ok(user_home()?.join(".axis").join("agents").join(policy_name))
+}
+
+fn validate_policy_name_component(policy_name: &str) -> Result<(), String> {
+    axis_core::policy::validate_policy_name_component(policy_name).map_err(|err| err.to_string())
+}
+
+fn expand_home_or_absolute_path_with_home(
+    path: &str,
+    home: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let expanded = if path == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest)
+    } else if path.starts_with('~') {
+        return Err(format!(
+            "unsupported home path '{path}': only '~' and '~/' are supported"
+        ));
+    } else {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(normalize_path(expanded)))
+}
+
+fn agent_state_mapping_for_policy_path_with_home(
+    path: &str,
+    home: &Path,
+    agent_root: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let Some(expanded) = expand_home_or_absolute_path_with_home(path, home)? else {
+        return Ok(None);
+    };
+
+    // Skip non-home paths (workspace, tmpdir, etc.).
+    if !expanded.starts_with(home) {
+        return Ok(None);
+    }
+
+    // Never symlink ~/.axis itself (that's the containment root).
+    if expanded == home.join(".axis") || expanded.starts_with(home.join(".axis")) {
+        return Ok(None);
+    }
+
+    // Never symlink large/dangerous directories.
+    let rel_check = expanded.strip_prefix(home).unwrap_or(&expanded);
+    if NEVER_SYMLINK
+        .iter()
+        .any(|&blocked| rel_check == Path::new(blocked) || rel_check.starts_with(blocked))
+    {
+        return Ok(None);
+    }
+
+    let relative = match expanded.strip_prefix(home) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => return Ok(None),
+    };
+    let Some(contained_dir) = contained_agent_dir_for_relative(&relative, agent_root) else {
+        return Ok(None);
+    };
+
+    Ok(Some((home.join(relative), contained_dir)))
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries.flatten() {
@@ -354,6 +525,9 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axis_core::policy::{SshKeySpec, SshPolicy};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn agent_state_root_is_under_home() {
@@ -394,5 +568,149 @@ mod tests {
             contained_agent_dir_for_relative(Path::new("fixture/project"), agent_root),
             None
         );
+    }
+
+    #[test]
+    fn workspace_preparation_rejects_unsafe_policy_names() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            for name in [
+                ".",
+                "..",
+                "../escape",
+                "/absolute",
+                "nested/name",
+                "nested\\name",
+            ] {
+                let err = prepare_agent_workspace(name, &["~/.codex".into()]).unwrap_err();
+                assert!(
+                    err.contains("policy name"),
+                    "expected policy name error for {name:?}, got {err}"
+                );
+                let mapping_err =
+                    agent_state_mapping_for_policy_path(name, "~/.codex").unwrap_err();
+                assert!(
+                    mapping_err.contains("policy name"),
+                    "expected mapping policy name error for {name:?}, got {mapping_err}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_rejects_unsafe_policy_names() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "/tmp/nonexistent-key".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            for name in ["../escape", "/absolute", "nested/name"] {
+                let err = prepare_ssh_workspace(name, &ssh_policy).unwrap_err();
+                assert!(
+                    err.contains("policy name"),
+                    "expected policy name error for {name:?}, got {err}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_fails_when_directory_permissions_cannot_be_hardened() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "/tmp/nonexistent-key".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err =
+                prepare_ssh_workspace_with_permissions("agent-ssh", &ssh_policy, |_path, mode| {
+                    Err(format!("permission hook failed for {mode:o}"))
+                })
+                .unwrap_err();
+
+            assert!(err.contains("permission hook failed for 700"));
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_fails_and_removes_key_when_key_permissions_cannot_be_hardened() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err =
+                prepare_ssh_workspace_with_permissions("agent-ssh", &ssh_policy, |_path, mode| {
+                    if mode == 0o600 {
+                        Err("key permission hook failed".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+
+            assert!(err.contains("key permission hook failed"));
+            assert!(
+                !home
+                    .path()
+                    .join(".axis/agents/agent-ssh/ssh/id_ed25519")
+                    .exists(),
+                "copied private key should be removed after chmod failure"
+            );
+        });
+    }
+
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        struct EnvGuard {
+            home: Option<OsString>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.home {
+                        Some(value) => std::env::set_var("HOME", value),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        let _env_guard = EnvGuard { home: previous };
+
+        f()
     }
 }
