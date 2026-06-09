@@ -8,6 +8,7 @@ pub mod bypass_audit;
 mod connect_attribution;
 mod identity;
 pub mod landlock;
+pub mod mxc;
 pub mod netns;
 pub mod resources;
 pub mod seccomp;
