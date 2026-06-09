@@ -5141,6 +5141,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn gated_real_mxc_payload_cannot_read_axis_config_fd() {
+        if test_mxc_executor().is_err() {
+            eprintln!(
+                "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
+            );
+            return;
+        }
+        if test_mxc_seccomp_launcher().is_err() {
+            eprintln!(
+                "axis-seccomp-launcher unavailable; set AXIS_TEST_AXIS_SECCOMP_LAUNCHER for a test helper (test skipped)"
+            );
+            return;
+        }
+        if find_on_path("bwrap").is_none() {
+            eprintln!("bubblewrap unavailable for MXC backend (test skipped)");
+            return;
+        }
+        if fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            .map(|value| value.trim() != "1")
+            .unwrap_or(true)
+        {
+            eprintln!("unprivileged user namespaces unavailable (test skipped)");
+            return;
+        }
+
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.command = python.to_string_lossy().into_owned();
+        config.args = vec!["-c".into(), real_mxc_config_fd_probe().into()];
+        config.working_dir = Some(workspace.path().into());
+        config.capture_output = true;
+        config.timeout_sec = Some(10);
+        config.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+
+        let mut sandbox = real_mxc_sandbox_for_test(&config).unwrap();
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+        let stderr = fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+
+        assert_eq!(code, 0, "MXC config fd probe failed:\n{stderr}");
+        assert!(workspace.path().join("config-fd-ok").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_native_proxy_reaches_only_axis_proxy_address() {
         if std::env::var("AXIS_REAL_MXC_PROXY_TESTS").as_deref() != Ok("1") {
             eprintln!("AXIS_REAL_MXC_PROXY_TESTS=1 not set (test skipped)");
@@ -6045,6 +6099,60 @@ left.close()
 right.close()
 pathlib.Path("block-ok").write_text("ok")
 print("block-stdout")
+"#
+    }
+
+    fn real_mxc_config_fd_probe() -> &'static str {
+        r#"
+import os
+import pathlib
+import sys
+
+leaks = []
+for name in os.listdir("/proc/self/fd"):
+    try:
+        fd = int(name)
+    except ValueError:
+        continue
+    if fd <= 2:
+        continue
+
+    proc_path = f"/proc/self/fd/{fd}"
+    try:
+        target = os.readlink(proc_path)
+    except OSError:
+        target = "<unreadable-link>"
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    try:
+        dup = os.open(proc_path, flags)
+    except OSError:
+        continue
+    try:
+        try:
+            os.lseek(dup, 0, os.SEEK_SET)
+        except OSError:
+            pass
+        try:
+            data = os.read(dup, 65536)
+        except OSError:
+            continue
+    finally:
+        os.close(dup)
+
+    if b'"version":"0.6.0-alpha"' in data and b'"containment":"bubblewrap"' in data:
+        leaks.append((fd, target))
+
+if leaks:
+    print(f"MXC config fd leaked into payload: {leaks}", file=sys.stderr)
+    sys.exit(31)
+
+pathlib.Path("config-fd-ok").write_text("ok")
 "#
     }
 
