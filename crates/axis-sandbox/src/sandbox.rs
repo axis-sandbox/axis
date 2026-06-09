@@ -74,7 +74,7 @@ pub struct Sandbox {
 impl Sandbox {
     /// Create a new sandbox with platform-specific isolation.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
-        Self::create_inner(config, true)
+        Self::create_inner_with_backend(config, true, PlatformBackendSelection::Default)
     }
 
     /// Create an isolated process for an already prepared managed workspace.
@@ -82,12 +82,13 @@ impl Sandbox {
     /// This skips agent workspace symlink setup/cleanup so short-lived daemon
     /// exec commands do not disturb symlinks owned by the primary sandbox.
     pub fn create_for_exec(config: SandboxConfig) -> Result<Self, SandboxError> {
-        Self::create_inner(config, false)
+        Self::create_inner_with_backend(config, false, PlatformBackendSelection::Default)
     }
 
-    fn create_inner(
+    fn create_inner_with_backend(
         config: SandboxConfig,
         manage_agent_workspace: bool,
+        backend: PlatformBackendSelection,
     ) -> Result<Self, SandboxError> {
         config
             .policy
@@ -134,7 +135,7 @@ impl Sandbox {
             }
         }
 
-        let inner = create_platform_sandbox(&config)?;
+        let inner = create_platform_sandbox_with_backend(&config, backend)?;
         Ok(Self {
             id: config.id,
             status: SandboxStatus::Creating,
@@ -191,6 +192,14 @@ impl Sandbox {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlatformBackendSelection {
+    Default,
+    #[cfg(target_os = "linux")]
+    LinuxMxc,
+}
+
 /// Platform-specific sandbox implementation trait.
 pub(crate) trait SandboxImpl: Send {
     /// Start the isolated process. Returns the PID.
@@ -228,25 +237,37 @@ pub(crate) trait SandboxImpl: Send {
     fn destroy(&mut self) -> Result<(), SandboxError>;
 }
 
-/// Create the platform-appropriate sandbox implementation.
-fn create_platform_sandbox(config: &SandboxConfig) -> Result<Box<dyn SandboxImpl>, SandboxError> {
+fn create_platform_sandbox_with_backend(
+    config: &SandboxConfig,
+    backend: PlatformBackendSelection,
+) -> Result<Box<dyn SandboxImpl>, SandboxError> {
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(crate::linux::LinuxSandbox::new(config)?))
+        match backend {
+            PlatformBackendSelection::Default => {
+                Ok(Box::new(crate::linux::LinuxSandbox::new(config)?))
+            }
+            PlatformBackendSelection::LinuxMxc => {
+                Ok(Box::new(crate::linux::mxc::MxcLinuxSandbox::new(config)?))
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
+        let _ = backend;
         Ok(Box::new(crate::macos::MacosSandbox::new(config)?))
     }
 
     #[cfg(target_os = "windows")]
     {
+        let _ = backend;
         Ok(Box::new(crate::windows::WindowsSandbox::new(config)?))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
+        let _ = backend;
         let _ = config;
         Err(SandboxError::Unsupported(format!(
             "platform '{}' is not yet supported",
@@ -319,5 +340,56 @@ mod tests {
 
         assert!(matches!(err, SandboxError::CreationFailed(_)));
         assert!(err.to_string().contains("cpu_rate_percent"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_create_for_exec_uses_default_linux_backend() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.workspace_dir = workspace.path().join("workspace");
+        disable_resource_limits(&mut config);
+
+        let sandbox = Sandbox::create_for_exec(config).unwrap();
+
+        assert_eq!(sandbox.status, SandboxStatus::Creating);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_create_uses_default_linux_backend() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.workspace_dir = workspace.path().join("workspace");
+        disable_resource_limits(&mut config);
+
+        let sandbox = Sandbox::create(config).unwrap();
+
+        assert_eq!(sandbox.status, SandboxStatus::Creating);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_linux_mxc_backend_fails_closed_before_spawn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.workspace_dir = workspace.path().join("workspace");
+
+        let err =
+            match create_platform_sandbox_with_backend(&config, PlatformBackendSelection::LinuxMxc)
+            {
+                Ok(_) => panic!("MXC backend should reject unsupported filesystem semantics"),
+                Err(err) => err,
+            };
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("MXC Linux backend unsupported"));
+        assert!(err.to_string().contains("default-deny"));
+    }
+
+    fn disable_resource_limits(config: &mut SandboxConfig) {
+        config.policy.process.max_processes = 0;
+        config.policy.process.max_memory_mb = 0;
+        config.policy.process.cpu_rate_percent = 0;
     }
 }

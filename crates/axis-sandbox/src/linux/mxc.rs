@@ -8,8 +8,9 @@
 //! selection. Unsupported AXIS guarantees fail before launch instead of being
 //! mapped to weaker MXC behavior.
 
-use crate::sandbox::SandboxConfig;
+use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
+use axis_core::types::SandboxId;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -248,6 +249,57 @@ impl MxcExecutor {
 pub struct MxcDryRunResult {
     pub stdout: String,
     pub stderr: String,
+}
+
+pub(crate) struct MxcLinuxSandbox {
+    id: SandboxId,
+}
+
+impl MxcLinuxSandbox {
+    pub(crate) fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
+        std::fs::create_dir_all(&config.workspace_dir)?;
+        let spec = MxcExecutionSpec::from_sandbox_config(config).map_err(|err| {
+            SandboxError::IsolationFailed(format!("MXC Linux backend unsupported: {err}"))
+        })?;
+        let executor = MxcExecutor::resolve().map_err(|err| {
+            SandboxError::IsolationFailed(format!("MXC Linux executor unavailable: {err}"))
+        })?;
+        executor
+            .dry_run(&spec, Duration::from_secs(5))
+            .map_err(|err| {
+                SandboxError::IsolationFailed(format!("MXC Linux dry-run validation failed: {err}"))
+            })?;
+
+        Ok(Self { id: config.id })
+    }
+}
+
+impl SandboxImpl for MxcLinuxSandbox {
+    fn start(&mut self) -> Result<u32, SandboxError> {
+        Err(SandboxError::Unsupported(format!(
+            "MXC Linux backend start is not implemented for sandbox {}",
+            self.id
+        )))
+    }
+
+    fn wait(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>
+    {
+        Box::pin(async {
+            Err(SandboxError::Unsupported(
+                "MXC Linux backend wait is not implemented".into(),
+            ))
+        })
+    }
+
+    fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
+        Ok(None)
+    }
+
+    fn destroy(&mut self) -> Result<(), SandboxError> {
+        Ok(())
+    }
 }
 
 impl MxcExecutionSpec {
