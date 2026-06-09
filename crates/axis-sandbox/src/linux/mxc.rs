@@ -356,6 +356,7 @@ pub(crate) struct MxcLinuxSandbox {
     spec: MxcExecutionSpec,
     executor: MxcExecutor,
     process_policy: axis_core::policy::ProcessPolicy,
+    filesystem_policy: axis_core::policy::FilesystemPolicy,
     network_strategy: super::strategy::NetworkStrategy,
     proxy_strategy: super::strategy::ProxyStrategy,
     resource_strategy: super::strategy::ResourceStrategy,
@@ -368,6 +369,7 @@ pub(crate) struct MxcLinuxSandbox {
     config_file: Option<tempfile::NamedTempFile>,
     seccomp_filter_file: Option<tempfile::NamedTempFile>,
     netns_name: Option<String>,
+    netns_helper_destroy_token: Option<String>,
     cgroup: Option<super::resources::CgroupHandle>,
     #[cfg(test)]
     cgroup_override: Option<super::resources::CgroupHandle>,
@@ -536,6 +538,7 @@ impl MxcLinuxSandbox {
             spec,
             executor,
             process_policy: config.policy.process.clone(),
+            filesystem_policy: config.policy.filesystem.clone(),
             network_strategy,
             proxy_strategy,
             resource_strategy,
@@ -548,6 +551,7 @@ impl MxcLinuxSandbox {
             config_file: None,
             seccomp_filter_file: Some(seccomp_filter_file),
             netns_name: None,
+            netns_helper_destroy_token: None,
             cgroup: None,
             #[cfg(test)]
             cgroup_override: None,
@@ -601,6 +605,12 @@ impl MxcLinuxSandbox {
 
     fn cleanup_netns(&mut self) -> Option<String> {
         let ns_name = self.netns_name.clone()?;
+        if self.netns_helper_destroy_token.is_some() {
+            return self.cleanup_netns_with_helper_token(
+                &ns_name,
+                super::netns::destroy_netns_with_helper_token,
+            );
+        }
 
         #[cfg(test)]
         if let Some(result) = self.netns_cleanup_result.clone() {
@@ -623,6 +633,29 @@ impl MxcLinuxSandbox {
         }
         self.netns_name = None;
         None
+    }
+
+    fn cleanup_netns_with_helper_token<F>(&mut self, ns_name: &str, destroy: F) -> Option<String>
+    where
+        F: FnOnce(SandboxId, &str) -> Result<(), String>,
+    {
+        let token = self.netns_helper_destroy_token.clone()?;
+        match destroy(self.id, &token) {
+            Ok(()) => {
+                self.netns_name = None;
+                self.netns_helper_destroy_token = None;
+                None
+            }
+            Err(error) if super::netns::helper_cleanup_already_done(&error) => {
+                self.netns_name = None;
+                self.netns_helper_destroy_token = None;
+                None
+            }
+            Err(error) => {
+                tracing::warn!("failed to destroy MXC helper netns '{ns_name}': {error}");
+                Some(format!("netns '{ns_name}': {error}"))
+            }
+        }
     }
 
     fn cleanup_cgroup(&mut self) -> Option<String> {
@@ -758,12 +791,7 @@ fn validate_mxc_network_strategy(
 
     match setup {
         super::strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin => Ok(()),
-        super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch => {
-            Err(SandboxError::IsolationFailed(
-                "MXC Linux proxy mode: axis-netns-helper launch cannot safely execute MXC configs yet; native CAP_NET_ADMIN network namespace setup is required"
-                    .into(),
-            ))
-        }
+        super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch => Ok(()),
     }
 }
 
@@ -917,6 +945,20 @@ impl SandboxImpl for MxcLinuxSandbox {
             None => None,
         };
 
+        if let super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+            proxy_port,
+            ..
+        } = &self.network_strategy
+        {
+            return self.start_with_netns_helper(
+                *proxy_port,
+                config,
+                prepared_rlimits,
+                cgroup_procs_fd,
+            );
+        }
+
         let netns_fd = match &self.network_strategy {
             super::strategy::NetworkStrategy::Proxy {
                 setup: super::strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
@@ -936,14 +978,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             super::strategy::NetworkStrategy::Proxy {
                 setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
                 ..
-            } => {
-                super::close_fd(cgroup_procs_fd);
-                return Err(
-                    self.cleanup_for_start_failure(SandboxError::IsolationFailed(
-                        "MXC netns: axis-netns-helper launch is not implemented for MXC".into(),
-                    )),
-                );
-            }
+            } => unreachable!("MXC helper launch is handled before native netns setup"),
             _ => None,
         };
 
@@ -1297,6 +1332,238 @@ impl SandboxImpl for MxcLinuxSandbox {
         tracing::info!("sandbox {} destroyed via MXC Linux backend", self.id);
         Ok(())
     }
+}
+
+impl MxcLinuxSandbox {
+    fn start_with_netns_helper(
+        &mut self,
+        proxy_port: u16,
+        config: tempfile::NamedTempFile,
+        prepared_rlimits: Option<super::PreparedRlimits>,
+        cgroup_procs_fd: Option<i32>,
+    ) -> Result<u32, SandboxError> {
+        if self.notify_connect {
+            super::close_fd(cgroup_procs_fd);
+            return Err(
+                self.cleanup_for_start_failure(SandboxError::IsolationFailed(
+                    "MXC helper launch cannot provide connect-time attribution yet".into(),
+                )),
+            );
+        }
+        if self.process_policy.run_as_user.is_some() {
+            super::close_fd(cgroup_procs_fd);
+            return Err(
+                self.cleanup_for_start_failure(SandboxError::IsolationFailed(
+                    "MXC helper launch with run_as_user is not implemented yet".into(),
+                )),
+            );
+        }
+        if super::landlock::policy_uses_tmpdir(&self.filesystem_policy) {
+            super::close_fd(cgroup_procs_fd);
+            return Err(
+                self.cleanup_for_start_failure(SandboxError::IsolationFailed(
+                    "MXC helper launch with {tmpdir} filesystem policy is not implemented yet"
+                        .into(),
+                )),
+            );
+        }
+
+        let config_fd = match sealed_mxc_config_fd(&config) {
+            Ok(fd) => fd,
+            Err(err) => {
+                super::close_fd(cgroup_procs_fd);
+                return Err(self.cleanup_for_start_failure(err));
+            }
+        };
+
+        let destroy_token = super::netns::new_destroy_token();
+        let helper_spec =
+            match self.mxc_helper_launch_spec(config_fd, prepared_rlimits, destroy_token.clone()) {
+                Ok(spec) => spec,
+                Err(err) => {
+                    super::close_fd(Some(config_fd));
+                    super::close_fd(cgroup_procs_fd);
+                    return Err(err);
+                }
+            };
+        let spec_fd = match super::netns::create_launch_spec_fd(&helper_spec) {
+            Ok(fd) => fd,
+            Err(err) => {
+                super::close_fd(Some(config_fd));
+                super::close_fd(cgroup_procs_fd);
+                return Err(
+                    self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                        "MXC helper launch spec: {err}"
+                    ))),
+                );
+            }
+        };
+        let (sync_read_fd, sync_write_fd) =
+            match super::helper_sync_pipe() {
+                Ok(fds) => fds,
+                Err(err) => {
+                    super::close_fd(Some(spec_fd));
+                    super::close_fd(Some(config_fd));
+                    super::close_fd(cgroup_procs_fd);
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("MXC helper sync pipe: {err}"),
+                    )));
+                }
+            };
+
+        let allocation = super::netns::proxy_netns_allocation(self.id, proxy_port);
+        let mut command = Command::new(super::netns::helper_path());
+        let helper_args = [
+            "launch".to_string(),
+            self.id.to_string(),
+            proxy_port.to_string(),
+            spec_fd.to_string(),
+            sync_write_fd.to_string(),
+            cgroup_procs_fd
+                .map(|fd| fd.to_string())
+                .unwrap_or_else(|| "-1".into()),
+        ];
+        command.args(helper_args);
+        command.current_dir(&self.workspace_dir);
+        command.env_clear();
+
+        if self.capture_output {
+            command.stdin(Stdio::null());
+            let stdout = match File::create(self.workspace_dir.join("stdout.log")) {
+                Ok(stdout) => stdout,
+                Err(err) => {
+                    super::close_fd(Some(spec_fd));
+                    super::close_fd(Some(config_fd));
+                    super::close_fd(Some(sync_read_fd));
+                    super::close_fd(Some(sync_write_fd));
+                    super::close_fd(cgroup_procs_fd);
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("stdout log: {err}"),
+                    )));
+                }
+            };
+            let stderr = match File::create(self.workspace_dir.join("stderr.log")) {
+                Ok(stderr) => stderr,
+                Err(err) => {
+                    super::close_fd(Some(spec_fd));
+                    super::close_fd(Some(config_fd));
+                    super::close_fd(Some(sync_read_fd));
+                    super::close_fd(Some(sync_write_fd));
+                    super::close_fd(cgroup_procs_fd);
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("stderr log: {err}"),
+                    )));
+                }
+            };
+            command.stdout(Stdio::from(stdout));
+            command.stderr(Stdio::from(stderr));
+        }
+
+        super::configure_helper_launch_fds_for_spawn(
+            &mut command,
+            super::HelperLaunchFds {
+                spec_fd,
+                sync_write_fd,
+                cgroup_procs_fd,
+                mxc_config_fd: Some(config_fd),
+            },
+        );
+
+        let mut child =
+            match command.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    super::close_fd(Some(spec_fd));
+                    super::close_fd(Some(config_fd));
+                    super::close_fd(Some(sync_read_fd));
+                    super::close_fd(Some(sync_write_fd));
+                    super::close_fd(cgroup_procs_fd);
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("MXC netns helper: {err}"),
+                    )));
+                }
+            };
+
+        super::close_fd(Some(spec_fd));
+        super::close_fd(Some(config_fd));
+        super::close_fd(Some(sync_write_fd));
+        super::close_fd(cgroup_procs_fd);
+
+        self.netns_name = Some(allocation.namespace);
+        self.netns_helper_destroy_token = Some(destroy_token);
+
+        if let Err(err) = super::netns::read_helper_sync(sync_read_fd) {
+            let _ = child.wait();
+            return Err(
+                self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                    "MXC netns helper setup failed: {err}"
+                ))),
+            );
+        }
+
+        let pid = child.id();
+        self.config_file = Some(config);
+        self.child = Some(child);
+        tracing::info!(
+            "sandbox {} started via MXC Linux helper backend, pid={pid}",
+            self.id
+        );
+        Ok(pid)
+    }
+
+    fn mxc_helper_launch_spec(
+        &mut self,
+        config_fd: i32,
+        prepared_rlimits: Option<super::PreparedRlimits>,
+        destroy_token: String,
+    ) -> Result<super::netns::HelperLaunchSpec, SandboxError> {
+        if config_fd < 3 {
+            return Err(
+                self.cleanup_for_start_failure(SandboxError::IsolationFailed(
+                    "MXC helper config fd must be an inherited fd >= 3".into(),
+                )),
+            );
+        }
+        let executor_path = path_to_string(self.executor.path()).map_err(|err| {
+            self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                "MXC helper executor path: {err}"
+            )))
+        })?;
+        Ok(super::netns::HelperLaunchSpec {
+            launch_kind: super::netns::HelperLaunchKind::MxcExecutor,
+            mxc_config_fd: Some(config_fd),
+            workspace_dir: self.workspace_dir.clone(),
+            filesystem: self.filesystem_policy.clone(),
+            process: self.process_policy.clone(),
+            rlimits: super::helper_rlimits_from_prepared(prepared_rlimits),
+            command: executor_path,
+            args: vec![
+                "--experimental".into(),
+                "--config".into(),
+                format!("/proc/self/fd/{config_fd}"),
+            ],
+            env: vec![
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("LC_ALL".into(), "C".into()),
+            ],
+            destroy_token,
+        })
+    }
+}
+
+fn sealed_mxc_config_fd(config: &tempfile::NamedTempFile) -> Result<i32, SandboxError> {
+    let mut config_file = config.as_file().try_clone().map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC helper config clone failed: {err}"))
+    })?;
+    config_file.seek(SeekFrom::Start(0)).map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC helper config rewind failed: {err}"))
+    })?;
+    let mut bytes = Vec::new();
+    config_file.read_to_end(&mut bytes).map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC helper config read failed: {err}"))
+    })?;
+    super::netns::create_mxc_config_fd(&bytes)
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC helper config seal: {err}")))
 }
 
 impl MxcExecutionSpec {
@@ -2345,18 +2612,14 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_rejects_helper_launch_for_mxc() {
+    fn proxy_mode_allows_unrestricted_helper_launch_for_mxc() {
         let id = SandboxId::new();
         let policy = mxc_representable_policy(NetworkMode::Proxy);
         let (network, _) = helper_mxc_proxy_strategies(id, 31_280);
         let workspace = tempfile::tempdir().unwrap();
         let config = config(policy, workspace.path().into());
 
-        let err = validate_mxc_network_strategy(&config, &network).unwrap_err();
-
-        assert!(matches!(err, SandboxError::IsolationFailed(_)));
-        assert!(err.to_string().contains("axis-netns-helper launch"));
-        assert!(err.to_string().contains("CAP_NET_ADMIN"));
+        assert!(validate_mxc_network_strategy(&config, &network).is_ok());
     }
 
     #[test]
@@ -2405,6 +2668,113 @@ mod tests {
             err.to_string()
                 .contains("blocked_syscalls includes connect")
         );
+    }
+
+    #[test]
+    fn proxy_mode_rejects_binary_restricted_helper_launch_for_mxc() {
+        let id = SandboxId::new();
+        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
+        let mut endpoint = endpoint_policy();
+        endpoint.binaries = vec![BinaryMatch {
+            path: "/usr/bin/curl".into(),
+        }];
+        policy.network.policies.push(endpoint);
+        let (network, _) = helper_mxc_proxy_strategies(id, 31_280);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.proxy_addr = Some(super::super::netns::proxy_bind_addr(id, 31_280));
+        config.connect_attribution = Some(ConnectAttributionStore::default());
+
+        let err = validate_mxc_network_strategy(&config, &network).unwrap_err();
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("axis-netns-helper launch"));
+        assert!(err.to_string().contains("connect-time attribution"));
+    }
+
+    #[test]
+    fn mxc_helper_launch_spec_uses_mxc_executor_contract_without_proxy_env() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let executor_path = executor.path().to_path_buf();
+        let launcher = fake_seccomp_launcher(&root);
+        let id = SandboxId::new();
+        let proxy_port = 31_280;
+        let (network, proxy) = helper_mxc_proxy_strategies(id, proxy_port);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
+        policy.process.max_processes = 17;
+        policy.process.max_memory_mb = 64;
+        policy.process.blocked_syscalls = vec!["clone3".into()];
+        let mut config = config(policy.clone(), workspace.path().into());
+        config.id = id;
+        config.proxy_port = proxy_port;
+        config.proxy_addr = Some(super::super::netns::proxy_bind_addr(id, proxy_port));
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_strategies(
+            &config,
+            executor,
+            launcher,
+            network,
+            proxy,
+            no_resource_limits_strategy(),
+        )
+        .unwrap();
+        let config_fd = 42;
+        let destroy_token =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+
+        let spec = sandbox
+            .mxc_helper_launch_spec(config_fd, None, destroy_token.clone())
+            .unwrap();
+
+        assert_eq!(
+            spec.launch_kind,
+            super::super::netns::HelperLaunchKind::MxcExecutor
+        );
+        assert_eq!(spec.mxc_config_fd, Some(config_fd));
+        assert_eq!(spec.workspace_dir, workspace.path().to_path_buf());
+        assert_eq!(spec.command, executor_path.to_string_lossy());
+        assert_eq!(
+            spec.args,
+            vec![
+                "--experimental".to_string(),
+                "--config".to_string(),
+                format!("/proc/self/fd/{config_fd}")
+            ]
+        );
+        assert_eq!(
+            spec.env,
+            vec![
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("LC_ALL".to_string(), "C".to_string())
+            ]
+        );
+        assert!(spec.env.iter().all(|(key, _)| {
+            !axis_core::sandbox_env::is_secret_env_key(key)
+                && !axis_core::sandbox_env::is_proxy_env_key(key)
+        }));
+        assert_eq!(spec.destroy_token, destroy_token);
+        assert_eq!(spec.rlimits, super::super::netns::HelperRlimits::default());
+        assert_eq!(spec.filesystem.read_only, policy.filesystem.read_only);
+        assert_eq!(spec.filesystem.read_write, policy.filesystem.read_write);
+        assert_eq!(spec.filesystem.deny, policy.filesystem.deny);
+        assert!(matches!(
+            spec.filesystem.compatibility,
+            Compatibility::HardRequirement
+        ));
+        assert_eq!(spec.process.max_processes, policy.process.max_processes);
+        assert_eq!(spec.process.max_memory_mb, policy.process.max_memory_mb);
+        assert_eq!(
+            spec.process.cpu_rate_percent,
+            policy.process.cpu_rate_percent
+        );
+        assert_eq!(spec.process.run_as_user, policy.process.run_as_user);
+        assert_eq!(
+            spec.process.blocked_syscalls,
+            policy.process.blocked_syscalls
+        );
+        assert_eq!(spec.process.timeout_sec, policy.process.timeout_sec);
     }
 
     #[test]
@@ -3743,6 +4113,88 @@ mod tests {
     }
 
     #[test]
+    fn helper_token_cleanup_clears_mxc_netns_state_when_destroy_succeeds() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+        sandbox.netns_name = Some("axis-test-helper-netns".into());
+        sandbox.netns_helper_destroy_token = Some(helper_test_token());
+        let sandbox_id = sandbox.id;
+
+        let cleanup =
+            sandbox.cleanup_netns_with_helper_token("axis-test-helper-netns", |id, token| {
+                assert_eq!(id, sandbox_id);
+                assert_eq!(token, helper_test_token());
+                Ok(())
+            });
+
+        assert!(cleanup.is_none());
+        assert!(sandbox.netns_name.is_none());
+        assert!(sandbox.netns_helper_destroy_token.is_none());
+    }
+
+    #[test]
+    fn helper_token_cleanup_accepts_mxc_helper_already_removed_state() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+        sandbox.netns_name = Some("axis-test-helper-netns".into());
+        sandbox.netns_helper_destroy_token = Some(helper_test_token());
+
+        let cleanup = sandbox.cleanup_netns_with_helper_token("axis-test-helper-netns", |_, _| {
+            Err("read helper state: No such file or directory".into())
+        });
+
+        assert!(cleanup.is_none());
+        assert!(sandbox.netns_name.is_none());
+        assert!(sandbox.netns_helper_destroy_token.is_none());
+    }
+
+    #[test]
+    fn helper_token_cleanup_preserves_mxc_retry_state_on_destroy_failure() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "exit 0");
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+        sandbox.netns_name = Some("axis-test-helper-netns".into());
+        sandbox.netns_helper_destroy_token = Some(helper_test_token());
+
+        let cleanup = sandbox
+            .cleanup_netns_with_helper_token("axis-test-helper-netns", |_, _| {
+                Err("iptables cleanup failed".into())
+            })
+            .expect("failed helper cleanup should be reported");
+
+        assert!(cleanup.contains("axis-test-helper-netns"));
+        assert!(cleanup.contains("iptables cleanup failed"));
+        assert_eq!(
+            sandbox.netns_name.as_deref(),
+            Some("axis-test-helper-netns")
+        );
+        assert_eq!(
+            sandbox.netns_helper_destroy_token.as_deref(),
+            Some(helper_test_token().as_str())
+        );
+    }
+
+    #[test]
     fn runtime_start_failure_cleans_tmpdir() {
         let root = secure_tempdir();
         let executable = root.path().join("lxc-exec");
@@ -4323,6 +4775,126 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn gated_mxc_helper_launch_reaches_proxy_and_denies_direct_bypass() {
+        if std::env::var("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH").as_deref() != Ok("1") {
+            eprintln!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 not set (test skipped)");
+            return;
+        }
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("MXC netns helper launch proof requires non-root euid (test skipped)");
+            return;
+        }
+        if !super::super::netns::helper_available() {
+            panic!(
+                "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 but {} is not an available setuid-root helper",
+                super::super::netns::helper_path().display()
+            );
+        }
+
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires python3 on PATH");
+        };
+        let baseline = Command::new(&python)
+            .arg("-c")
+            .arg("pass")
+            .status()
+            .expect("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires python3 to start");
+        assert!(
+            baseline.success(),
+            "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires a working python3"
+        );
+
+        let executor = MxcExecutor::resolve().unwrap_or_else(|err| {
+            panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires lxc-exec: {err}")
+        });
+        assert!(
+            root_owned_executable_for_test(executor.path()),
+            "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires root-owned lxc-exec, got {}",
+            executor.path().display()
+        );
+        let launcher = test_mxc_seccomp_launcher().unwrap_or_else(|err| {
+            panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires axis-seccomp-launcher: {err}")
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let proxy_port = free_tcp_port_with_adjacent_port();
+        let denied_port = proxy_port + 1;
+        let allocation = super::super::netns::proxy_netns_allocation(id, proxy_port);
+        let (network_strategy, proxy_strategy) = helper_mxc_proxy_strategies(id, proxy_port);
+        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
+        policy.process.max_processes = 0;
+        policy.process.max_memory_mb = 0;
+        policy.process.cpu_rate_percent = 0;
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.command = python.to_string_lossy().into_owned();
+        config.args = vec!["-c".into(), real_mxc_helper_proxy_probe().into()];
+        config.working_dir = Some(workspace.path().into());
+        config.capture_output = true;
+        config.timeout_sec = Some(10);
+        config.proxy_port = proxy_port;
+        config.proxy_addr = Some(allocation.proxy_addr);
+        config.env = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                "AXIS_EXPECT_PROXY_HOST".into(),
+                allocation.host_addr.to_string(),
+            ),
+            ("AXIS_EXPECT_PROXY_PORT".into(), proxy_port.to_string()),
+            ("AXIS_DENIED_HOST_PORT".into(), denied_port.to_string()),
+            (
+                "HTTPS_PROXY".into(),
+                "http://stale-proxy-with-secret".into(),
+            ),
+        ];
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_strategies(
+            &config,
+            executor,
+            launcher,
+            network_strategy,
+            proxy_strategy,
+            no_resource_limits_strategy(),
+        )
+        .unwrap();
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let helper_token = sandbox
+            .netns_helper_destroy_token
+            .clone()
+            .expect("MXC helper launch should record a destroy token");
+        let listener = TcpListener::bind((allocation.host_addr, proxy_port)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let denied_listener = TcpListener::bind((allocation.host_addr, denied_port)).unwrap();
+        denied_listener.set_nonblocking(true).unwrap();
+        assert!(
+            listener_observed_probe(&listener),
+            "host-veth proxy listener did not observe MXC helper-launched sandbox"
+        );
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+        let stderr = fs::read_to_string(workspace.path().join("stderr.log")).unwrap_or_default();
+
+        assert_eq!(code, 0, "MXC helper proxy probe failed:\n{stderr}");
+        assert!(
+            !listener_observed_probe_with_timeout(&denied_listener, Duration::from_millis(500)),
+            "host-veth denied listener observed direct non-proxy egress"
+        );
+        assert!(workspace.path().join("mxc-proxy-ok").exists());
+        assert!(sandbox.netns_name.is_none());
+        assert!(sandbox.netns_helper_destroy_token.is_none());
+        let stale_destroy = super::super::netns::destroy_netns_with_helper_token(id, &helper_token);
+        assert!(
+            stale_destroy
+                .as_ref()
+                .is_err_and(|e| super::super::netns::helper_cleanup_already_done(e)),
+            "helper state should be gone after wait, got {stale_destroy:?}"
+        );
+        sandbox.destroy().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn gated_mxc_outer_connect_attribution_records_connecting_executable_before_exec() {
         if std::env::var("AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION").as_deref() != Ok("1") {
             eprintln!(
@@ -4702,6 +5274,10 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
         sandbox.netns_cleanup_result = Some(Err("destroy failed".into()));
     }
 
+    fn helper_test_token() -> String {
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()
+    }
+
     fn fake_mxc_runtime_executor(root: &tempfile::TempDir, run_script: &str) -> MxcExecutor {
         let executable = root.path().join("lxc-exec");
         write_executable(
@@ -4841,6 +5417,36 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             }
         }
         None
+    }
+
+    fn root_owned_executable_for_test(path: &Path) -> bool {
+        if !path.is_absolute() {
+            return false;
+        }
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            let Ok(metadata) = fs::symlink_metadata(&current) else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() {
+                return false;
+            }
+            let mode = metadata.permissions().mode();
+            if current != Path::new("/") && metadata.uid() != 0 {
+                return false;
+            }
+            if mode & 0o022 != 0 {
+                return false;
+            }
+            if current == path {
+                return metadata.is_file() && mode & 0o111 != 0;
+            }
+            if !metadata.is_dir() {
+                return false;
+            }
+        }
+        false
     }
 
     fn free_tcp_port() -> u16 {
@@ -5007,6 +5613,54 @@ import pathlib
 import socket
 import sys
 import time
+
+host = os.environ["AXIS_EXPECT_PROXY_HOST"]
+port = int(os.environ["AXIS_EXPECT_PROXY_PORT"])
+denied_port = int(os.environ["AXIS_DENIED_HOST_PORT"])
+expected_proxy = f"http://{host}:{port}"
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    assert os.environ.get(key) == expected_proxy, (key, os.environ.get(key), expected_proxy)
+for key in ("NO_PROXY", "no_proxy"):
+    assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
+
+deadline = time.time() + 3
+while True:
+    try:
+        sock = socket.create_connection((host, port), 0.25)
+    except OSError:
+        if time.time() >= deadline:
+            raise
+        time.sleep(0.05)
+    else:
+        break
+sock.sendall(b"mxc-proxy-probe")
+sock.close()
+
+try:
+    denied = socket.create_connection((host, denied_port), 1)
+except OSError:
+    pass
+else:
+    denied.close()
+    print("direct non-proxy host-veth port was reachable", file=sys.stderr)
+    sys.exit(30)
+
+pathlib.Path("mxc-proxy-ok").write_text("ok")
+"#
+    }
+
+    fn real_mxc_helper_proxy_probe() -> &'static str {
+        r#"
+import os
+import pathlib
+import socket
+import sys
+import time
+
+status = pathlib.Path("/proc/self/status").read_text()
+if "NoNewPrivs:\t1" not in status:
+    print("helper-launched MXC target did not inherit no_new_privs", file=sys.stderr)
+    sys.exit(31)
 
 host = os.environ["AXIS_EXPECT_PROXY_HOST"]
 port = int(os.environ["AXIS_EXPECT_PROXY_PORT"])

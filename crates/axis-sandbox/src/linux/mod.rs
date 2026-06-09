@@ -896,6 +896,8 @@ impl LinuxSandbox {
         let destroy_token = netns::new_destroy_token();
         let helper_env = self.helper_target_env();
         let spec = netns::HelperLaunchSpec {
+            launch_kind: netns::HelperLaunchKind::DirectProcess,
+            mxc_config_fd: None,
             workspace_dir: self.config.workspace_dir.clone(),
             filesystem: self.config.policy.filesystem.clone(),
             process: self.config.policy.process.clone(),
@@ -994,6 +996,7 @@ impl LinuxSandbox {
                 spec_fd,
                 sync_write_fd,
                 cgroup_procs_fd,
+                mxc_config_fd: None,
             },
         );
 
@@ -1148,6 +1151,7 @@ struct HelperLaunchFds {
     spec_fd: i32,
     sync_write_fd: i32,
     cgroup_procs_fd: Option<i32>,
+    mxc_config_fd: Option<i32>,
 }
 
 fn configure_helper_launch_fds_for_spawn(cmd: &mut std::process::Command, fds: HelperLaunchFds) {
@@ -1159,6 +1163,7 @@ fn configure_helper_launch_fds_for_spawn(cmd: &mut std::process::Command, fds: H
                 Some(fds.spec_fd),
                 Some(fds.sync_write_fd),
                 fds.cgroup_procs_fd,
+                fds.mxc_config_fd,
             ]
             .into_iter()
             .flatten()
@@ -2959,6 +2964,7 @@ mod tests {
                 spec_fd: write_fd,
                 sync_write_fd: write_fd,
                 cgroup_procs_fd: None,
+                mxc_config_fd: None,
             },
         );
 

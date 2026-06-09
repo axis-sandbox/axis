@@ -15,7 +15,7 @@ use axis_core::policy::{FilesystemPolicy, ProcessPolicy};
 use axis_core::types::SandboxId;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::RawFd;
 use std::process::Command;
 use std::str::FromStr;
@@ -29,6 +29,8 @@ const HELPER_SYNC_OK: &str = "OK\n";
 const MAX_ACTIVE_HELPER_NETNS_PER_UID: usize = 32;
 const HELPER_PGROUP_DRAIN_TIMEOUT_MS: u64 = 500;
 const HELPER_PGROUP_DRAIN_INTERVAL_MS: u64 = 20;
+const MXC_EXECUTOR_NAME: &str = "lxc-exec";
+const MXC_HELPER_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyNetnsAllocation {
@@ -46,6 +48,10 @@ pub struct ProxyNetnsAllocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HelperLaunchSpec {
+    #[serde(default)]
+    pub launch_kind: HelperLaunchKind,
+    #[serde(default)]
+    pub mxc_config_fd: Option<RawFd>,
     pub workspace_dir: std::path::PathBuf,
     pub filesystem: FilesystemPolicy,
     pub process: ProcessPolicy,
@@ -54,6 +60,14 @@ pub(crate) struct HelperLaunchSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub destroy_token: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HelperLaunchKind {
+    #[default]
+    DirectProcess,
+    MxcExecutor,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,8 +575,15 @@ pub(crate) fn new_destroy_token() -> String {
 
 pub(crate) fn create_launch_spec_fd(spec: &HelperLaunchSpec) -> Result<RawFd, String> {
     let bytes = serde_json::to_vec(spec).map_err(|e| format!("helper launch spec: {e}"))?;
-    let name = std::ffi::CString::new("axis-netns-launch")
-        .map_err(|e| format!("helper launch memfd name: {e}"))?;
+    create_sealed_memfd("axis-netns-launch", "helper launch spec", &bytes)
+}
+
+pub(crate) fn create_mxc_config_fd(bytes: &[u8]) -> Result<RawFd, String> {
+    create_sealed_memfd("axis-mxc-config", "MXC helper config", bytes)
+}
+
+fn create_sealed_memfd(name: &str, label: &str, bytes: &[u8]) -> Result<RawFd, String> {
+    let name = std::ffi::CString::new(name).map_err(|e| format!("{label} memfd name: {e}"))?;
     let fd = unsafe {
         libc::syscall(
             libc::SYS_memfd_create,
@@ -572,17 +593,17 @@ pub(crate) fn create_launch_spec_fd(spec: &HelperLaunchSpec) -> Result<RawFd, St
     };
     if fd < 0 {
         return Err(format!(
-            "helper launch memfd_create failed: {}",
+            "{label} memfd_create failed: {}",
             std::io::Error::last_os_error()
         ));
     }
 
-    if let Err(errno) = super::write_all_fd(fd, &bytes) {
+    if let Err(errno) = super::write_all_fd(fd, bytes) {
         unsafe {
             libc::close(fd);
         }
         return Err(format!(
-            "helper launch spec write failed: {}",
+            "{label} write failed: {}",
             std::io::Error::from_raw_os_error(errno)
         ));
     }
@@ -593,10 +614,10 @@ pub(crate) fn create_launch_spec_fd(spec: &HelperLaunchSpec) -> Result<RawFd, St
         unsafe {
             libc::close(fd);
         }
-        return Err(format!("helper launch spec rewind failed: {error}"));
+        return Err(format!("{label} rewind failed: {error}"));
     }
 
-    if let Err(e) = seal_launch_spec_fd(fd) {
+    if let Err(e) = seal_memfd(fd, label) {
         unsafe {
             libc::close(fd);
         }
@@ -606,12 +627,12 @@ pub(crate) fn create_launch_spec_fd(spec: &HelperLaunchSpec) -> Result<RawFd, St
     Ok(fd)
 }
 
-fn seal_launch_spec_fd(fd: RawFd) -> Result<(), String> {
+fn seal_memfd(fd: RawFd, label: &str) -> Result<(), String> {
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     let ret = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) };
     if ret < 0 {
         Err(format!(
-            "helper launch spec seal failed: {}",
+            "{label} seal failed: {}",
             std::io::Error::last_os_error()
         ))
     } else {
@@ -997,11 +1018,11 @@ fn launch_with_helper_action(
     runner: &mut dyn CommandRunner,
 ) -> Result<(), String> {
     let spec = read_launch_spec(spec_fd)?;
-    validate_launch_spec(sandbox_id, proxy_port, &spec)?;
+    let owner = helper_owner();
+    validate_launch_spec(sandbox_id, proxy_port, owner, &spec)?;
     if let Some(fd) = cgroup_procs_fd {
         validate_cgroup_procs_fd(fd, sandbox_id)?;
     }
-    let owner = helper_owner();
     ensure_helper_launch_authorized(owner)?;
     create_helper_state(sandbox_id, owner.uid, &spec.destroy_token)?;
 
@@ -1051,8 +1072,17 @@ fn launch_with_helper_action(
     }
 
     if child == 0 {
-        let setup_result =
-            apply_helper_launch_isolation(&allocation.namespace, owner, cgroup_procs_fd, &spec);
+        let setup_result = match spec.launch_kind {
+            HelperLaunchKind::DirectProcess => {
+                apply_helper_launch_isolation(&allocation.namespace, owner, cgroup_procs_fd, &spec)
+            }
+            HelperLaunchKind::MxcExecutor => apply_mxc_helper_launch_isolation(
+                &allocation.namespace,
+                owner,
+                cgroup_procs_fd,
+                &spec,
+            ),
+        };
         if let Err(e) = setup_result {
             write_helper_error(sync_fd, &e);
             unsafe {
@@ -1074,6 +1104,9 @@ fn launch_with_helper_action(
 
     unsafe {
         libc::close(sync_fd);
+        if let Some(fd) = spec.mxc_config_fd {
+            libc::close(fd);
+        }
         if let Some(fd) = cgroup_procs_fd {
             libc::close(fd);
         }
@@ -1319,6 +1352,7 @@ fn validate_cgroup_procs_fd(fd: RawFd, sandbox_id: SandboxId) -> Result<(), Stri
 fn validate_launch_spec(
     sandbox_id: SandboxId,
     proxy_port: u16,
+    owner: HelperOwner,
     spec: &HelperLaunchSpec,
 ) -> Result<(), String> {
     if spec.command.is_empty() {
@@ -1340,6 +1374,170 @@ fn validate_launch_spec(
     {
         return Err("helper launch proxy allocation mismatch".into());
     }
+    match spec.launch_kind {
+        HelperLaunchKind::DirectProcess => {
+            if spec.mxc_config_fd.is_some() {
+                return Err("direct helper launch must not inherit an MXC config fd".into());
+            }
+            Ok(())
+        }
+        HelperLaunchKind::MxcExecutor => validate_mxc_helper_launch_spec(owner, spec),
+    }
+}
+
+fn validate_mxc_helper_launch_spec(
+    _owner: HelperOwner,
+    spec: &HelperLaunchSpec,
+) -> Result<(), String> {
+    if spec.args.len() != 3 || spec.args[0] != "--experimental" || spec.args[1] != "--config" {
+        return Err(
+            "MXC helper launch must execute lxc-exec with '--experimental --config <file>'".into(),
+        );
+    }
+    let config_fd = spec
+        .mxc_config_fd
+        .ok_or_else(|| "MXC helper launch requires a sealed config fd".to_string())?;
+    if config_fd < 3 {
+        return Err("MXC helper config fd must be an inherited fd >= 3".into());
+    }
+    let expected_config_path = format!("/proc/self/fd/{config_fd}");
+    if spec.args[2] != expected_config_path {
+        return Err(format!(
+            "MXC helper launch config path must be {expected_config_path}"
+        ));
+    }
+    validate_sealed_fd(config_fd, "MXC helper config fd")?;
+    validate_mxc_executor_path(std::path::Path::new(&spec.command))?;
+    for (key, _) in &spec.env {
+        if axis_core::sandbox_env::is_secret_env_key(key)
+            || axis_core::sandbox_env::is_proxy_env_key(key)
+        {
+            return Err(format!(
+                "MXC helper launch environment contains forbidden key '{key}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sealed_fd(fd: RawFd, label: &str) -> Result<(), String> {
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(format!(
+            "{label} must support seals: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if seals & required != required {
+        return Err(format!(
+            "{label} must be sealed against writes and size changes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_helper_executable_path(path: &std::path::Path, label: &str) -> Result<(), String> {
+    validate_helper_path_components(path, label)
+}
+
+fn validate_mxc_executor_path(path: &std::path::Path) -> Result<(), String> {
+    validate_helper_executable_path(path, "MXC executor")?;
+    if !mxc_executor_helper_path_allowed(path) {
+        return Err(format!(
+            "MXC executor path {} must be a trusted lxc-exec install path",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn mxc_executor_helper_path_allowed(path: &std::path::Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(MXC_EXECUTOR_NAME))
+        && path.parent().is_some_and(|parent| {
+            MXC_HELPER_EXECUTOR_DIRS
+                .iter()
+                .any(|dir| parent == std::path::Path::new(dir))
+        })
+}
+
+fn validate_helper_path_components(path: &std::path::Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute"));
+    }
+
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|e| format!("{label} path component {}: {e}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{label} path component {} must not be a symlink",
+                current.display()
+            ));
+        }
+
+        if current == path {
+            validate_helper_leaf(path, &metadata, label)?;
+        } else if !metadata.is_dir() {
+            return Err(format!(
+                "{label} path component {} must be a directory",
+                current.display()
+            ));
+        } else {
+            let mode = metadata.permissions().mode();
+            if current != std::path::Path::new("/") && metadata.uid() != 0 {
+                return Err(format!(
+                    "{label} path component {} must be owned by root",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 {
+                return Err(format!(
+                    "{label} path component {} must not be group- or world-writable",
+                    current.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_helper_leaf(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+    label: &str,
+) -> Result<(), String> {
+    if !metadata.is_file() {
+        return Err(format!(
+            "{label} path {} must be a regular file",
+            path.display()
+        ));
+    }
+
+    let mode = metadata.permissions().mode();
+    if metadata.uid() != 0 {
+        return Err(format!(
+            "{label} path {} must be owned by root",
+            path.display()
+        ));
+    }
+    if mode & 0o111 == 0 {
+        return Err(format!(
+            "{label} path {} must be executable",
+            path.display()
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{label} path {} must not be group- or world-writable",
+            path.display()
+        ));
+    }
+
     Ok(())
 }
 
@@ -1453,6 +1651,69 @@ fn apply_helper_launch_isolation(
             std::io::Error::from_raw_os_error(errno)
         ));
     }
+    Ok(())
+}
+
+fn apply_mxc_helper_launch_isolation(
+    namespace: &str,
+    owner: HelperOwner,
+    cgroup_procs_fd: Option<RawFd>,
+    spec: &HelperLaunchSpec,
+) -> Result<(), String> {
+    if let Some(fd) = cgroup_procs_fd {
+        if let Err(errno) = super::enter_cgroup_from_child_fd(fd) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(format!(
+                "enter cgroup failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    let netns_fd = enter_netns(namespace)?;
+    let setns_ret = unsafe { libc::setns(netns_fd, libc::CLONE_NEWNET) };
+    unsafe {
+        libc::close(netns_fd);
+    }
+    if setns_ret < 0 {
+        return Err(errno_message("enter network namespace"));
+    }
+
+    drop_to_owner(owner)?;
+
+    set_no_new_privs()?;
+    if let Err(errno) = apply_helper_rlimits(spec.rlimits) {
+        return Err(format!(
+            "apply resource limits failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    if let Err(errno) = super::drop_process_capabilities() {
+        return Err(format!(
+            "drop capabilities failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    if let Err(errno) = super::mark_unexpected_child_fds_close_on_exec() {
+        return Err(format!(
+            "mark inherited fds close-on-exec failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    if let Some(fd) = spec.mxc_config_fd
+        && let Err(errno) = super::clear_fd_cloexec(fd)
+    {
+        return Err(format!(
+            "preserve MXC config fd for exec failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+
     Ok(())
 }
 
@@ -2215,13 +2476,14 @@ mod tests {
     #[test]
     fn helper_launch_spec_validation_rejects_unsafe_or_unsupported_specs() {
         let sandbox_id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let owner = helper_owner();
         let mut spec = helper_launch_spec();
 
-        validate_launch_spec(sandbox_id, 3128, &spec).unwrap();
+        validate_launch_spec(sandbox_id, 3128, owner, &spec).unwrap();
 
         spec.command.clear();
         assert!(
-            validate_launch_spec(sandbox_id, 3128, &spec)
+            validate_launch_spec(sandbox_id, 3128, owner, &spec)
                 .unwrap_err()
                 .contains("command")
         );
@@ -2229,7 +2491,7 @@ mod tests {
         spec = helper_launch_spec();
         spec.destroy_token = "bad".into();
         assert!(
-            validate_launch_spec(sandbox_id, 3128, &spec)
+            validate_launch_spec(sandbox_id, 3128, owner, &spec)
                 .unwrap_err()
                 .contains("destroy token")
         );
@@ -2237,7 +2499,7 @@ mod tests {
         spec = helper_launch_spec();
         spec.process.run_as_user = Some("sandbox-user".into());
         assert!(
-            validate_launch_spec(sandbox_id, 3128, &spec)
+            validate_launch_spec(sandbox_id, 3128, owner, &spec)
                 .unwrap_err()
                 .contains("run_as_user")
         );
@@ -2245,10 +2507,144 @@ mod tests {
         spec = helper_launch_spec();
         spec.filesystem.read_write = vec!["{tmpdir}".into()];
         assert!(
-            validate_launch_spec(sandbox_id, 3128, &spec)
+            validate_launch_spec(sandbox_id, 3128, owner, &spec)
                 .unwrap_err()
                 .contains("{tmpdir}")
         );
+
+        spec = helper_launch_spec();
+        spec.mxc_config_fd = Some(42);
+        assert!(
+            validate_launch_spec(sandbox_id, 3128, owner, &spec)
+                .unwrap_err()
+                .contains("direct helper launch")
+        );
+    }
+
+    #[test]
+    fn mxc_helper_launch_spec_validation_requires_safe_executor_and_private_config() {
+        let sandbox_id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let owner = helper_owner();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = root.path().join("lxc-exec");
+        std::fs::write(&executor, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_fd = create_mxc_config_fd(b"{}").unwrap();
+        let mut spec = helper_launch_spec();
+        spec.launch_kind = HelperLaunchKind::MxcExecutor;
+        spec.mxc_config_fd = Some(config_fd);
+        spec.command = executor.to_string_lossy().into_owned();
+        spec.args = vec![
+            "--experimental".into(),
+            "--config".into(),
+            format!("/proc/self/fd/{config_fd}"),
+        ];
+        spec.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+
+        let owner_executable_error = validate_launch_spec(sandbox_id, 3128, owner, &spec)
+            .expect_err("owner-controlled MXC executor must be rejected");
+        assert!(
+            owner_executable_error.contains("owned by root")
+                || owner_executable_error.contains("group- or world-writable"),
+            "unexpected owner executable error: {owner_executable_error}"
+        );
+
+        let root_non_mxc_executor = std::path::Path::new("/usr/bin/true");
+        if safe_root_executable(root_non_mxc_executor) {
+            spec.command = root_non_mxc_executor.to_string_lossy().into_owned();
+            assert!(
+                validate_launch_spec(sandbox_id, 3128, owner, &spec)
+                    .unwrap_err()
+                    .contains("trusted lxc-exec")
+            );
+        }
+
+        let root_executor = MXC_HELPER_EXECUTOR_DIRS
+            .iter()
+            .map(|dir| std::path::Path::new(dir).join(MXC_EXECUTOR_NAME))
+            .find(|path| safe_root_executable(path));
+        let Some(root_executor) = root_executor else {
+            eprintln!("root-owned lxc-exec unavailable (test remainder skipped)");
+            unsafe {
+                libc::close(config_fd);
+            }
+            return;
+        };
+        spec.command = root_executor.to_string_lossy().into_owned();
+        validate_launch_spec(sandbox_id, 3128, owner, &spec).unwrap();
+
+        let mut bad_args = spec.clone();
+        bad_args.args = vec![format!("/proc/self/fd/{config_fd}")];
+        assert!(
+            validate_launch_spec(sandbox_id, 3128, owner, &bad_args)
+                .unwrap_err()
+                .contains("--experimental --config")
+        );
+
+        let mut bad_config_path = spec.clone();
+        bad_config_path.args[2] = format!("/proc/self/fd/{}", config_fd + 1);
+        assert!(
+            validate_launch_spec(sandbox_id, 3128, owner, &bad_config_path)
+                .unwrap_err()
+                .contains("config path")
+        );
+
+        let mut missing_config_fd = spec.clone();
+        missing_config_fd.mxc_config_fd = None;
+        assert!(
+            validate_launch_spec(sandbox_id, 3128, owner, &missing_config_fd)
+                .unwrap_err()
+                .contains("sealed config fd")
+        );
+
+        let (unsealed_read_fd, unsealed_write_fd) = test_pipe();
+        let mut unsealed_config = spec.clone();
+        unsealed_config.mxc_config_fd = Some(unsealed_read_fd);
+        unsealed_config.args[2] = format!("/proc/self/fd/{unsealed_read_fd}");
+        assert!(
+            validate_launch_spec(sandbox_id, 3128, owner, &unsealed_config)
+                .unwrap_err()
+                .contains("must support seals")
+        );
+        unsafe {
+            libc::close(unsealed_read_fd);
+            libc::close(unsealed_write_fd);
+        }
+
+        let mut bad_env = spec.clone();
+        bad_env.env = vec![("HTTPS_PROXY".into(), "http://proxy-with-creds".into())];
+        assert!(
+            validate_launch_spec(sandbox_id, 3128, owner, &bad_env)
+                .unwrap_err()
+                .contains("forbidden key")
+        );
+
+        unsafe {
+            libc::close(config_fd);
+        }
+    }
+
+    #[test]
+    fn mxc_helper_executor_path_allowlist_requires_lxc_exec_in_stable_dirs() {
+        assert!(mxc_executor_helper_path_allowed(std::path::Path::new(
+            "/usr/local/bin/lxc-exec"
+        )));
+        assert!(mxc_executor_helper_path_allowed(std::path::Path::new(
+            "/usr/bin/lxc-exec"
+        )));
+        assert!(mxc_executor_helper_path_allowed(std::path::Path::new(
+            "/bin/lxc-exec"
+        )));
+        assert!(!mxc_executor_helper_path_allowed(std::path::Path::new(
+            "/usr/bin/true"
+        )));
+        assert!(!mxc_executor_helper_path_allowed(std::path::Path::new(
+            "/opt/axis/bin/lxc-exec"
+        )));
+        assert!(!mxc_executor_helper_path_allowed(std::path::Path::new(
+            "lxc-exec"
+        )));
     }
 
     #[test]
@@ -2321,6 +2717,27 @@ mod tests {
             validate_helper_launch_authorization(0, 0)
                 .unwrap_err()
                 .contains("non-root real UID")
+        );
+    }
+
+    #[test]
+    fn helper_no_new_privs_setup_sets_sticky_exec_boundary_in_child() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let ok = set_no_new_privs().is_ok()
+                && unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 1;
+            unsafe {
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child did not set no_new_privs: status={status}"
         );
     }
 
@@ -3049,6 +3466,8 @@ mod tests {
 
     fn helper_launch_spec() -> HelperLaunchSpec {
         HelperLaunchSpec {
+            launch_kind: HelperLaunchKind::DirectProcess,
+            mxc_config_fd: None,
             workspace_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
             filesystem: FilesystemPolicy::default(),
             process: ProcessPolicy {
