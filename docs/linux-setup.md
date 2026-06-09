@@ -1,7 +1,9 @@
 # Linux Setup And Operations
 
 This page describes the Linux behavior shipped by the current source tree.
-Linux sandboxing is direct process execution, not Docker or a VM.
+It is a platform mapping for the shared
+[AXIS Isolation Contract](axis-isolation-contract.md). Linux sandboxing is
+direct process execution, not Docker or a VM.
 
 ## Quickstart
 

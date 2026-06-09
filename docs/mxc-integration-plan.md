@@ -5,7 +5,8 @@
 This is the current plan for integrating Microsoft Execution Containers (MXC)
 as a selectable AXIS containment substrate. It defines the capability model,
 backend coverage, verification requirements, and packaging constraints needed
-for cross-platform backend support.
+for cross-platform backend support. The normative policy semantics are defined
+in [AXIS Isolation Contract](axis-isolation-contract.md).
 
 ## Purpose
 
@@ -100,7 +101,9 @@ clear skips, and keep root-required setup in repeatable CI paths.
 
 ### Contract Structure
 
-The contract model should be structured as:
+The shared policy contract is defined in
+[AXIS Isolation Contract](axis-isolation-contract.md). Backend and platform
+work should be structured as:
 
 - a cross-platform AXIS isolation contract that defines shared policy
   semantics, lifecycle invariants, credential rules, fail-closed behavior, and
@@ -196,7 +199,8 @@ backend:
 - stateful lifecycle support;
 - cleanup responsibilities.
 
-The planner should produce one of these outcomes for every policy/backend pair:
+The planner should produce the contract-defined outcome for every
+policy/backend pair:
 
 | Outcome | Meaning |
 | --- | --- |
