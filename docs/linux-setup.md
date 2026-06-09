@@ -82,7 +82,28 @@ setuid-root helper at:
 ```
 
 The helper is not part of the quickstart requirement. Ordinary local tests and
-block-mode use do not depend on it.
+block-mode use do not depend on it. Linux `.deb` and `.rpm` packages install the
+helper as root-owned setuid content so normal `axis run` invocations can request
+proxy mode without runtime sudo. The curl installer keeps the default no-admin
+path, but can install the helper explicitly:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh \
+  | sh -s -- --with-netns-helper
+```
+
+Advanced users can instead grant `CAP_NET_ADMIN` to root-owned `axis` and
+`axisd` binaries:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh \
+  | sh -s -- --with-cap-net-admin --prefix /usr/local/bin
+```
+
+The helper path is preferred because it confines privilege to the narrow network
+setup binary. Granting capabilities to `axis` and `axisd` broadens the privilege
+held by the main runtime and should be used only on hosts where that tradeoff is
+acceptable.
 
 For source-tree validation, do not install a manual host helper and then
 treat that as test coverage. The repo-owned privileged proof is:

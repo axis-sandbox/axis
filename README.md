@@ -25,6 +25,9 @@ In proxy mode, every network request goes through a policy-evaluated proxy. The 
 ```bash
 # Linux / macOS
 curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh
+
+# Linux proxy-mode helper, optional and privileged
+curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh -s -- --with-netns-helper
 ```
 
 ```powershell
@@ -44,6 +47,12 @@ cargo install --path crates/axis-daemon
 sudo dpkg -i axis_0.1.0_amd64.deb    # Debian/Ubuntu
 sudo rpm -i axis-0.1.0-1.x86_64.rpm  # Fedora/RHEL
 ```
+
+Linux packages install the optional netns helper used by stronger proxy-mode
+policies. The curl installer keeps the default no-admin path unless
+`--with-netns-helper` is requested. Advanced Linux users may choose
+`--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
+narrower privileged path.
 
 When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon`
 is enough for the local no-admin Linux quickstart and e2e tests.

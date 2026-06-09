@@ -50,6 +50,9 @@ jobs:
           mkdir -p dist/axis-${{ matrix.platform }}
           cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
           cp target/${{ matrix.target }}/release/axisd dist/axis-${{ matrix.platform }}/
+          if [ "${{ matrix.platform }}" = "linux-x86_64" ]; then
+            cp target/${{ matrix.target }}/release/axis-netns-helper dist/axis-${{ matrix.platform }}/
+          fi
           cp policies/*.yaml dist/axis-${{ matrix.platform }}/
           cp README.md LICENSE dist/axis-${{ matrix.platform }}/
           cd dist

@@ -54,6 +54,9 @@ jobs:
           mkdir -p dist/axis-${{ matrix.platform }}
           cp target/${{ matrix.target }}/release/axis dist/axis-${{ matrix.platform }}/
           cp target/${{ matrix.target }}/release/axisd dist/axis-${{ matrix.platform }}/
+          if [ "${{ matrix.platform }}" = "linux-x86_64" ]; then
+            cp target/${{ matrix.target }}/release/axis-netns-helper dist/axis-${{ matrix.platform }}/
+          fi
           cp policies/*.yaml dist/axis-${{ matrix.platform }}/
           cp LICENSE dist/axis-${{ matrix.platform }}/
           cd dist && tar czf axis-${{ matrix.platform }}.tar.gz axis-${{ matrix.platform }}/
@@ -96,7 +99,7 @@ jobs:
             Built: ${{ github.event.head_commit.timestamp || 'manual' }}
             Commit: ${{ github.sha }}
 
-            Install: `curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh -s -- --nightly`
+            Install: `curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh -s -- --nightly`
           prerelease: true
           files: |
             artifacts/**/*.tar.gz

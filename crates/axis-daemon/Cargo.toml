@@ -16,6 +16,7 @@ priority = "optional"
 assets = [
     ["target/release/axis", "usr/bin/", "755"],
     ["target/release/axisd", "usr/bin/", "755"],
+    ["target/release/axis-netns-helper", "usr/libexec/axis/", "4755"],
     ["../../dist/axis.service", "lib/systemd/system/", "644"],
     ["../../policies/minimal.yaml", "etc/axis/policies/", "644"],
     ["../../policies/coding-agent.yaml", "etc/axis/policies/", "644"],
@@ -27,6 +28,7 @@ conf-files = ["/etc/axis/policies/"]
 assets = [
     { source = "target/release/axis", dest = "/usr/bin/axis", mode = "755" },
     { source = "target/release/axisd", dest = "/usr/bin/axisd", mode = "755" },
+    { source = "target/release/axis-netns-helper", dest = "/usr/libexec/axis/axis-netns-helper", mode = "4755" },
     { source = "dist/axis.service", dest = "/lib/systemd/system/axis.service", mode = "644" },
 ]
 
