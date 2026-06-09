@@ -21,6 +21,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -355,6 +356,7 @@ pub(crate) struct MxcLinuxSandbox {
     id: SandboxId,
     spec: MxcExecutionSpec,
     executor: MxcExecutor,
+    resolved_identity: Option<super::identity::ResolvedIdentity>,
     process_policy: axis_core::policy::ProcessPolicy,
     filesystem_policy: axis_core::policy::FilesystemPolicy,
     network_strategy: super::strategy::NetworkStrategy,
@@ -481,11 +483,23 @@ impl MxcLinuxSandbox {
         >,
         I: FnOnce() -> Result<super::strategy::ResourceStrategy, SandboxError>,
     {
+        let resolved_identity = resolve_mxc_identity(&config.policy.process)?;
         let (network_strategy, proxy_strategy) = resolve_network()?;
         let resource_strategy = resolve_resources()?;
         let notify_connect = mxc_connect_attribution_required(config, &network_strategy)?;
         let mut tmpdir_active = false;
-        if super::landlock::policy_uses_tmpdir(&config.policy.filesystem) {
+        let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
+        if let Some(identity) = &resolved_identity {
+            super::identity::prepare_workspace_for_identity(&config.workspace_dir, identity)
+                .map_err(|err| SandboxError::IsolationFailed(format!("MXC run_as_user: {err}")))?;
+            if tmpdir_required {
+                super::identity::create_tmpdir_for_identity(&config.workspace_dir, identity)
+                    .map_err(|err| {
+                        SandboxError::IsolationFailed(format!("MXC run_as_user: {err}"))
+                    })?;
+                tmpdir_active = true;
+            }
+        } else if tmpdir_required {
             super::landlock::create_tmpdir(&config.workspace_dir)
                 .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))?;
             tmpdir_active = true;
@@ -514,6 +528,13 @@ impl MxcLinuxSandbox {
                     append_cleanup_failure(err, cleanup_error)
                 },
             )?;
+        if let Some(identity) = &resolved_identity {
+            prepare_seccomp_filter_for_identity(&seccomp_filter_file, identity).map_err(|err| {
+                let cleanup_error =
+                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                append_cleanup_failure(err, cleanup_error)
+            })?;
+        }
         let executor = resolve_executor().map_err(|err| {
             let cleanup_error =
                 cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
@@ -537,6 +558,7 @@ impl MxcLinuxSandbox {
             id: config.id,
             spec,
             executor,
+            resolved_identity,
             process_policy: config.policy.process.clone(),
             filesystem_policy: config.policy.filesystem.clone(),
             network_strategy,
@@ -734,7 +756,7 @@ fn resolve_mxc_resource_strategy(
             fallback.reason
         );
     }
-    validate_mxc_resource_strategy(&resources)?;
+    validate_mxc_resource_strategy(policy, &resources)?;
     Ok(resources)
 }
 
@@ -845,16 +867,30 @@ fn mxc_connect_attribution_required(
     }
 }
 
+fn resolve_mxc_identity(
+    policy: &axis_core::policy::ProcessPolicy,
+) -> Result<Option<super::identity::ResolvedIdentity>, SandboxError> {
+    let Some(username) = &policy.run_as_user else {
+        return Ok(None);
+    };
+
+    super::identity::resolve_run_as_user(username, &super::identity::SystemUserLookup)
+        .map(Some)
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC run_as_user: {err}")))
+}
+
 fn validate_mxc_resource_strategy(
+    policy: &axis_core::policy::ProcessPolicy,
     resources: &super::strategy::ResourceStrategy,
 ) -> Result<(), SandboxError> {
     if let super::strategy::ResourceStrategy::RlimitFallback {
         process_limit: super::strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser,
         ..
     } = resources
+        && policy.run_as_user.is_none()
     {
         return Err(SandboxError::IsolationFailed(
-            "MXC Linux resources: process-count rlimit fallback requires a safe MXC run_as_user path; writable cgroups v2 are required for process limits on the current MXC backend"
+            "MXC Linux resources: process-count rlimit fallback requires a configured dedicated run_as_user"
                 .into(),
         ));
     }
@@ -1032,11 +1068,20 @@ impl SandboxImpl for MxcLinuxSandbox {
             None
         };
 
+        let config_fd = match sealed_mxc_config_fd(&config) {
+            Ok(fd) => fd,
+            Err(err) => {
+                super::close_fd(cgroup_procs_fd);
+                return Err(self.cleanup_for_start_failure_with_netns_fd(netns_fd, err));
+            }
+        };
+        let config_path = format!("/proc/self/fd/{config_fd}");
+
         let mut command = Command::new(self.executor.path());
         command
             .arg("--experimental")
             .arg("--config")
-            .arg(config.path())
+            .arg(&config_path)
             .current_dir(&self.workspace_dir)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -1047,6 +1092,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             let stdout = match File::create(self.workspace_dir.join("stdout.log")) {
                 Ok(stdout) => stdout,
                 Err(err) => {
+                    super::close_fd(Some(config_fd));
                     super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure_with_netns_fd(
                         netns_fd,
@@ -1057,6 +1103,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             let stderr = match File::create(self.workspace_dir.join("stderr.log")) {
                 Ok(stderr) => stderr,
                 Err(err) => {
+                    super::close_fd(Some(config_fd));
                     super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure_with_netns_fd(
                         netns_fd,
@@ -1071,6 +1118,7 @@ impl SandboxImpl for MxcLinuxSandbox {
         let mut child_error_pipe = match super::ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
             Err(err) => {
+                super::close_fd(Some(config_fd));
                 super::close_fd(cgroup_procs_fd);
                 return Err(self.cleanup_for_start_failure_with_netns_fd(
                     netns_fd,
@@ -1079,6 +1127,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             }
         };
         let child_error_write_fd = child_error_pipe.write_fd;
+        let resolved_identity = self.resolved_identity.clone();
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) < 0 {
@@ -1108,6 +1157,39 @@ impl SandboxImpl for MxcLinuxSandbox {
                         return Err(super::child_setup_error(
                             child_error_write_fd,
                             super::ChildSetupErrorKind::EnterNetworkNamespace,
+                            super::current_errno(),
+                        ));
+                    }
+                }
+
+                if let Err(errno) = set_no_new_privs_for_mxc_run_as_user(resolved_identity.as_ref())
+                {
+                    return Err(super::child_setup_error(
+                        child_error_write_fd,
+                        super::ChildSetupErrorKind::NoNewPrivs,
+                        errno,
+                    ));
+                }
+
+                if let Some(identity) = &resolved_identity {
+                    if libc::setgroups(0, std::ptr::null()) < 0 {
+                        return Err(super::child_setup_error(
+                            child_error_write_fd,
+                            super::ChildSetupErrorKind::SetGroups,
+                            super::current_errno(),
+                        ));
+                    }
+                    if libc::setgid(identity.gid) < 0 {
+                        return Err(super::child_setup_error(
+                            child_error_write_fd,
+                            super::ChildSetupErrorKind::SetGid,
+                            super::current_errno(),
+                        ));
+                    }
+                    if libc::setuid(identity.uid) < 0 {
+                        return Err(super::child_setup_error(
+                            child_error_write_fd,
+                            super::ChildSetupErrorKind::SetUid,
                             super::current_errno(),
                         ));
                     }
@@ -1182,6 +1264,13 @@ impl SandboxImpl for MxcLinuxSandbox {
                         errno,
                     ));
                 }
+                if let Err(errno) = super::clear_fd_cloexec(config_fd) {
+                    return Err(super::child_setup_error(
+                        child_error_write_fd,
+                        super::ChildSetupErrorKind::CloseFileDescriptors,
+                        errno,
+                    ));
+                }
 
                 Ok(())
             });
@@ -1191,6 +1280,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             Ok(child) => {
                 super::close_fd(netns_fd);
                 super::close_fd(cgroup_procs_fd);
+                super::close_fd(Some(config_fd));
                 if let Some(pair) = seccomp_listener_pair.as_mut() {
                     pair.close_child_in_parent();
                 }
@@ -1198,6 +1288,7 @@ impl SandboxImpl for MxcLinuxSandbox {
                 child
             }
             Err(err) => {
+                super::close_fd(Some(config_fd));
                 super::close_fd(cgroup_procs_fd);
                 let err = match super::spawn_error(err, &mut child_error_pipe) {
                     SandboxError::IsolationFailed(message) => {
@@ -1563,7 +1654,42 @@ fn sealed_mxc_config_fd(config: &tempfile::NamedTempFile) -> Result<i32, Sandbox
         SandboxError::IsolationFailed(format!("MXC helper config read failed: {err}"))
     })?;
     super::netns::create_mxc_config_fd(&bytes)
-        .map_err(|err| SandboxError::IsolationFailed(format!("MXC helper config seal: {err}")))
+        .and_then(ensure_mxc_config_fd_above_stdio)
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC config seal: {err}")))
+}
+
+fn ensure_mxc_config_fd_above_stdio(fd: i32) -> Result<i32, String> {
+    if fd >= 3 {
+        return Ok(fd);
+    }
+
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    unsafe {
+        libc::close(fd);
+    }
+    if duplicated < 0 {
+        Err(format!(
+            "MXC config fd duplicate failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(duplicated)
+    }
+}
+
+fn set_no_new_privs_for_mxc_run_as_user(
+    identity: Option<&super::identity::ResolvedIdentity>,
+) -> Result<(), i32> {
+    if identity.is_none() {
+        return Ok(());
+    }
+
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret < 0 {
+        Err(super::current_errno())
+    } else {
+        Ok(())
+    }
 }
 
 impl MxcExecutionSpec {
@@ -1917,6 +2043,74 @@ fn write_private_seccomp_filter(
         .set_permissions(fs::Permissions::from_mode(0o400))
         .map_err(|err| SandboxError::IsolationFailed(format!("MXC seccomp filter: {err}")))?;
     Ok(file)
+}
+
+fn prepare_seccomp_filter_for_identity(
+    file: &tempfile::NamedTempFile,
+    identity: &super::identity::ResolvedIdentity,
+) -> Result<(), SandboxError> {
+    let fd = file.as_file().as_raw_fd();
+    let mut stat = fstat_seccomp_filter(fd, identity, "before ownership update")?;
+    if stat.st_uid != identity.uid || stat.st_gid != identity.gid {
+        let chown_ret = unsafe { libc::fchown(fd, identity.uid, identity.gid) };
+        if chown_ret < 0 {
+            return Err(SandboxError::IsolationFailed(format!(
+                "MXC seccomp filter: cannot assign private filter to run_as_user '{}': {}",
+                identity.username,
+                std::io::Error::last_os_error()
+            )));
+        }
+        stat = fstat_seccomp_filter(fd, identity, "after ownership update")?;
+    }
+
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC seccomp filter: private filter must be a regular file for run_as_user '{}'",
+            identity.username
+        )));
+    }
+
+    let chmod_ret = unsafe { libc::fchmod(fd, 0o400) };
+    if chmod_ret < 0 {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC seccomp filter: cannot restrict private filter for run_as_user '{}': {}",
+            identity.username,
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let stat = fstat_seccomp_filter(fd, identity, "after permission update")?;
+    if stat.st_uid != identity.uid || stat.st_gid != identity.gid {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC seccomp filter: private filter is owned by {}:{}, expected {}:{} for run_as_user '{}'",
+            stat.st_uid, stat.st_gid, identity.uid, identity.gid, identity.username
+        )));
+    }
+    if stat.st_mode & 0o777 != 0o400 {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC seccomp filter: private filter mode is {:o}, expected 400 for run_as_user '{}'",
+            stat.st_mode & 0o777,
+            identity.username
+        )));
+    }
+    Ok(())
+}
+
+fn fstat_seccomp_filter(
+    fd: i32,
+    identity: &super::identity::ResolvedIdentity,
+    phase: &str,
+) -> Result<libc::stat, SandboxError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let stat_ret = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if stat_ret < 0 {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC seccomp filter: cannot verify private filter {phase} for run_as_user '{}': {}",
+            identity.username,
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(unsafe { stat.assume_init() })
 }
 
 fn seccomp_launcher_command_line(
@@ -3683,6 +3877,126 @@ mod tests {
         assert!(err.to_string().contains("covered by denied path"));
     }
 
+    #[test]
+    fn run_as_user_rejects_missing_and_root_users_before_support_resolution() {
+        for (username, expected) in [
+            ("root", "must not resolve to UID or GID 0"),
+            ("axis-definitely-missing-run-as-user", "does not exist"),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut policy = mxc_representable_policy(NetworkMode::Allow);
+            policy.process.run_as_user = Some(username.into());
+            let config = config(policy, workspace.path().into());
+
+            let result = MxcLinuxSandbox::new_with_resolvers(
+                &config,
+                || panic!("executor must not be resolved after invalid run_as_user"),
+                || panic!("seccomp launcher must not be resolved after invalid run_as_user"),
+                || panic!("network strategy must not be resolved after invalid run_as_user"),
+                || panic!("resource strategy must not be resolved after invalid run_as_user"),
+            );
+            let Err(err) = result else {
+                panic!("expected invalid run_as_user '{username}' to fail");
+            };
+
+            assert!(matches!(err, SandboxError::IsolationFailed(_)));
+            assert!(err.to_string().contains("MXC run_as_user"));
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {username}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_filter_for_identity_is_owner_private() {
+        let mut filter = tempfile::NamedTempFile::new().unwrap();
+        filter.write_all(b"filter").unwrap();
+        filter.flush().unwrap();
+        filter
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let identity = super::super::identity::ResolvedIdentity {
+            username: "current-user".into(),
+            uid: super::super::identity::current_euid(),
+            gid: super::super::identity::current_egid(),
+            home: None,
+        };
+
+        prepare_seccomp_filter_for_identity(&filter, &identity).unwrap();
+
+        let metadata = filter.as_file().metadata().unwrap();
+        assert_eq!(metadata.uid(), identity.uid);
+        assert_eq!(metadata.gid(), identity.gid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+    }
+
+    #[test]
+    fn sealed_mxc_config_fd_avoids_stdio_slots_when_stdio_is_closed() {
+        let mut config = tempfile::NamedTempFile::new().unwrap();
+        config.write_all(b"{}").unwrap();
+        config.flush().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(0);
+                libc::close(1);
+                libc::close(2);
+            }
+            let ok = match sealed_mxc_config_fd(&config) {
+                Ok(fd) => {
+                    let ok = fd >= 3;
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    ok
+                }
+                Err(_) => false,
+            };
+            unsafe {
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "sealed config fd was not duplicated above stdio: status={status}"
+        );
+    }
+
+    #[test]
+    fn mxc_run_as_user_exec_boundary_sets_no_new_privs() {
+        let identity = super::super::identity::ResolvedIdentity {
+            username: "current-user".into(),
+            uid: super::super::identity::current_euid(),
+            gid: super::super::identity::current_egid(),
+            home: None,
+        };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            let ok = set_no_new_privs_for_mxc_run_as_user(Some(&identity)).is_ok()
+                && unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 1;
+            unsafe {
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "MXC run_as_user child did not set no_new_privs: status={status}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn runtime_captures_output_exit_code_and_removes_private_config() {
         let root = secure_tempdir();
@@ -3746,13 +4060,138 @@ mod tests {
         );
         let config_path = fs::read_to_string(config_path_record).unwrap();
         assert!(
-            !Path::new(config_path.trim()).exists(),
-            "private MXC config file should be removed after wait"
+            config_path.trim().starts_with("/proc/self/fd/"),
+            "runtime MXC config should be passed by inherited fd, got {config_path:?}"
         );
+        assert!(sandbox.config_file.is_none());
         let config_json = fs::read_to_string(config_copy).unwrap();
         assert!(!config_json.contains("ANTHROPIC_API_KEY"));
         assert!(!config_json.contains("proxy-with-creds"));
         assert!(!config_json.contains("secret"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_runtime_run_as_user_applies_identity_before_process_rlimit() {
+        if super::super::identity::current_euid() != 0 {
+            eprintln!("MXC run_as_user runtime test requires euid 0 (test skipped)");
+            return;
+        }
+        let Ok(username) = std::env::var("AXIS_TEST_RUN_AS_USER") else {
+            eprintln!("AXIS_TEST_RUN_AS_USER not set (test skipped)");
+            return;
+        };
+        let target = match super::super::identity::resolve_run_as_user(
+            &username,
+            &super::super::identity::SystemUserLookup,
+        ) {
+            Ok(identity) => identity,
+            Err(err) => {
+                eprintln!("cannot use AXIS_TEST_RUN_AS_USER='{username}': {err} (test skipped)");
+                return;
+            }
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = root.path().join("lxc-exec");
+        let workspace = tempfile::tempdir().unwrap();
+        let config_copy = workspace.path().join("run-config-copy");
+        let uid_path = workspace.path().join("uid");
+        let gid_path = workspace.path().join("gid");
+        let limits_path = workspace.path().join("limits");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   cat \"$config\" >/dev/null\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 cat \"$config\" > {}\n\
+                 id -u > {}\n\
+                 id -g > {}\n\
+                 cat /proc/self/limits > {}\n",
+                MXC_DRY_RUN_SUCCESS,
+                shell_quote_path(&config_copy),
+                shell_quote_path(&uid_path),
+                shell_quote_path(&gid_path),
+                shell_quote_path(&limits_path),
+            ),
+            0o755,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let mut policy = mxc_representable_policy(NetworkMode::Allow);
+        policy.process.run_as_user = Some(username);
+        policy.process.max_processes = 4096;
+        policy.process.max_memory_mb = 0;
+        policy.process.cpu_rate_percent = 0;
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let mut config = config(policy, workspace.path().into());
+        config.capture_output = false;
+        let resource_strategy = strategy::ResourceStrategy::RlimitFallback {
+            memory_limit: false,
+            process_limit: strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser,
+            cpu_limit: strategy::CpuLimitFallback::NotRequested,
+        };
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor_and_resource_strategy(
+            &config,
+            executor,
+            launcher,
+            resource_strategy,
+        )
+        .unwrap();
+        let workspace_metadata = fs::metadata(workspace.path()).unwrap();
+        assert_eq!(workspace_metadata.uid(), target.uid);
+        assert_eq!(workspace_metadata.gid(), target.gid);
+        let tmpdir_metadata =
+            fs::metadata(super::super::landlock::sandbox_tmpdir(workspace.path())).unwrap();
+        assert_eq!(tmpdir_metadata.uid(), target.uid);
+        assert_eq!(tmpdir_metadata.gid(), target.gid);
+        let filter_metadata = sandbox
+            .seccomp_filter_file
+            .as_ref()
+            .unwrap()
+            .as_file()
+            .metadata()
+            .unwrap();
+        assert_eq!(filter_metadata.uid(), target.uid);
+        assert_eq!(filter_metadata.gid(), target.gid);
+        assert_eq!(filter_metadata.permissions().mode() & 0o777, 0o400);
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            fs::read_to_string(uid_path).unwrap().trim(),
+            target.uid.to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(gid_path).unwrap().trim(),
+            target.gid.to_string()
+        );
+        let limits = fs::read_to_string(limits_path).unwrap();
+        let max_processes = limits
+            .lines()
+            .find(|line| line.starts_with("Max processes"))
+            .expect("process limits should include Max processes");
+        assert!(
+            max_processes.split_whitespace().any(|part| part == "4096"),
+            "RLIMIT_NPROC should be lowered for the target user: {max_processes}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4234,25 +4673,28 @@ mod tests {
     }
 
     #[test]
-    fn resource_strategy_rejects_process_rlimit_fallback_for_mxc() {
+    fn resource_strategy_allows_process_rlimit_fallback_only_with_run_as_user() {
         let process_fallback = strategy::ResourceStrategy::RlimitFallback {
             memory_limit: true,
             process_limit: strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser,
             cpu_limit: strategy::CpuLimitFallback::NotRequested,
         };
+        let mut policy = ProcessPolicy::default();
 
-        let err = validate_mxc_resource_strategy(&process_fallback).unwrap_err();
+        let err = validate_mxc_resource_strategy(&policy, &process_fallback).unwrap_err();
 
         assert!(matches!(err, SandboxError::IsolationFailed(_)));
-        assert!(err.to_string().contains("process-count rlimit fallback"));
-        assert!(err.to_string().contains("writable cgroups v2"));
+        assert!(err.to_string().contains("dedicated run_as_user"));
+
+        policy.run_as_user = Some("sandbox-user".into());
+        validate_mxc_resource_strategy(&policy, &process_fallback).unwrap();
 
         let memory_only = strategy::ResourceStrategy::RlimitFallback {
             memory_limit: true,
             process_limit: strategy::ProcessLimitFallback::NotRequested,
             cpu_limit: strategy::CpuLimitFallback::NotRequested,
         };
-        validate_mxc_resource_strategy(&memory_only).unwrap();
+        validate_mxc_resource_strategy(&ProcessPolicy::default(), &memory_only).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
