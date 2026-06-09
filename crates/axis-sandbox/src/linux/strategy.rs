@@ -230,6 +230,28 @@ pub(crate) fn plan_resource_strategy(
     Ok((resources, fallbacks))
 }
 
+pub(crate) fn build_strict_proxy_strategy(
+    policy: &Policy,
+    sandbox_id: SandboxId,
+    proxy_port: u16,
+    proxy_addr: Option<SocketAddr>,
+) -> Result<(NetworkStrategy, ProxyStrategy), StrategyError> {
+    let probe = DefaultCapabilityProbe;
+    plan_strict_proxy_strategy(policy, sandbox_id, proxy_port, proxy_addr, &probe)
+}
+
+pub(crate) fn plan_strict_proxy_strategy(
+    policy: &Policy,
+    sandbox_id: SandboxId,
+    proxy_port: u16,
+    proxy_addr: Option<SocketAddr>,
+    probe: &dyn CapabilityProbe,
+) -> Result<(NetworkStrategy, ProxyStrategy), StrategyError> {
+    let caps = probe.snapshot();
+    let proxy_addr = validate_proxy_bind(sandbox_id, proxy_port, proxy_addr)?;
+    plan_strict_proxy_network(policy, sandbox_id, proxy_addr, &caps)
+}
+
 pub(crate) fn plan_with_probe(
     policy: &Policy,
     sandbox_id: SandboxId,
@@ -353,64 +375,73 @@ fn plan_network(
                 ));
             }
 
-            let firewall = selected_firewall(caps);
-            if caps.cap_net_admin && caps.ip && firewall.is_some() {
-                return Ok(proxy_plan(
-                    sandbox_id,
-                    ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
-                    firewall,
-                    proxy_addr,
-                ));
-            }
-
-            if caps.cap_net_admin && caps.ip && caps.nft {
-                return Err(StrategyError::new(
-                    "network",
-                    "nft is available but Linux proxy setup currently requires iptables",
-                ));
-            }
-
-            if caps.netns_helper {
-                if policy.process.run_as_user.is_some() {
-                    return Err(StrategyError::new(
-                        "network",
-                        "axis-netns-helper proxy setup with run_as_user is not implemented yet",
-                    ));
-                }
-                if super::landlock::policy_uses_tmpdir(&policy.filesystem) {
-                    return Err(StrategyError::new(
-                        "network",
-                        "axis-netns-helper proxy setup with {tmpdir} filesystem policy is not implemented yet",
-                    ));
-                }
-                return Ok(proxy_plan(
-                    sandbox_id,
-                    ProxyNetworkSetup::AxisNetnsHelperLaunch,
-                    Some(FirewallTool::Iptables),
-                    proxy_addr,
-                ));
-            }
-
-            if caps.unprivileged_userns && caps.ip && firewall.is_some() {
-                return Err(StrategyError::new(
-                    "network",
-                    "unprivileged user namespace proxy setup is not implemented yet",
-                ));
-            }
-
-            if caps.bubblewrap {
-                return Err(StrategyError::new(
-                    "network",
-                    "bubblewrap is available only as a block-mode fallback until proxy reachability is implemented",
-                ));
-            }
-
-            Err(StrategyError::new(
-                "network",
-                "proxy mode requires CAP_NET_ADMIN with ip/firewall tooling, axis-netns-helper, or unprivileged user namespace support",
-            ))
+            plan_strict_proxy_network(policy, sandbox_id, proxy_addr, caps)
         }
     }
+}
+
+fn plan_strict_proxy_network(
+    policy: &Policy,
+    sandbox_id: SandboxId,
+    proxy_addr: SocketAddr,
+    caps: &CapabilitySnapshot,
+) -> Result<(NetworkStrategy, ProxyStrategy), StrategyError> {
+    let firewall = selected_firewall(caps);
+    if caps.cap_net_admin && caps.ip && firewall.is_some() {
+        return Ok(proxy_plan(
+            sandbox_id,
+            ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
+            firewall,
+            proxy_addr,
+        ));
+    }
+
+    if caps.cap_net_admin && caps.ip && caps.nft {
+        return Err(StrategyError::new(
+            "network",
+            "nft is available but Linux proxy setup currently requires iptables",
+        ));
+    }
+
+    if caps.netns_helper {
+        if policy.process.run_as_user.is_some() {
+            return Err(StrategyError::new(
+                "network",
+                "axis-netns-helper proxy setup with run_as_user is not implemented yet",
+            ));
+        }
+        if super::landlock::policy_uses_tmpdir(&policy.filesystem) {
+            return Err(StrategyError::new(
+                "network",
+                "axis-netns-helper proxy setup with {tmpdir} filesystem policy is not implemented yet",
+            ));
+        }
+        return Ok(proxy_plan(
+            sandbox_id,
+            ProxyNetworkSetup::AxisNetnsHelperLaunch,
+            Some(FirewallTool::Iptables),
+            proxy_addr,
+        ));
+    }
+
+    if caps.unprivileged_userns && caps.ip && firewall.is_some() {
+        return Err(StrategyError::new(
+            "network",
+            "unprivileged user namespace proxy setup is not implemented yet",
+        ));
+    }
+
+    if caps.bubblewrap {
+        return Err(StrategyError::new(
+            "network",
+            "bubblewrap is available only as a block-mode fallback until proxy reachability is implemented",
+        ));
+    }
+
+    Err(StrategyError::new(
+        "network",
+        "proxy mode requires CAP_NET_ADMIN with ip/firewall tooling, axis-netns-helper, or unprivileged user namespace support",
+    ))
 }
 
 fn validate_proxy_bind(

@@ -929,12 +929,12 @@ mod tests {
                 true,
                 PlatformBackendSelection::LinuxMxc,
             ) {
-                Ok(_) => panic!("MXC backend setup should fail for unsupported proxy mode"),
+                Ok(_) => panic!("MXC backend setup should fail before launch"),
                 Err(err) => err,
             };
 
             assert!(matches!(err, SandboxError::IsolationFailed(_)));
-            assert!(err.to_string().contains("cooperative"));
+            assert!(err.to_string().contains("MXC Linux"));
             assert!(
                 !home.path().join(".codex").exists(),
                 "agent symlink should be cleaned when backend setup fails"
