@@ -635,6 +635,13 @@ fn translate_sandbox_config(
     Ok(translate_sandbox_config_with_metadata(config)?.spec)
 }
 
+#[cfg(test)]
+pub(crate) fn translate_sandbox_config_for_test(
+    config: &SandboxConfig,
+) -> Result<MxcExecutionSpec, MxcTranslationError> {
+    translate_sandbox_config(config)
+}
+
 struct MxcTranslatedConfig {
     spec: MxcExecutionSpec,
     root_read_substrate_acknowledged: bool,

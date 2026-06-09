@@ -8,6 +8,8 @@
 //! This ensures all agent-writable data is contained in a single
 //! directory tree that can be inspected, backed up, and destroyed.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 /// Agent state directory mappings.
@@ -166,6 +168,81 @@ pub fn ssh_workspace_path(policy_name: &str) -> PathBuf {
     agent_state_root(policy_name).join("ssh")
 }
 
+/// Get the AXIS-managed home directory for a policy.
+pub fn managed_home_path(policy_name: &str) -> PathBuf {
+    agent_state_root(policy_name).join("home")
+}
+
+/// Prepare an AXIS-owned home directory for backends that cannot represent
+/// host-path mount aliases such as binding generated SSH state at ~/.ssh.
+pub(crate) fn prepare_managed_home_workspace(
+    policy_name: &str,
+    read_write_paths: &[String],
+) -> Result<PathBuf, String> {
+    let real_home = user_home()?;
+    let agent_root = agent_state_root_checked(policy_name)?;
+    let managed_home = agent_root.join("home");
+    create_axis_private_dir(&managed_home, 0o700, "managed home")?;
+
+    for rw_path in read_write_paths {
+        let Some((expected_home_path, contained_dir)) =
+            managed_home_agent_state_mapping_for_policy_path_with_home(
+                rw_path,
+                &real_home,
+                &agent_root,
+            )?
+        else {
+            continue;
+        };
+        create_axis_private_dir(&contained_dir, 0o700, "agent state directory")?;
+
+        let relative = expected_home_path
+            .strip_prefix(&real_home)
+            .map_err(|e| format!("managed home path '{}': {e}", expected_home_path.display()))?;
+        let managed_path = managed_home.join(relative);
+        if let Some(parent) = managed_path.parent() {
+            create_axis_private_dir(parent, 0o700, "managed home parent")?;
+        }
+        if managed_path.is_symlink() {
+            std::fs::remove_file(&managed_path).map_err(|e| {
+                format!(
+                    "remove managed home symlink '{}': {e}",
+                    managed_path.display()
+                )
+            })?;
+        } else if managed_path.exists() {
+            return Err(format!(
+                "managed home path '{}' already exists and is not an AXIS symlink",
+                managed_path.display()
+            ));
+        }
+        symlink_dir(&contained_dir, &managed_path)?;
+    }
+
+    Ok(managed_home)
+}
+
+pub(crate) fn cleanup_generated_ssh_workspace(ssh_dir: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(ssh_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("inspect ssh dir '{}': {err}", ssh_dir.display())),
+    };
+
+    if metadata.file_type().is_symlink() {
+        std::fs::remove_file(ssh_dir)
+            .map_err(|err| format!("remove ssh symlink '{}': {err}", ssh_dir.display()))?;
+    } else if metadata.is_dir() {
+        std::fs::remove_dir_all(ssh_dir)
+            .map_err(|err| format!("remove ssh dir '{}': {err}", ssh_dir.display()))?;
+    } else {
+        std::fs::remove_file(ssh_dir)
+            .map_err(|err| format!("remove ssh path '{}': {err}", ssh_dir.display()))?;
+    }
+
+    Ok(())
+}
+
 /// Create ~/.ssh as a symlink to the scoped SSH directory.
 ///
 /// This refuses to replace any existing ~/.ssh path, including an existing
@@ -179,28 +256,9 @@ pub fn link_scoped_ssh_workspace(ssh_dir: &Path) -> Result<(PathBuf, PathBuf), S
             ssh_link.display()
         ));
     }
-    std::fs::create_dir_all(ssh_dir).map_err(|e| format!("create ssh dir: {e}"))?;
+    create_axis_private_dir(ssh_dir, 0o700, "scoped SSH directory")?;
 
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(ssh_dir, &ssh_link).map_err(|e| {
-            format!(
-                "symlink {} -> {}: {e}",
-                ssh_link.display(),
-                ssh_dir.display()
-            )
-        })?;
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_dir(ssh_dir, &ssh_link).map_err(|e| {
-            format!(
-                "symlink {} -> {}: {e}",
-                ssh_link.display(),
-                ssh_dir.display()
-            )
-        })?;
-    }
+    symlink_dir(ssh_dir, &ssh_link)?;
 
     Ok((ssh_link, ssh_dir.to_path_buf()))
 }
@@ -208,6 +266,10 @@ pub fn link_scoped_ssh_workspace(ssh_dir: &Path) -> Result<(PathBuf, PathBuf), S
 pub(crate) fn expand_home_or_absolute_path(path: &str) -> Result<Option<PathBuf>, String> {
     let home = user_home()?;
     expand_home_or_absolute_path_with_home(path, &home)
+}
+
+pub(crate) fn user_home_path() -> Result<PathBuf, String> {
+    user_home()
 }
 
 pub(crate) fn scoped_ssh_link_path() -> Result<PathBuf, String> {
@@ -221,6 +283,15 @@ pub(crate) fn agent_state_mapping_for_policy_path(
     let home = user_home()?;
     let agent_root = agent_state_root_checked(policy_name)?;
     agent_state_mapping_for_policy_path_with_home(path, &home, &agent_root)
+}
+
+pub(crate) fn managed_home_agent_state_mapping_for_policy_path(
+    policy_name: &str,
+    path: &str,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let home = user_home()?;
+    let agent_root = agent_state_root_checked(policy_name)?;
+    managed_home_agent_state_mapping_for_policy_path_with_home(path, &home, &agent_root)
 }
 
 pub(crate) fn scoped_ssh_link_points_to(ssh_dir: &Path) -> Result<bool, String> {
@@ -254,12 +325,32 @@ pub fn prepare_ssh_workspace(
     policy_name: &str,
     ssh_policy: &axis_core::policy::SshPolicy,
 ) -> Result<Option<PathBuf>, String> {
-    prepare_ssh_workspace_with_permissions(policy_name, ssh_policy, set_private_permissions)
+    let ssh_dir = agent_state_root_checked(policy_name)?.join("ssh");
+    prepare_ssh_workspace_at_with_permissions(
+        policy_name,
+        ssh_policy,
+        &ssh_dir,
+        set_private_permissions,
+    )
 }
 
-fn prepare_ssh_workspace_with_permissions<F>(
+pub(crate) fn prepare_ssh_workspace_at(
     policy_name: &str,
     ssh_policy: &axis_core::policy::SshPolicy,
+    ssh_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    prepare_ssh_workspace_at_with_permissions(
+        policy_name,
+        ssh_policy,
+        ssh_dir,
+        set_private_permissions,
+    )
+}
+
+fn prepare_ssh_workspace_at_with_permissions<F>(
+    policy_name: &str,
+    ssh_policy: &axis_core::policy::SshPolicy,
+    ssh_dir: &Path,
     mut set_permissions: F,
 ) -> Result<Option<PathBuf>, String>
 where
@@ -269,42 +360,106 @@ where
         return Ok(None);
     }
 
+    validate_policy_name_component(policy_name)?;
+    create_axis_private_dir_with_permissions(
+        ssh_dir,
+        0o700,
+        "scoped SSH directory",
+        &mut set_permissions,
+    )?;
+    reset_generated_ssh_dir(ssh_dir)?;
+
     let home = user_home()?;
+    let prepared_keys = match prepare_ssh_keys(ssh_policy, &home) {
+        Ok(prepared_keys) => prepared_keys,
+        Err(err) => {
+            let _ = cleanup_generated_ssh_workspace(ssh_dir);
+            return Err(err);
+        }
+    };
 
-    let ssh_dir = agent_state_root_checked(policy_name)?.join("ssh");
-    std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create ssh dir: {e}"))?;
+    if let Err(err) =
+        populate_ssh_workspace(ssh_policy, ssh_dir, &prepared_keys, &mut set_permissions)
+    {
+        let _ = cleanup_generated_ssh_workspace(ssh_dir);
+        return Err(err);
+    }
 
-    set_permissions(&ssh_dir, 0o700)?;
+    Ok(Some(ssh_dir.to_path_buf()))
+}
 
-    // Copy each allowed key.
-    let mut config_entries = Vec::new();
+struct PreparedSshKey<'a> {
+    spec: &'a axis_core::policy::SshKeySpec,
+    src_path: PathBuf,
+    key_filename: String,
+    exists: bool,
+}
+
+fn prepare_ssh_keys<'a>(
+    ssh_policy: &'a axis_core::policy::SshPolicy,
+    home: &Path,
+) -> Result<Vec<PreparedSshKey<'a>>, String> {
+    let mut generated_key_files = HashSet::new();
+    let mut prepared = Vec::with_capacity(ssh_policy.allowed_keys.len());
+
     for key_spec in &ssh_policy.allowed_keys {
-        let src_path = expand_home_or_absolute_path_with_home(&key_spec.private_key, &home)?
+        for host in &key_spec.allowed_hosts {
+            validate_ssh_config_token("host pattern", host)?;
+        }
+        let src_path = expand_home_or_absolute_path_with_home(&key_spec.private_key, home)?
             .ok_or_else(|| {
                 format!(
                     "ssh: key '{}' path must be absolute or start with ~/; got {}",
                     key_spec.name, key_spec.private_key
                 )
             })?;
-
-        if !src_path.exists() {
-            tracing::warn!(
-                "ssh: key '{}' not found at {}",
-                key_spec.name,
-                src_path.display()
-            );
-            continue;
-        }
-
-        // Copy private key to sandbox ssh dir.
         let key_filename = src_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("key_{}", key_spec.name));
+        validate_ssh_config_token("key filename", &key_filename)?;
+        let exists = src_path.exists();
+        if exists && !generated_key_files.insert(key_filename.clone()) {
+            return Err(format!(
+                "ssh: multiple allowed keys would generate '{}'",
+                key_filename
+            ));
+        }
+        prepared.push(PreparedSshKey {
+            spec: key_spec,
+            src_path,
+            key_filename,
+            exists,
+        });
+    }
 
-        let dst_path = ssh_dir.join(&key_filename);
-        std::fs::copy(&src_path, &dst_path)
-            .map_err(|e| format!("copy key '{}': {e}", key_spec.name))?;
+    Ok(prepared)
+}
+
+fn populate_ssh_workspace<F>(
+    ssh_policy: &axis_core::policy::SshPolicy,
+    ssh_dir: &Path,
+    prepared_keys: &[PreparedSshKey<'_>],
+    set_permissions: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, u32) -> Result<(), String>,
+{
+    // Copy each allowed key.
+    let mut config_entries = Vec::new();
+    for prepared_key in prepared_keys {
+        if !prepared_key.exists {
+            tracing::warn!(
+                "ssh: key '{}' not found at {}",
+                prepared_key.spec.name,
+                prepared_key.src_path.display()
+            );
+            continue;
+        }
+        let key_filename = &prepared_key.key_filename;
+        let dst_path = ssh_dir.join(key_filename);
+        copy_file_create_new(&prepared_key.src_path, &dst_path)
+            .map_err(|e| format!("copy key '{}': {e}", prepared_key.spec.name))?;
 
         if let Err(err) = set_permissions(&dst_path, 0o600) {
             let _ = std::fs::remove_file(&dst_path);
@@ -312,25 +467,25 @@ where
         }
 
         // Copy public key too if it exists.
-        let pub_src = PathBuf::from(format!("{}.pub", src_path.display()));
+        let pub_src = PathBuf::from(format!("{}.pub", prepared_key.src_path.display()));
         if pub_src.exists() {
             let pub_dst = ssh_dir.join(format!("{key_filename}.pub"));
-            let _ = std::fs::copy(&pub_src, &pub_dst);
+            let _ = copy_file_create_new(&pub_src, &pub_dst);
         }
 
         tracing::info!(
             "ssh: exposed key '{}' for hosts {:?}",
-            key_spec.name,
-            key_spec.allowed_hosts
+            prepared_key.spec.name,
+            prepared_key.spec.allowed_hosts
         );
 
         // Build SSH config entry.
-        let hosts = if key_spec.allowed_hosts.is_empty() {
+        let hosts = if prepared_key.spec.allowed_hosts.is_empty() {
             "*".to_string()
         } else {
-            key_spec.allowed_hosts.join(" ")
+            prepared_key.spec.allowed_hosts.join(" ")
         };
-        config_entries.push((hosts, key_filename));
+        config_entries.push((hosts, key_filename.clone()));
     }
 
     // Generate SSH config.
@@ -352,7 +507,7 @@ where
         config.push_str("    IdentityFile /dev/null\n");
         config.push_str("    IdentitiesOnly yes\n");
 
-        std::fs::write(ssh_dir.join("config"), &config)
+        write_file_create_new(&ssh_dir.join("config"), config.as_bytes())
             .map_err(|e| format!("write ssh config: {e}"))?;
     }
 
@@ -375,7 +530,7 @@ where
             if let Ok(output) = output
                 && output.status.success()
             {
-                std::fs::write(ssh_dir.join("known_hosts"), &output.stdout)
+                write_file_create_new(&ssh_dir.join("known_hosts"), &output.stdout)
                     .map_err(|e| format!("write known_hosts: {e}"))?;
                 tracing::info!("ssh: generated known_hosts for {} hosts", all_hosts.len());
             }
@@ -383,13 +538,12 @@ where
     }
 
     // Create marker file.
-    std::fs::write(
-        ssh_dir.join(".axis-managed"),
-        "This SSH directory is managed by AXIS.\n",
-    )
-    .ok();
+    let _ = write_file_create_new(
+        &ssh_dir.join(".axis-managed"),
+        b"This SSH directory is managed by AXIS.\n",
+    );
 
-    Ok(Some(ssh_dir))
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -401,6 +555,159 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+fn symlink_dir(target: &Path, link: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+            .map_err(|e| format!("symlink {} -> {}: {e}", link.display(), target.display()))?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link)
+            .map_err(|e| format!("symlink {} -> {}: {e}", link.display(), target.display()))?;
+    }
+    Ok(())
+}
+
+fn create_axis_private_dir(path: &Path, mode: u32, label: &str) -> Result<(), String> {
+    let mut set_permissions = set_private_permissions;
+    create_axis_private_dir_with_permissions(path, mode, label, &mut set_permissions)
+}
+
+fn create_axis_private_dir_with_permissions<F>(
+    path: &Path,
+    mode: u32,
+    label: &str,
+    set_permissions: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, u32) -> Result<(), String>,
+{
+    create_axis_dir_all_rejecting_symlinks(path, label)?;
+    set_permissions(path, mode)?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} '{}': {err}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{label} '{}' must be a real directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn create_axis_dir_all_rejecting_symlinks(path: &Path, label: &str) -> Result<(), String> {
+    let home = user_home()?;
+    let relative = path.strip_prefix(&home).map_err(|_| {
+        format!(
+            "{label} '{}' must be under the user home '{}'",
+            path.display(),
+            home.display()
+        )
+    })?;
+
+    let mut current = home;
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                current.push(name);
+                ensure_real_directory_component(&current, label)?;
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "{label} '{}' contains unsupported path components",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_directory_component(path: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "{label} '{}' must not contain symlinks",
+                    path.display()
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(format!("{label} '{}' must be a directory", path.display()));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path)
+                .map_err(|err| format!("create {label} '{}': {err}", path.display()))?;
+        }
+        Err(err) => return Err(format!("inspect {label} '{}': {err}", path.display())),
+    }
+    Ok(())
+}
+
+fn reset_generated_ssh_dir(ssh_dir: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(ssh_dir)
+        .map_err(|err| format!("read ssh dir '{}': {err}", ssh_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read ssh dir '{}': {err}", ssh_dir.display()))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("inspect generated ssh path '{}': {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "generated ssh path '{}' must not be a symlink",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            return Err(format!(
+                "generated ssh path '{}' must not be a directory",
+                path.display()
+            ));
+        }
+        std::fs::remove_file(&path).map_err(|err| {
+            format!(
+                "remove stale generated ssh path '{}': {err}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn copy_file_create_new(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let mut input = std::fs::File::open(src)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    std::io::copy(&mut input, &mut output)
+}
+
+fn write_file_create_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+fn validate_ssh_config_token(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || byte == b'/' || byte == b'\\')
+    {
+        return Err(format!(
+            "ssh: {label} '{value}' is not safe for generated config"
+        ));
+    }
     Ok(())
 }
 
@@ -491,6 +798,35 @@ fn agent_state_mapping_for_policy_path_with_home(
     Ok(Some((home.join(relative), contained_dir)))
 }
 
+fn managed_home_agent_state_mapping_for_policy_path_with_home(
+    path: &str,
+    home: &Path,
+    agent_root: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let Some(expanded) = expand_home_or_absolute_path_with_home(path, home)? else {
+        return Ok(None);
+    };
+
+    if !expanded.starts_with(home) {
+        return Ok(None);
+    }
+
+    let relative = match expanded.strip_prefix(home) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => return Ok(None),
+    };
+    let contained_dir = if relative == Path::new(".axis") {
+        Some(agent_root.join("axis"))
+    } else {
+        contained_agent_dir_for_relative(&relative, agent_root)
+    };
+    let Some(contained_dir) = contained_dir else {
+        return Ok(None);
+    };
+
+    Ok(Some((home.join(relative), contained_dir)))
+}
+
 fn normalize_path(path: PathBuf) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -526,8 +862,6 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use axis_core::policy::{SshKeySpec, SshPolicy};
-    use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn agent_state_root_is_under_home() {
@@ -624,6 +958,266 @@ mod tests {
     }
 
     #[test]
+    fn ssh_workspace_preparation_removes_stale_generated_files() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            std::fs::write(ssh_dir.join("old_key"), "stale-key").unwrap();
+            std::fs::write(ssh_dir.join("config"), "stale-config").unwrap();
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap();
+
+            assert!(!ssh_dir.join("old_key").exists());
+            assert_eq!(
+                std::fs::read_to_string(ssh_dir.join("id_ed25519")).unwrap(),
+                "private-key"
+            );
+            let generated_config = std::fs::read_to_string(ssh_dir.join("config")).unwrap();
+            assert!(generated_config.contains("Host github.com"));
+            assert!(!generated_config.contains("stale-config"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_workspace_preparation_rejects_stale_generated_symlink() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let outside = home.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let target = outside.join("id_ed25519");
+            std::fs::write(&target, "outside-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            std::os::unix::fs::symlink(&target, ssh_dir.join("id_ed25519")).unwrap();
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("must not be a symlink"));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside-key");
+            assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "private-key");
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_rejects_stale_generated_directory() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            std::fs::create_dir_all(ssh_dir.join("stale-directory")).unwrap();
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("must not be a directory"));
+            assert!(ssh_dir.join("stale-directory").is_dir());
+            assert!(!ssh_dir.join("id_ed25519").exists());
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_rejects_unsafe_generated_key_filename() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519\nHost *");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("key filename"));
+            assert!(!ssh_dir.join("config").exists());
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_rejects_unsafe_generated_host_pattern() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com\nHost *".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("host pattern"));
+            assert!(!ssh_dir.join("id_ed25519").exists());
+            assert!(!ssh_dir.join("config").exists());
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_validates_all_hosts_before_copying_any_key() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let first_key_path = home.path().join("id_ed25519");
+            let second_key_path = home.path().join("id_ed25519_second");
+            std::fs::write(&first_key_path, "first-private-key").unwrap();
+            std::fs::write(&second_key_path, "second-private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![
+                    SshKeySpec {
+                        name: "github".into(),
+                        private_key: first_key_path.to_string_lossy().into_owned(),
+                        allowed_hosts: vec!["github.com".into()],
+                    },
+                    SshKeySpec {
+                        name: "bad".into(),
+                        private_key: second_key_path.to_string_lossy().into_owned(),
+                        allowed_hosts: vec!["bad.example\nHost *".into()],
+                    },
+                ],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("host pattern"));
+            assert!(!ssh_dir.join("id_ed25519").exists());
+            assert!(!ssh_dir.join("id_ed25519_second").exists());
+            assert!(!ssh_dir.join("config").exists());
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_validates_known_hosts_inputs_for_missing_keys() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "bad".into(),
+                    private_key: "~/.ssh/missing-key".into(),
+                    allowed_hosts: vec!["bad.example\nHost *".into()],
+                }],
+                generate_config: false,
+                generate_known_hosts: true,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("host pattern"));
+            assert!(!ssh_dir.exists());
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_rejects_option_like_known_hosts_input() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["-p".into()],
+                }],
+                generate_config: false,
+                generate_known_hosts: true,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("host pattern"));
+            assert!(!ssh_dir.exists());
+        });
+    }
+
+    #[test]
+    fn ssh_workspace_preparation_clears_stale_files_when_validation_fails() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let key_path = home.path().join("id_ed25519");
+            std::fs::write(&key_path, "private-key").unwrap();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            std::fs::write(ssh_dir.join("id_ed25519"), "stale-private-key").unwrap();
+            std::fs::write(ssh_dir.join("config"), "stale-config").unwrap();
+            let ssh_policy = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: key_path.to_string_lossy().into_owned(),
+                    allowed_hosts: vec!["github.com\nHost *".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_ssh_workspace_at("agent-ssh", &ssh_policy, &ssh_dir).unwrap_err();
+
+            assert!(err.contains("host pattern"));
+            assert!(
+                !ssh_dir.exists(),
+                "validation failure should remove stale generated SSH state"
+            );
+        });
+    }
+
+    #[test]
     fn ssh_workspace_preparation_fails_when_directory_permissions_cannot_be_hardened() {
         let home = tempfile::tempdir().unwrap();
 
@@ -638,11 +1232,14 @@ mod tests {
                 generate_known_hosts: false,
             };
 
-            let err =
-                prepare_ssh_workspace_with_permissions("agent-ssh", &ssh_policy, |_path, mode| {
-                    Err(format!("permission hook failed for {mode:o}"))
-                })
-                .unwrap_err();
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let err = prepare_ssh_workspace_at_with_permissions(
+                "agent-ssh",
+                &ssh_policy,
+                &ssh_dir,
+                |_path, mode| Err(format!("permission hook failed for {mode:o}")),
+            )
+            .unwrap_err();
 
             assert!(err.contains("permission hook failed for 700"));
         });
@@ -665,15 +1262,20 @@ mod tests {
                 generate_known_hosts: false,
             };
 
-            let err =
-                prepare_ssh_workspace_with_permissions("agent-ssh", &ssh_policy, |_path, mode| {
+            let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
+            let err = prepare_ssh_workspace_at_with_permissions(
+                "agent-ssh",
+                &ssh_policy,
+                &ssh_dir,
+                |_path, mode| {
                     if mode == 0o600 {
                         Err("key permission hook failed".into())
                     } else {
                         Ok(())
                     }
-                })
-                .unwrap_err();
+                },
+            )
+            .unwrap_err();
 
             assert!(err.contains("key permission hook failed"));
             assert!(
@@ -687,30 +1289,6 @@ mod tests {
     }
 
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-
-        struct EnvGuard {
-            home: Option<OsString>,
-        }
-
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.home {
-                        Some(value) => std::env::set_var("HOME", value),
-                        None => std::env::remove_var("HOME"),
-                    }
-                }
-            }
-        }
-
-        let previous = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        let _env_guard = EnvGuard { home: previous };
-
-        f()
+        crate::test_support::with_home(home, f)
     }
 }

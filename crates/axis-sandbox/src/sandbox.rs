@@ -6,7 +6,7 @@
 use axis_core::connect_attribution::ConnectAttributionStore;
 use axis_core::policy::Policy;
 use axis_core::types::{SandboxId, SandboxStatus};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -95,12 +95,17 @@ impl Sandbox {
             .validate()
             .map_err(|e| SandboxError::CreationFailed(format!("invalid sandbox policy: {e}")))?;
 
-        let agent_symlinks = prepare_managed_agent_workspace(&mut config, manage_agent_workspace)?;
+        let agent_symlinks =
+            prepare_managed_agent_workspace(&mut config, manage_agent_workspace, backend)?;
 
         let inner = match create_platform_sandbox_with_backend(&config, backend) {
             Ok(inner) => inner,
             Err(err) => {
-                crate::workspace::cleanup_agent_symlinks(&agent_symlinks);
+                cleanup_prepared_agent_workspace_on_setup_failure(
+                    &config,
+                    backend,
+                    &agent_symlinks,
+                );
                 return Err(err);
             }
         };
@@ -163,7 +168,13 @@ impl Sandbox {
 fn prepare_managed_agent_workspace(
     config: &mut SandboxConfig,
     manage_agent_workspace: bool,
+    backend: PlatformBackendSelection,
 ) -> Result<Vec<(PathBuf, PathBuf)>, SandboxError> {
+    if uses_mxc_managed_home_for_scoped_ssh(config, backend) {
+        prepare_mxc_managed_home_workspace(config)?;
+        return Ok(Vec::new());
+    }
+
     if !manage_agent_workspace {
         let agent_symlinks = Vec::new();
         if let Err(err) = rewrite_read_write_paths_for_agent_targets(
@@ -242,6 +253,85 @@ fn prepare_managed_agent_workspace(
     Ok(agent_symlinks)
 }
 
+fn cleanup_prepared_agent_workspace_on_setup_failure(
+    config: &SandboxConfig,
+    backend: PlatformBackendSelection,
+    agent_symlinks: &[(PathBuf, PathBuf)],
+) {
+    crate::workspace::cleanup_agent_symlinks(agent_symlinks);
+
+    if uses_mxc_managed_home_for_scoped_ssh(config, backend) {
+        let ssh_dir = crate::workspace::managed_home_path(&config.policy.name).join(".ssh");
+        if let Err(err) = crate::workspace::cleanup_generated_ssh_workspace(&ssh_dir) {
+            tracing::warn!("failed to clean up generated managed SSH workspace: {err}");
+        }
+    }
+}
+
+fn uses_mxc_managed_home_for_scoped_ssh(
+    config: &SandboxConfig,
+    backend: PlatformBackendSelection,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(backend, PlatformBackendSelection::LinuxMxc)
+            && !config.policy.ssh.allowed_keys.is_empty()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = backend;
+        let _ = config;
+        false
+    }
+}
+
+fn prepare_mxc_managed_home_workspace(config: &mut SandboxConfig) -> Result<(), SandboxError> {
+    let managed_home = crate::workspace::prepare_managed_home_workspace(
+        &config.policy.name,
+        &config.policy.filesystem.read_write,
+    )
+    .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
+    let ssh_dir = managed_home.join(".ssh");
+    push_unique_policy_path(&mut config.policy.filesystem.read_write, &managed_home)
+        .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
+    rewrite_read_write_paths_for_mxc_managed_home_targets(
+        &config.policy.name,
+        &mut config.policy.filesystem.read_write,
+    )
+    .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
+    reject_unmanaged_home_grants_for_mxc_managed_home(config)
+        .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
+    crate::workspace::prepare_ssh_workspace_at(&config.policy.name, &config.policy.ssh, &ssh_dir)
+        .map_err(|err| SandboxError::CreationFailed(format!("scoped SSH workspace: {err}")))?;
+    set_managed_home_env(&mut config.env, &managed_home)
+        .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
+    Ok(())
+}
+
+fn set_managed_home_env(
+    env: &mut Vec<(String, String)>,
+    managed_home: &Path,
+) -> Result<(), String> {
+    let home = policy_path_string(managed_home)?;
+    let xdg_config_home = policy_path_string(&managed_home.join(".config"))?;
+    let xdg_data_home = policy_path_string(&managed_home.join(".local/share"))?;
+    let xdg_cache_home = policy_path_string(&managed_home.join(".cache"))?;
+    upsert_env(env, "HOME", home);
+    upsert_env(env, "XDG_CONFIG_HOME", xdg_config_home);
+    upsert_env(env, "XDG_DATA_HOME", xdg_data_home);
+    upsert_env(env, "XDG_CACHE_HOME", xdg_cache_home);
+    Ok(())
+}
+
+fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = env.iter_mut().find(|(existing_key, _)| existing_key == key) {
+        *existing = value;
+    } else {
+        env.push((key.into(), value));
+    }
+}
+
 fn prepare_existing_scoped_ssh_for_exec(config: &mut SandboxConfig) -> Result<(), SandboxError> {
     if config.policy.ssh.allowed_keys.is_empty() {
         return Ok(());
@@ -297,6 +387,181 @@ fn rewrite_read_write_paths_for_agent_targets(
     }
 
     Ok(())
+}
+
+fn rewrite_read_write_paths_for_mxc_managed_home_targets(
+    policy_name: &str,
+    read_write_paths: &mut [String],
+) -> Result<(), String> {
+    for path in read_write_paths.iter_mut() {
+        if let Some((_, target)) =
+            crate::workspace::managed_home_agent_state_mapping_for_policy_path(policy_name, path)?
+        {
+            *path = policy_path_string(&target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_unmanaged_home_grants_for_mxc_managed_home(config: &SandboxConfig) -> Result<(), String> {
+    let lexical_home = crate::workspace::user_home_path()?;
+    let home = normalize_existing_or_absolute_path(&lexical_home)?;
+    let agent_root = normalize_existing_or_absolute_path(&crate::workspace::agent_state_root(
+        &config.policy.name,
+    ))?;
+    let workspace = normalize_existing_or_absolute_path(&config.workspace_dir)?;
+    let tmpdir = normalize_existing_or_absolute_path(&sandbox_tmpdir_path(&config.workspace_dir))?;
+    let guard = ManagedHomeGrantGuard {
+        home: &home,
+        agent_root: &agent_root,
+        workspace: &workspace,
+        tmpdir: &tmpdir,
+        raw_workspace: &config.workspace_dir,
+        lexical_home: &lexical_home,
+    };
+    reject_unmanaged_home_grants("read_only", &config.policy.filesystem.read_only, &guard)?;
+    reject_unmanaged_home_grants("read_write", &config.policy.filesystem.read_write, &guard)
+}
+
+struct ManagedHomeGrantGuard<'a> {
+    home: &'a Path,
+    agent_root: &'a Path,
+    workspace: &'a Path,
+    tmpdir: &'a Path,
+    raw_workspace: &'a Path,
+    lexical_home: &'a Path,
+}
+
+fn reject_unmanaged_home_grants(
+    section: &str,
+    paths: &[String],
+    guard: &ManagedHomeGrantGuard<'_>,
+) -> Result<(), String> {
+    for path in paths {
+        let expanded =
+            expand_managed_home_guard_path(path, guard.raw_workspace, guard.lexical_home)?;
+        if expanded.starts_with(guard.home)
+            && !path_contains_or_equal(guard.agent_root, &expanded)
+            && !path_contains_or_equal(guard.workspace, &expanded)
+            && !path_contains_or_equal(guard.tmpdir, &expanded)
+        {
+            return Err(format!(
+                "MXC managed HOME cannot grant real home {section} path '{}' (expanded '{}')",
+                path,
+                expanded.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expand_managed_home_guard_path(
+    path: &str,
+    workspace: &Path,
+    home: &Path,
+) -> Result<PathBuf, String> {
+    let mut expanded = if path == "~" {
+        home.to_string_lossy().into_owned()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest).to_string_lossy().into_owned()
+    } else if path.starts_with('~') {
+        return Err(format!(
+            "unsupported home path '{path}': only '~' and '~/' are supported"
+        ));
+    } else {
+        path.to_string()
+    };
+
+    expanded = expanded.replace("{workspace}", &workspace.to_string_lossy());
+    expanded = expanded.replace(
+        "{tmpdir}",
+        &sandbox_tmpdir_path(workspace).to_string_lossy(),
+    );
+
+    normalize_existing_or_absolute_path(&PathBuf::from(expanded))
+}
+
+fn sandbox_tmpdir_path(workspace: &Path) -> PathBuf {
+    workspace.join(".axis-tmp")
+}
+
+fn normalize_existing_or_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    let normalized = normalize_absolute_path(path)?;
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return normalize_absolute_path(&canonical);
+    }
+
+    let mut existing_prefix = PathBuf::from("/");
+    let mut probe = PathBuf::from("/");
+    let mut missing_suffix = Vec::new();
+    let mut missing = false;
+
+    for component in normalized.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) if !missing => {
+                probe.push(part);
+                if probe.exists() {
+                    existing_prefix = probe.clone();
+                } else {
+                    missing = true;
+                    missing_suffix.push(part.to_os_string());
+                }
+            }
+            Component::Normal(part) => missing_suffix.push(part.to_os_string()),
+            Component::CurDir | Component::ParentDir => {}
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "linux policy path '{}' must not contain a non-linux prefix",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let mut resolved = std::fs::canonicalize(&existing_prefix).unwrap_or(existing_prefix);
+    for part in missing_suffix {
+        resolved.push(part);
+    }
+    normalize_absolute_path(&resolved)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "policy path '{}' must be absolute after expansion",
+            path.display()
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(_) => {
+                return Err(format!(
+                    "linux policy path '{}' must not contain a non-linux prefix",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        Ok(PathBuf::from("/"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
+    child == parent || child.starts_with(parent)
 }
 
 fn remove_policy_path(paths: &mut Vec<String>, remove: &Path) -> Result<(), String> {
@@ -414,12 +679,10 @@ fn create_platform_sandbox_with_backend(
 mod tests {
     use super::*;
     use axis_core::policy::{
-        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, ProcessPolicy,
-        SshKeySpec, SshPolicy,
+        Compatibility, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy,
+        ProcessPolicy, SshKeySpec, SshPolicy,
     };
-    use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
 
     fn test_config() -> SandboxConfig {
         SandboxConfig {
@@ -496,7 +759,12 @@ mod tests {
                 "{workspace}".into(),
             ];
 
-            let symlinks = prepare_managed_agent_workspace(&mut config, true).unwrap();
+            let symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::Default,
+            )
+            .unwrap();
             let codex_link = home.path().join(".codex");
             let codex_target = home.path().join(".axis/agents/agent-codex/codex");
 
@@ -559,7 +827,12 @@ mod tests {
                 generate_known_hosts: false,
             };
 
-            let symlinks = prepare_managed_agent_workspace(&mut config, true).unwrap();
+            let symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::Default,
+            )
+            .unwrap();
             let ssh_link = home.path().join(".ssh");
             let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
 
@@ -616,7 +889,12 @@ mod tests {
                 generate_known_hosts: false,
             };
 
-            let err = prepare_managed_agent_workspace(&mut config, true).unwrap_err();
+            let err = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::Default,
+            )
+            .unwrap_err();
 
             assert!(matches!(err, SandboxError::CreationFailed(_)));
             assert!(
@@ -681,7 +959,12 @@ mod tests {
             config.workspace_dir = workspace.path().join("workspace");
             config.policy.filesystem.read_write = vec!["~/.codex".into()];
 
-            let exec_symlinks = prepare_managed_agent_workspace(&mut config, false).unwrap();
+            let exec_symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                false,
+                PlatformBackendSelection::Default,
+            )
+            .unwrap();
 
             assert!(exec_symlinks.is_empty());
             assert!(codex_link.is_symlink());
@@ -718,7 +1001,12 @@ mod tests {
                 generate_known_hosts: false,
             };
 
-            let exec_symlinks = prepare_managed_agent_workspace(&mut config, false).unwrap();
+            let exec_symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                false,
+                PlatformBackendSelection::Default,
+            )
+            .unwrap();
 
             assert!(exec_symlinks.is_empty());
             assert!(home.path().join(".ssh").is_symlink());
@@ -732,6 +1020,780 @@ mod tests {
             assert!(!config.policy.filesystem.deny.contains(&"~/.ssh".into()));
 
             crate::workspace::cleanup_agent_symlinks(&[ssh_link_pair]);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_uses_managed_home_without_replacing_real_ssh() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            let key_path = real_ssh.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            std::fs::create_dir_all(&config.workspace_dir).unwrap();
+            config.policy.filesystem.compatibility = Compatibility::BestEffort;
+            config.policy.filesystem.read_write = vec![
+                "{workspace}".into(),
+                "~/.claude".into(),
+                "~/.local/share/claude".into(),
+                "~/.config".into(),
+                "~/.axis".into(),
+                "~/.codex".into(),
+            ];
+            config.policy.filesystem.deny = vec!["~/.ssh".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::LinuxMxc,
+            )
+            .unwrap();
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+            let agent_axis_target = home.path().join(".axis/agents/agent-ssh/axis");
+            let claude_target = home.path().join(".axis/agents/agent-ssh/claude");
+            let claude_share_target = home.path().join(".axis/agents/agent-ssh/claude-share");
+            let config_target = home.path().join(".axis/agents/agent-ssh/config");
+            let codex_target = home.path().join(".axis/agents/agent-ssh/codex");
+
+            assert!(symlinks.is_empty());
+            assert!(real_ssh.is_dir());
+            assert!(!real_ssh.is_symlink());
+            assert!(!home.path().join(".codex").exists());
+            assert!(!home.path().join(".claude").exists());
+            assert!(!home.path().join(".local").exists());
+            assert_eq!(
+                std::fs::read_to_string(managed_home.join(".ssh/id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+            let generated_config =
+                std::fs::read_to_string(managed_home.join(".ssh/config")).unwrap();
+            assert!(generated_config.contains("Host github.com"));
+            assert!(generated_config.contains("IdentityFile ~/.ssh/id_ed25519"));
+            assert!(generated_config.contains("Host *"));
+            assert!(generated_config.contains("IdentityFile /dev/null"));
+            assert!(!generated_config.contains(real_ssh.to_str().unwrap()));
+            assert_eq!(
+                std::fs::read_link(managed_home.join(".axis")).unwrap(),
+                agent_axis_target
+            );
+            assert_eq!(
+                std::fs::read_link(managed_home.join(".claude")).unwrap(),
+                claude_target
+            );
+            assert_eq!(
+                std::fs::read_link(managed_home.join(".local/share/claude")).unwrap(),
+                claude_share_target
+            );
+            assert_eq!(
+                std::fs::read_link(managed_home.join(".config")).unwrap(),
+                config_target
+            );
+            assert_eq!(
+                std::fs::read_link(managed_home.join(".codex")).unwrap(),
+                codex_target
+            );
+            assert_eq!(
+                config
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == "HOME")
+                    .map(|(_, value)| value.as_str()),
+                Some(managed_home.to_str().unwrap())
+            );
+            let env_value = |name: &str| {
+                config
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(env_value("HOME"), Some(managed_home.to_str().unwrap()));
+            assert_eq!(
+                env_value("XDG_CONFIG_HOME"),
+                Some(managed_home.join(".config").to_str().unwrap())
+            );
+            assert_eq!(
+                env_value("XDG_DATA_HOME"),
+                Some(managed_home.join(".local/share").to_str().unwrap())
+            );
+            assert_eq!(
+                env_value("XDG_CACHE_HOME"),
+                Some(managed_home.join(".cache").to_str().unwrap())
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&managed_home.to_string_lossy().into_owned()),
+                "MXC backend policy should grant the managed HOME"
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&agent_axis_target.to_string_lossy().into_owned()),
+                "known ~/.axis state must be rewritten to a policy-owned target"
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&claude_share_target.to_string_lossy().into_owned()),
+                "known Claude share state must be rewritten to a policy-owned target"
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&codex_target.to_string_lossy().into_owned()),
+                "known agent state target should remain mounted separately"
+            );
+            assert!(
+                !config.policy.filesystem.read_write.iter().any(|path| {
+                    path == "~/.axis"
+                        || path == "~/.local/share/claude"
+                        || path == "~/.claude"
+                        || path == "~/.config"
+                        || path == "~/.codex"
+                        || path == home.path().join(".axis").to_string_lossy().as_ref()
+                        || path
+                            == home
+                                .path()
+                                .join(".local/share/claude")
+                                .to_string_lossy()
+                                .as_ref()
+                }),
+                "MXC backend policy must not retain real home agent-state grants"
+            );
+            assert!(
+                config.policy.filesystem.deny.contains(&"~/.ssh".into()),
+                "real user ~/.ssh should remain denied"
+            );
+            let spec = crate::linux::mxc::translate_sandbox_config_for_test(&config).unwrap();
+            assert!(
+                spec.filesystem
+                    .readwrite_paths
+                    .contains(&managed_home.to_string_lossy().into_owned())
+            );
+            assert!(
+                spec.filesystem
+                    .readwrite_paths
+                    .contains(&agent_axis_target.to_string_lossy().into_owned())
+            );
+            assert!(
+                spec.filesystem
+                    .readwrite_paths
+                    .contains(&claude_share_target.to_string_lossy().into_owned())
+            );
+            assert!(!spec.filesystem.readwrite_paths.iter().any(|path| {
+                path == home.path().join(".axis").to_string_lossy().as_ref()
+                    || path
+                        == home
+                            .path()
+                            .join(".local/share/claude")
+                            .to_string_lossy()
+                            .as_ref()
+            }));
+            assert!(
+                spec.process
+                    .env
+                    .contains(&format!("HOME={}", managed_home.display()))
+            );
+            assert!(spec.process.env.contains(&format!(
+                "XDG_CONFIG_HOME={}",
+                managed_home.join(".config").display()
+            )));
+            assert!(spec.process.env.contains(&format!(
+                "XDG_DATA_HOME={}",
+                managed_home.join(".local/share").display()
+            )));
+            assert!(spec.process.env.contains(&format!(
+                "XDG_CACHE_HOME={}",
+                managed_home.join(".cache").display()
+            )));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_exec_scoped_ssh_reuses_managed_home_without_real_home_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            let key_path = real_ssh.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.deny = vec!["~/.ssh".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                false,
+                PlatformBackendSelection::LinuxMxc,
+            )
+            .unwrap();
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+
+            assert!(symlinks.is_empty());
+            assert!(real_ssh.is_dir());
+            assert!(!real_ssh.is_symlink());
+            assert_eq!(
+                std::fs::read_to_string(managed_home.join(".ssh/id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+            assert_eq!(
+                config
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == "HOME")
+                    .map(|(_, value)| value.as_str()),
+                Some(managed_home.to_str().unwrap())
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_leaves_existing_real_ssh_symlink_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh_target = home.path().join("real-ssh-target");
+            std::fs::create_dir(&real_ssh_target).unwrap();
+            let key_path = real_ssh_target.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+            std::os::unix::fs::symlink(&real_ssh_target, home.path().join(".ssh")).unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.deny = vec!["~/.ssh".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            prepare_managed_agent_workspace(&mut config, true, PlatformBackendSelection::LinuxMxc)
+                .unwrap();
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+
+            assert!(home.path().join(".ssh").is_symlink());
+            assert_eq!(
+                std::fs::read_link(home.path().join(".ssh")).unwrap(),
+                real_ssh_target
+            );
+            assert_eq!(
+                std::fs::read_to_string(managed_home.join(".ssh/id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+            assert!(
+                config.policy.filesystem.deny.contains(&"~/.ssh".into()),
+                "real user ~/.ssh symlink should remain denied"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_missing_key_uses_managed_home_without_real_home_grants() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.read_write = vec!["~/.axis".into()];
+            config.policy.filesystem.deny = vec!["~/.ssh".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            prepare_managed_agent_workspace(&mut config, true, PlatformBackendSelection::LinuxMxc)
+                .unwrap();
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+            let agent_axis_target = home.path().join(".axis/agents/agent-ssh/axis");
+
+            assert!(managed_home.join(".ssh").is_dir());
+            assert!(!managed_home.join(".ssh/id_ed25519").exists());
+            assert!(!managed_home.join(".ssh/config").exists());
+            assert_eq!(
+                std::fs::read_link(managed_home.join(".axis")).unwrap(),
+                agent_axis_target
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&agent_axis_target.to_string_lossy().into_owned())
+            );
+            assert!(
+                !config.policy.filesystem.read_write.iter().any(|path| {
+                    path == "~/.axis"
+                        || path == home.path().join(".axis").to_string_lossy().as_ref()
+                }),
+                "missing SSH keys must not leave real ~/.axis mounted"
+            );
+            assert!(
+                config.policy.filesystem.deny.contains(&"~/.ssh".into()),
+                "real user ~/.ssh should remain denied even when configured keys are missing"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_unmanaged_real_home_grants_before_copying_keys() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+
+            for grant in ["~/.ssh", "~/.axis/agents", "~/.local", "~/Documents"] {
+                let workspace = tempfile::tempdir().unwrap();
+                let mut config = test_config();
+                config.policy.name = format!("agent-{}", grant.replace(['~', '/', '.'], "_"));
+                config.workspace_dir = workspace.path().join("workspace");
+                config.policy.filesystem.read_write = vec![grant.into()];
+                config.policy.ssh = SshPolicy {
+                    allowed_keys: vec![SshKeySpec {
+                        name: "github".into(),
+                        private_key: "~/.ssh/id_ed25519".into(),
+                        allowed_hosts: vec!["github.com".into()],
+                    }],
+                    generate_config: true,
+                    generate_known_hosts: false,
+                };
+
+                let err = prepare_managed_agent_workspace(
+                    &mut config,
+                    true,
+                    PlatformBackendSelection::LinuxMxc,
+                )
+                .unwrap_err();
+                let managed_home = home
+                    .path()
+                    .join(".axis/agents")
+                    .join(&config.policy.name)
+                    .join("home");
+
+                assert!(matches!(err, SandboxError::CreationFailed(_)));
+                assert!(
+                    err.to_string()
+                        .contains("cannot grant real home read_write path"),
+                    "unexpected error for {grant}: {err}"
+                );
+                assert!(
+                    !managed_home.join(".ssh/id_ed25519").exists(),
+                    "invalid grant {grant} must be rejected before copying SSH keys"
+                );
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_unmanaged_real_home_read_only_grants() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.filesystem.read_only = vec!["~/Documents".into()];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::LinuxMxc,
+            )
+            .unwrap_err();
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+
+            assert!(matches!(err, SandboxError::CreationFailed(_)));
+            assert!(
+                err.to_string()
+                    .contains("cannot grant real home read_only path")
+            );
+            assert!(!managed_home.join(".ssh/id_ed25519").exists());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_token_expanded_real_home_escape_before_copying_keys() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+            let workspace = home.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+
+            for grant in [
+                "{workspace}/../.axis",
+                "{workspace}/../.axis/agents",
+                "{workspace}/../.local",
+                "{workspace}/../Documents",
+            ] {
+                let mut config = test_config();
+                config.policy.name = format!("agent-{}", grant.replace(['{', '}', '/', '.'], "_"));
+                config.workspace_dir = workspace.clone();
+                config.policy.filesystem.read_write = vec![grant.into()];
+                config.policy.ssh = SshPolicy {
+                    allowed_keys: vec![SshKeySpec {
+                        name: "github".into(),
+                        private_key: "~/.ssh/id_ed25519".into(),
+                        allowed_hosts: vec!["github.com".into()],
+                    }],
+                    generate_config: true,
+                    generate_known_hosts: false,
+                };
+
+                let err = prepare_managed_agent_workspace(
+                    &mut config,
+                    true,
+                    PlatformBackendSelection::LinuxMxc,
+                )
+                .unwrap_err();
+                let managed_home = home
+                    .path()
+                    .join(".axis/agents")
+                    .join(&config.policy.name)
+                    .join("home");
+
+                assert!(
+                    err.to_string()
+                        .contains("cannot grant real home read_write path"),
+                    "unexpected error for {grant}: {err}"
+                );
+                assert!(
+                    !managed_home.join(".ssh/id_ed25519").exists(),
+                    "token-expanded grant {grant} must be rejected before copying SSH keys"
+                );
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_allows_workspace_and_tmpdir_token_grants() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+            let workspace = home.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.clone();
+            config.policy.filesystem.read_write = vec![
+                "{workspace}".into(),
+                "{workspace}/state".into(),
+                "{tmpdir}".into(),
+                "{tmpdir}/cache".into(),
+            ];
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            prepare_managed_agent_workspace(&mut config, true, PlatformBackendSelection::LinuxMxc)
+                .unwrap();
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+
+            assert_eq!(
+                std::fs::read_to_string(managed_home.join(".ssh/id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&"{workspace}".into())
+                    && config
+                        .policy
+                        .filesystem
+                        .read_write
+                        .contains(&"{tmpdir}".into())
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_symlinked_home_real_home_grants() {
+        let real_home = tempfile::tempdir().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let home_link = link_parent.path().join("home-link");
+        std::os::unix::fs::symlink(real_home.path(), &home_link).unwrap();
+
+        with_home(&home_link, || {
+            let real_ssh = home_link.join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+
+            for grant in [
+                "~/Documents".to_string(),
+                "~/.ssh".to_string(),
+                real_home.path().join(".ssh").to_string_lossy().into_owned(),
+            ] {
+                let workspace = tempfile::tempdir().unwrap();
+                let mut config = test_config();
+                config.policy.name = format!("agent-{}", grant.replace(['~', '/', '.'], "_"));
+                config.workspace_dir = workspace.path().join("workspace");
+                config.policy.filesystem.read_write = vec![grant.clone()];
+                config.policy.ssh = SshPolicy {
+                    allowed_keys: vec![SshKeySpec {
+                        name: "github".into(),
+                        private_key: "~/.ssh/id_ed25519".into(),
+                        allowed_hosts: vec!["github.com".into()],
+                    }],
+                    generate_config: true,
+                    generate_known_hosts: false,
+                };
+
+                let err = prepare_managed_agent_workspace(
+                    &mut config,
+                    true,
+                    PlatformBackendSelection::LinuxMxc,
+                )
+                .unwrap_err();
+                let managed_home = home_link
+                    .join(".axis/agents")
+                    .join(&config.policy.name)
+                    .join("home");
+
+                assert!(
+                    err.to_string()
+                        .contains("cannot grant real home read_write path"),
+                    "unexpected error for {grant}: {err}"
+                );
+                assert!(
+                    !managed_home.join(".ssh/id_ed25519").exists(),
+                    "symlinked HOME grant {grant} must be rejected before copying SSH keys"
+                );
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_preexisting_managed_home_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            let key_path = real_ssh.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+
+            let outside = home.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let agent_root = home.path().join(".axis/agents/agent-ssh");
+            std::fs::create_dir_all(&agent_root).unwrap();
+            std::os::unix::fs::symlink(&outside, agent_root.join("home")).unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::LinuxMxc,
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, SandboxError::CreationFailed(_)));
+            assert!(err.to_string().contains("must not contain symlinks"));
+            assert!(!outside.join(".ssh/id_ed25519").exists());
+            assert_eq!(
+                std::fs::read_to_string(real_ssh.join("id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_rejects_preexisting_managed_ssh_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            let key_path = real_ssh.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+            std::fs::create_dir_all(&managed_home).unwrap();
+            let outside = home.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, managed_home.join(".ssh")).unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::LinuxMxc,
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, SandboxError::CreationFailed(_)));
+            assert!(err.to_string().contains("must not contain symlinks"));
+            assert!(!outside.join("id_ed25519").exists());
+            assert_eq!(
+                std::fs::read_to_string(real_ssh.join("id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mxc_scoped_ssh_cleans_generated_ssh_on_backend_setup_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            let key_path = real_ssh.join("id_ed25519");
+            std::fs::write(&key_path, "real-private-key").unwrap();
+
+            let mut config = test_config();
+            config.policy.name = "agent-ssh".into();
+            config.policy.network.mode = NetworkMode::Proxy;
+            config.workspace_dir = workspace.path().join("workspace");
+            config.policy.ssh = SshPolicy {
+                allowed_keys: vec![SshKeySpec {
+                    name: "github".into(),
+                    private_key: "~/.ssh/id_ed25519".into(),
+                    allowed_hosts: vec!["github.com".into()],
+                }],
+                generate_config: true,
+                generate_known_hosts: false,
+            };
+
+            let err = match Sandbox::create_inner_with_backend(
+                config,
+                true,
+                PlatformBackendSelection::LinuxMxc,
+            ) {
+                Ok(_) => panic!("MXC backend setup should fail for unsupported proxy mode"),
+                Err(err) => err,
+            };
+            let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+
+            assert!(matches!(err, SandboxError::IsolationFailed(_)));
+            assert!(real_ssh.is_dir());
+            assert!(!real_ssh.is_symlink());
+            assert_eq!(
+                std::fs::read_to_string(real_ssh.join("id_ed25519")).unwrap(),
+                "real-private-key"
+            );
+            assert!(
+                !managed_home.join(".ssh").exists(),
+                "generated managed SSH state should be cleaned after backend setup failure"
+            );
         });
     }
 
@@ -787,30 +1849,6 @@ mod tests {
     }
 
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-
-        struct EnvGuard {
-            home: Option<OsString>,
-        }
-
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.home {
-                        Some(value) => std::env::set_var("HOME", value),
-                        None => std::env::remove_var("HOME"),
-                    }
-                }
-            }
-        }
-
-        let previous = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        let _env_guard = EnvGuard { home: previous };
-
-        f()
+        crate::test_support::with_home(home, f)
     }
 }
