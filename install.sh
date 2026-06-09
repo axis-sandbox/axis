@@ -249,8 +249,14 @@ install() {
         tar xf "${TMPDIR}/axis-archive" -C "${TMPDIR}/extracted"
     fi
 
-    # Install binaries.
-    for bin in axis axisd; do
+    # Install binaries. The Linux seccomp launcher is an ordinary unprivileged
+    # helper used by the MXC-backed sandbox path and must live beside axis/axisd
+    # for user-prefix installs.
+    INSTALL_BINS="axis axisd"
+    if [ "$OS" = "linux" ]; then
+        INSTALL_BINS="$INSTALL_BINS axis-seccomp-launcher"
+    fi
+    for bin in $INSTALL_BINS; do
         if [ "$OS" = "windows" ]; then
             BIN_NAME="${bin}.exe"
         else
@@ -261,6 +267,10 @@ install() {
         if [ -n "$SRC" ]; then
             install_user_binary "$SRC" "${INSTALL_DIR}/${BIN_NAME}"
             echo "  Installed: ${INSTALL_DIR}/${BIN_NAME}"
+        elif [ "$bin" = "axis-seccomp-launcher" ]; then
+            echo "Error: archive does not contain axis-seccomp-launcher"
+            echo "Use a Linux release archive that ships the MXC seccomp launcher."
+            exit 1
         fi
     done
 

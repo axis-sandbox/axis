@@ -8,7 +8,7 @@ Linux sandboxing is direct process execution, not Docker or a VM.
 Build from a checkout:
 
 ```bash
-cargo build --release -p axis-cli -p axis-daemon
+cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 ```
 
 Run the default block-mode sandbox:
@@ -132,7 +132,7 @@ visible skips.
 Default local Linux proof:
 
 ```bash
-cargo build --release -p axis-cli -p axis-daemon
+cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 AXIS_BIN=./target/release/axis bash e2e/linux/test_sandbox.sh
 AXIS_BIN=./target/release/axis bash e2e/linux/test_e2e_daemon.sh
 ```

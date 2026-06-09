@@ -42,6 +42,7 @@ curl -sSf .../install.sh | sh -s -- --nightly    # Linux/macOS
 # Build from source
 cargo install --path crates/axis-cli
 cargo install --path crates/axis-daemon
+cargo install --path crates/axis-sandbox --bin axis-seccomp-launcher
 
 # Linux packages
 sudo dpkg -i axis_0.1.0_amd64.deb    # Debian/Ubuntu
@@ -54,7 +55,7 @@ policies. The curl installer keeps the default no-admin path unless
 `--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
 narrower privileged path.
 
-When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon`
+When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins`
 is enough for the local no-admin Linux quickstart and e2e tests.
 
 ## Quick Start

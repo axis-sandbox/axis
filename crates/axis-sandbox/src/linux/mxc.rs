@@ -28,6 +28,13 @@ const MXC_LINUX_PLATFORM: &str = "linux";
 const MXC_BUBBLEWRAP_CONTAINMENT: &str = "bubblewrap";
 const MXC_EXECUTOR_NAME: &str = "lxc-exec";
 const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
+const AXIS_SECCOMP_LAUNCHER_NAME: &str = "axis-seccomp-launcher";
+const AXIS_SECCOMP_LAUNCHER_DIRS: &[&str] = &[
+    "/usr/libexec/axis",
+    "/usr/local/libexec/axis",
+    "/usr/lib/axis",
+    "/usr/local/lib/axis",
+];
 const MXC_DRY_RUN_SUCCESS: &str = "Dry run completed. Result: validation passed";
 const MAX_DRY_RUN_OUTPUT_BYTES: u64 = 64 * 1024;
 const POST_TIMEOUT_REAP_GRACE_SEC: u64 = 5;
@@ -94,6 +101,17 @@ pub enum MxcExecutorError {
     MalformedDryRunOutput,
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+enum MxcSeccompLauncherError {
+    #[error(
+        "no safe axis-seccomp-launcher found in stable install locations or beside the current executable"
+    )]
+    Unavailable,
+
+    #[error("unsafe axis-seccomp-launcher candidate '{}': {reason}", path.display())]
+    UnsafeCandidate { path: PathBuf, reason: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MxcExecutionSpec {
     pub version: String,
@@ -106,6 +124,11 @@ pub struct MxcExecutionSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcExecutor {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MxcSeccompLauncher {
     path: PathBuf,
 }
 
@@ -254,6 +277,59 @@ impl MxcExecutor {
     }
 }
 
+impl MxcSeccompLauncher {
+    fn resolve() -> Result<Self, MxcSeccompLauncherError> {
+        Self::resolve_from_candidates(production_seccomp_launcher_candidates())
+    }
+
+    fn resolve_from_candidates<I, P>(candidates: I) -> Result<Self, MxcSeccompLauncherError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        for candidate in candidates {
+            if let Ok(launcher) = Self::from_path(candidate) {
+                return Ok(launcher);
+            }
+        }
+
+        Err(MxcSeccompLauncherError::Unavailable)
+    }
+
+    fn from_path<P>(path: P) -> Result<Self, MxcSeccompLauncherError>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        validate_safe_executable_path(&path, ExecutorPathMode::Production).map_err(|reason| {
+            MxcSeccompLauncherError::UnsafeCandidate {
+                path: path.clone(),
+                reason,
+            }
+        })?;
+        Ok(Self { path })
+    }
+
+    #[cfg(test)]
+    fn from_injected_path<P>(path: P) -> Result<Self, MxcSeccompLauncherError>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        validate_safe_executable_path(&path, ExecutorPathMode::TestInjected).map_err(|reason| {
+            MxcSeccompLauncherError::UnsafeCandidate {
+                path: path.clone(),
+                reason,
+            }
+        })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcDryRunResult {
     pub stdout: String,
@@ -267,6 +343,7 @@ pub(crate) struct MxcLinuxSandbox {
     child: Option<Child>,
     exit_code: Option<i32>,
     config_file: Option<tempfile::NamedTempFile>,
+    seccomp_filter_file: Option<tempfile::NamedTempFile>,
     workspace_dir: PathBuf,
     capture_output: bool,
     timeout_sec: Option<u64>,
@@ -276,27 +353,40 @@ pub(crate) struct MxcLinuxSandbox {
 impl MxcLinuxSandbox {
     pub(crate) fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
         std::fs::create_dir_all(&config.workspace_dir)?;
-        Self::new_with_executor_resolver(config, || {
-            MxcExecutor::resolve().map_err(|err| {
-                SandboxError::IsolationFailed(format!("MXC Linux executor unavailable: {err}"))
-            })
-        })
+        Self::new_with_resolvers(
+            config,
+            || {
+                MxcExecutor::resolve().map_err(|err| {
+                    SandboxError::IsolationFailed(format!("MXC Linux executor unavailable: {err}"))
+                })
+            },
+            || {
+                MxcSeccompLauncher::resolve().map_err(|err| {
+                    SandboxError::IsolationFailed(format!(
+                        "MXC Linux seccomp launcher unavailable: {err}"
+                    ))
+                })
+            },
+        )
     }
 
     #[cfg(test)]
     fn new_with_executor(
         config: &SandboxConfig,
         executor: MxcExecutor,
+        seccomp_launcher: MxcSeccompLauncher,
     ) -> Result<Self, SandboxError> {
-        Self::new_with_executor_resolver(config, || Ok(executor))
+        Self::new_with_resolvers(config, || Ok(executor), || Ok(seccomp_launcher))
     }
 
-    fn new_with_executor_resolver<F>(
+    fn new_with_resolvers<F, G>(
         config: &SandboxConfig,
         resolve_executor: F,
+        resolve_seccomp_launcher: G,
     ) -> Result<Self, SandboxError>
     where
         F: FnOnce() -> Result<MxcExecutor, SandboxError>,
+        G: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
     {
         let mut tmpdir_active = false;
         if super::landlock::policy_uses_tmpdir(&config.policy.filesystem) {
@@ -313,6 +403,15 @@ impl MxcLinuxSandbox {
                 cleanup_error,
             )
         })?;
+        let mut spec = spec;
+        let seccomp_filter_file =
+            prepare_mxc_seccomp_launch(config, &mut spec, resolve_seccomp_launcher).map_err(
+                |err| {
+                    let cleanup_error =
+                        cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                    append_cleanup_failure(err, cleanup_error)
+                },
+            )?;
         let executor = resolve_executor().map_err(|err| {
             let cleanup_error =
                 cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
@@ -338,6 +437,7 @@ impl MxcLinuxSandbox {
             child: None,
             exit_code: None,
             config_file: None,
+            seccomp_filter_file: Some(seccomp_filter_file),
             workspace_dir: config.workspace_dir.clone(),
             capture_output: config.capture_output,
             timeout_sec: config.timeout_sec,
@@ -347,6 +447,7 @@ impl MxcLinuxSandbox {
 
     fn cleanup_after_stop(&mut self) -> Result<(), SandboxError> {
         self.config_file.take();
+        self.seccomp_filter_file.take();
         self.cleanup_tmpdir()
     }
 
@@ -361,6 +462,8 @@ impl MxcLinuxSandbox {
     }
 
     fn cleanup_for_start_failure(&mut self, error: SandboxError) -> SandboxError {
+        self.config_file.take();
+        self.seccomp_filter_file.take();
         let cleanup_error = self.cleanup_tmpdir().err().map(|err| err.to_string());
         append_cleanup_failure(error, cleanup_error)
     }
@@ -772,6 +875,100 @@ fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
 }
 
+fn prepare_mxc_seccomp_launch<F>(
+    config: &SandboxConfig,
+    spec: &mut MxcExecutionSpec,
+    resolve_seccomp_launcher: F,
+) -> Result<tempfile::NamedTempFile, SandboxError>
+where
+    F: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
+{
+    let filter = super::seccomp::prepare_seccomp_with_options(
+        &config.policy.process,
+        mxc_seccomp_options_for_policy(&config.policy),
+    )
+    .map_err(SandboxError::IsolationFailed)?;
+    let seccomp_launcher = resolve_seccomp_launcher()?;
+    let filter_file = write_private_seccomp_filter(&filter)?;
+    let filter_path = path_to_string(filter_file.path())
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC seccomp filter path: {err}")))?;
+    let launcher_path = path_to_string(seccomp_launcher.path()).map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC seccomp launcher path: {err}"))
+    })?;
+
+    ensure_seccomp_support_path_not_denied(&spec.filesystem, "launcher", &launcher_path)?;
+    ensure_seccomp_support_path_not_denied(&spec.filesystem, "filter", &filter_path)?;
+    push_unique(&mut spec.filesystem.readonly_paths, launcher_path.clone());
+    push_unique(&mut spec.filesystem.readonly_paths, filter_path.clone());
+    spec.process.command_line =
+        seccomp_launcher_command_line(&launcher_path, &filter_path, &config.command, &config.args);
+
+    Ok(filter_file)
+}
+
+fn ensure_seccomp_support_path_not_denied(
+    filesystem: &MxcFilesystem,
+    label: &str,
+    path: &str,
+) -> Result<(), SandboxError> {
+    let path = Path::new(path);
+    for denied in &filesystem.denied_paths {
+        let denied = Path::new(denied);
+        if path_contains_or_equal(denied, path) {
+            return Err(SandboxError::IsolationFailed(format!(
+                "MXC seccomp {label} path '{}' is covered by denied path '{}'",
+                path.display(),
+                denied.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOptions {
+    match policy.network.mode {
+        NetworkMode::Block => super::seccomp::SeccompOptions::deny_network_socket_domains(),
+        NetworkMode::Allow | NetworkMode::Proxy => super::seccomp::SeccompOptions::default(),
+    }
+}
+
+fn write_private_seccomp_filter(
+    filter: &super::seccomp::PreparedSeccompFilter,
+) -> Result<tempfile::NamedTempFile, SandboxError> {
+    let mut file = tempfile::Builder::new()
+        .prefix("axis-mxc-seccomp-")
+        .suffix(".bpf")
+        .tempfile()
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC seccomp filter: {err}")))?;
+    file.write_all(&filter.export_bpf_bytes())
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC seccomp filter: {err}")))?;
+    file.flush()
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC seccomp filter: {err}")))?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o400))
+        .map_err(|err| SandboxError::IsolationFailed(format!("MXC seccomp filter: {err}")))?;
+    Ok(file)
+}
+
+fn seccomp_launcher_command_line(
+    launcher_path: &str,
+    filter_path: &str,
+    command: &str,
+    args: &[String],
+) -> String {
+    [
+        shell_quote_arg(launcher_path),
+        "--filter".into(),
+        shell_quote_arg(filter_path),
+        "--".into(),
+    ]
+    .into_iter()
+    .chain(std::iter::once(shell_quote_arg(command)))
+    .chain(args.iter().map(|arg| shell_quote_arg(arg)))
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 fn translate_network(policy: &Policy) -> Result<MxcNetwork, MxcTranslationError> {
     let default_policy = match policy.network.mode {
         NetworkMode::Allow => {
@@ -906,6 +1103,40 @@ fn production_executor_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+fn production_seccomp_launcher_candidates() -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for dir in AXIS_SECCOMP_LAUNCHER_DIRS {
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            Path::new(dir).join(AXIS_SECCOMP_LAUNCHER_NAME),
+        );
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            dir.join(AXIS_SECCOMP_LAUNCHER_NAME),
+        );
+        if dir.file_name().is_some_and(|name| name == "deps")
+            && let Some(parent) = dir.parent()
+        {
+            push_candidate(
+                &mut candidates,
+                &mut seen,
+                parent.join(AXIS_SECCOMP_LAUNCHER_NAME),
+            );
+        }
+    }
+
+    candidates
+}
+
 fn push_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, candidate: PathBuf) {
     if seen.insert(candidate.clone()) {
         candidates.push(candidate);
@@ -923,8 +1154,16 @@ fn validate_executor_path(
     path: &Path,
     validation_mode: ExecutorPathMode,
 ) -> Result<(), MxcExecutorError> {
+    validate_safe_executable_path(path, validation_mode)
+        .map_err(|reason| unsafe_candidate(path, reason))
+}
+
+fn validate_safe_executable_path(
+    path: &Path,
+    validation_mode: ExecutorPathMode,
+) -> Result<(), String> {
     if !path.is_absolute() {
-        return Err(unsafe_candidate(path, "path must be absolute"));
+        return Err("path must be absolute".into());
     }
 
     // SAFETY: geteuid(2) has no preconditions and only reads process state.
@@ -934,19 +1173,16 @@ fn validate_executor_path(
         current.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&current).map_err(|err| {
             if current == path && err.kind() == std::io::ErrorKind::NotFound {
-                unsafe_candidate(path, "candidate does not exist")
+                "candidate does not exist".to_string()
             } else {
-                unsafe_candidate(
-                    path,
-                    format!("could not inspect '{}': {err}", current.display()),
-                )
+                format!("could not inspect '{}': {err}", current.display())
             }
         })?;
 
         if metadata.file_type().is_symlink() {
-            return Err(unsafe_candidate(
-                path,
-                format!("path component '{}' is a symlink", current.display()),
+            return Err(format!(
+                "path component '{}' is a symlink",
+                current.display()
             ));
         }
         let mode_bits = metadata.permissions().mode();
@@ -956,45 +1192,36 @@ fn validate_executor_path(
             && allows_sticky_writable_ancestor(mode_bits, validation_mode);
         if current != Path::new("/") && uid != 0 && uid != trusted_uid && !injected_sticky_ancestor
         {
-            return Err(unsafe_candidate(
-                path,
-                format!(
-                    "path component '{}' is not owned by root or the current user",
-                    current.display()
-                ),
+            return Err(format!(
+                "path component '{}' is not owned by root or the current user",
+                current.display()
             ));
         }
 
         if current == path {
             if !metadata.is_file() {
-                return Err(unsafe_candidate(path, "candidate is not a regular file"));
+                return Err("candidate is not a regular file".into());
             }
             if mode_bits & 0o111 == 0 {
-                return Err(unsafe_candidate(path, "candidate is not executable"));
+                return Err("candidate is not executable".into());
             }
             if mode_bits & 0o022 != 0 {
-                return Err(unsafe_candidate(
-                    path,
-                    format!(
-                        "path component '{}' is group- or world-writable",
-                        current.display()
-                    ),
+                return Err(format!(
+                    "path component '{}' is group- or world-writable",
+                    current.display()
                 ));
             }
         } else if !metadata.is_dir() {
-            return Err(unsafe_candidate(
-                path,
-                format!("path component '{}' is not a directory", current.display()),
+            return Err(format!(
+                "path component '{}' is not a directory",
+                current.display()
             ));
         } else if mode_bits & 0o022 != 0
             && !allows_sticky_writable_ancestor(mode_bits, validation_mode)
         {
-            return Err(unsafe_candidate(
-                path,
-                format!(
-                    "path component '{}' is group- or world-writable",
-                    current.display()
-                ),
+            return Err(format!(
+                "path component '{}' is group- or world-writable",
+                current.display()
             ));
         }
     }
@@ -1960,6 +2187,128 @@ mod tests {
         assert!(!err.to_string().contains("super-secret"));
     }
 
+    #[test]
+    fn seccomp_launch_rewrites_command_and_mounts_private_filter_readonly() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let config_copy = root.path().join("config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 cat \"$config\" > {}\n\
+                 echo '{}'\n",
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Block),
+            workspace.path().into(),
+        );
+        config.command = "/bin/sh".into();
+        config.args = vec!["-c".into(), "echo '$PATH'".into()];
+
+        let sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher.clone())
+            .expect("fake MXC dry-run should accept rewritten command");
+
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        let command_line = json["process"]["commandLine"].as_str().unwrap();
+        assert!(command_line.contains("axis-seccomp-launcher"));
+        assert!(command_line.contains("--filter"));
+        assert!(command_line.contains("-- /bin/sh -c 'echo '\\''$PATH'\\'''"));
+        assert!(!command_line.contains("ANTHROPIC_API_KEY"));
+        assert!(!command_line.contains("proxy-with-creds"));
+
+        let readonly_paths = json["filesystem"]["readonlyPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(readonly_paths.contains(&launcher.path().to_str().unwrap()));
+        let filter_path = readonly_paths
+            .iter()
+            .copied()
+            .find(|path| path.contains("axis-mxc-seccomp-") && path.ends_with(".bpf"))
+            .expect("MXC config should mount the private seccomp filter readonly");
+        assert!(
+            Path::new(filter_path).exists(),
+            "filter file must stay alive while sandbox is alive"
+        );
+
+        drop(sandbox);
+        assert!(
+            !Path::new(filter_path).exists(),
+            "filter file should be removed when sandbox state is dropped"
+        );
+    }
+
+    #[test]
+    fn invalid_seccomp_policy_fails_before_executor_resolution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Allow);
+        policy.process.blocked_syscalls = vec!["not_a_real_syscall".into()];
+        let config = config(policy, workspace.path().into());
+
+        let result = MxcLinuxSandbox::new_with_resolvers(
+            &config,
+            || panic!("executor must not be resolved after seccomp preparation failure"),
+            || panic!("launcher must not be resolved after seccomp preparation failure"),
+        );
+        let Err(err) = result else {
+            panic!("expected seccomp preparation failure");
+        };
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("unknown syscall"));
+    }
+
+    #[test]
+    fn denied_seccomp_launcher_path_fails_before_executor_resolution() {
+        let root = secure_tempdir();
+        let workspace = root.path().join("workspace");
+        let denied = root.path().join("denied");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&denied).unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher_path = denied.join("axis-seccomp-launcher");
+        write_executable(&launcher_path, "#!/bin/sh\nexit 127\n", 0o700);
+        let launcher = MxcSeccompLauncher::from_injected_path(&launcher_path).unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Allow);
+        policy
+            .filesystem
+            .deny
+            .push(denied.to_string_lossy().into_owned());
+        let config = config(policy, workspace);
+
+        let result = MxcLinuxSandbox::new_with_resolvers(
+            &config,
+            || panic!("executor must not be resolved when seccomp support path is denied"),
+            || Ok(launcher),
+        );
+        let Err(err) = result else {
+            panic!("expected denied seccomp launcher path failure");
+        };
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("seccomp launcher path"));
+        assert!(err.to_string().contains("covered by denied path"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn runtime_captures_output_exit_code_and_removes_private_config() {
         let root = secure_tempdir();
@@ -2007,7 +2356,8 @@ mod tests {
         );
         config.capture_output = true;
 
-        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
         SandboxImpl::start(&mut sandbox).unwrap();
         let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
 
@@ -2062,7 +2412,8 @@ mod tests {
         );
         config.capture_output = false;
 
-        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
         SandboxImpl::start(&mut sandbox).unwrap();
         let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
 
@@ -2106,7 +2457,8 @@ mod tests {
         let mut config = config(policy, workspace.path().into());
         config.timeout_sec = Some(1);
 
-        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
         assert!(tmpdir.exists(), "MXC setup should create AXIS tmpdir");
         SandboxImpl::start(&mut sandbox).unwrap();
         let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
@@ -2136,20 +2488,38 @@ mod tests {
         policy.filesystem.read_write.push("{tmpdir}".into());
         let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
         let config = config(policy, workspace.path().into());
-        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
         assert!(tmpdir.exists(), "MXC setup should create AXIS tmpdir");
+        let filter_path = sandbox
+            .seccomp_filter_file
+            .as_ref()
+            .map(|file| file.path().to_path_buf())
+            .expect("MXC setup should create private seccomp filter");
+        assert!(
+            filter_path.exists(),
+            "private seccomp filter should exist before start"
+        );
         std::fs::remove_file(&executable).unwrap();
 
         let err = SandboxImpl::start(&mut sandbox).unwrap_err();
 
         assert!(matches!(err, SandboxError::SpawnFailed(_)));
         assert!(!tmpdir.exists(), "start failure should clean AXIS tmpdir");
+        assert!(
+            !filter_path.exists(),
+            "start failure should remove private seccomp filter"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_allow_and_block_runtime_parity() {
         if MxcExecutor::resolve().is_err() {
             eprintln!("safe lxc-exec unavailable (test skipped)");
+            return;
+        }
+        if MxcSeccompLauncher::resolve().is_err() {
+            eprintln!("axis-seccomp-launcher unavailable for MXC backend (test skipped)");
             return;
         }
         if find_on_path("bwrap").is_none() {
@@ -2336,6 +2706,12 @@ mod tests {
     fn write_executable(path: &Path, script: &str, mode: u32) {
         fs::write(path, script).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn fake_seccomp_launcher(root: &tempfile::TempDir) -> MxcSeccompLauncher {
+        let executable = root.path().join("axis-seccomp-launcher");
+        write_executable(&executable, "#!/bin/sh\nexit 127\n", 0o700);
+        MxcSeccompLauncher::from_injected_path(&executable).unwrap()
     }
 
     fn secure_tempdir() -> tempfile::TempDir {

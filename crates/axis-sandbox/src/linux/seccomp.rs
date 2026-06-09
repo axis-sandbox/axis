@@ -9,6 +9,8 @@
 //! the whitelist.
 
 use axis_core::policy::ProcessPolicy;
+use std::ffi::{CString, OsString};
+use std::os::unix::ffi::OsStrExt;
 
 // ── seccomp constants ─────────────────────────────────────────────────────
 
@@ -267,6 +269,40 @@ impl PreparedSeccompFilter {
             bytes.extend_from_slice(&insn.k.to_ne_bytes());
         }
         bytes
+    }
+
+    fn from_bpf_bytes(bytes: &[u8]) -> Result<Self, String> {
+        const BPF_INSN_SIZE: usize = std::mem::size_of::<BpfInsn>();
+
+        if bytes.is_empty() {
+            return Err("seccomp filter is empty".into());
+        }
+        if !bytes.len().is_multiple_of(BPF_INSN_SIZE) {
+            return Err(format!(
+                "seccomp filter has invalid byte length {}, expected a multiple of {BPF_INSN_SIZE}",
+                bytes.len()
+            ));
+        }
+
+        let instruction_count = bytes.len() / BPF_INSN_SIZE;
+        if instruction_count > u16::MAX as usize {
+            return Err(format!(
+                "seccomp filter has {instruction_count} instructions, maximum is {}",
+                u16::MAX
+            ));
+        }
+
+        let mut insns = Vec::with_capacity(instruction_count);
+        for chunk in bytes.chunks_exact(BPF_INSN_SIZE) {
+            insns.push(BpfInsn {
+                code: u16::from_ne_bytes([chunk[0], chunk[1]]),
+                jt: chunk[2],
+                jf: chunk[3],
+                k: u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+            });
+        }
+
+        Ok(Self { insns })
     }
 }
 
@@ -618,6 +654,95 @@ pub fn apply_seccomp(policy: &ProcessPolicy) -> Result<(), String> {
     Ok(())
 }
 
+pub fn launcher_main_from_env() -> i32 {
+    match run_launcher_from_args(std::env::args_os().skip(1)) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("axis-seccomp-launcher: {err}");
+            126
+        }
+    }
+}
+
+fn run_launcher_from_args<I>(args: I) -> Result<i32, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let flag = args
+        .next()
+        .ok_or_else(|| "missing --filter argument".to_string())?;
+    if flag.as_os_str() != "--filter" {
+        return Err(format!(
+            "expected --filter argument, got '{}'",
+            flag.to_string_lossy()
+        ));
+    }
+
+    let filter_path = args
+        .next()
+        .ok_or_else(|| "missing seccomp filter path".to_string())?;
+    let separator = args
+        .next()
+        .ok_or_else(|| "missing -- command separator".to_string())?;
+    if separator.as_os_str() != "--" {
+        return Err(format!(
+            "expected -- command separator, got '{}'",
+            separator.to_string_lossy()
+        ));
+    }
+
+    let command = args.collect::<Vec<_>>();
+    if command.is_empty() {
+        return Err("missing payload command".into());
+    }
+
+    let filter_bytes = std::fs::read(&filter_path).map_err(|err| {
+        format!(
+            "failed to read seccomp filter '{}': {err}",
+            filter_path.to_string_lossy()
+        )
+    })?;
+    let filter = PreparedSeccompFilter::from_bpf_bytes(&filter_bytes)?;
+    let argv = command
+        .iter()
+        .map(|arg| {
+            CString::new(arg.as_os_str().as_bytes()).map_err(|_| {
+                format!(
+                    "payload argument contains NUL byte: '{}'",
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut argv_ptrs = argv.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+    argv_ptrs.push(std::ptr::null());
+
+    let no_new_privs = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if no_new_privs < 0 {
+        return Err(format!(
+            "PR_SET_NO_NEW_PRIVS failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    filter.apply_current_process().map_err(|errno| {
+        format!(
+            "seccomp(SET_MODE_FILTER) failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        )
+    })?;
+
+    unsafe {
+        libc::execvp(argv[0].as_ptr(), argv_ptrs.as_ptr());
+    }
+
+    Err(format!(
+        "failed to exec payload '{}': {}",
+        command[0].to_string_lossy(),
+        std::io::Error::last_os_error()
+    ))
+}
+
 fn current_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
@@ -658,7 +783,9 @@ fn syscall_number(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::process::{Command, ExitStatus};
 
     const DOCUMENTED_NETWORK_SOCKET_DOMAINS: &[u32] = &[
@@ -1170,6 +1297,87 @@ mod tests {
     }
 
     #[test]
+    fn exported_bpf_roundtrip_preserves_action_matrix() {
+        let default_filter = prepare_seccomp(&ProcessPolicy::default()).unwrap();
+        let imported_default =
+            PreparedSeccompFilter::from_bpf_bytes(&default_filter.export_bpf_bytes()).unwrap();
+
+        assert_eq!(
+            prepared_bpf_decision_for(&imported_default, AUDIT_ARCH_X86_64, 0, [0; 6]),
+            FilterDecision::Allow,
+            "read should remain whitelisted after BPF export/import"
+        );
+        assert_eq!(
+            prepared_bpf_decision_for(&imported_default, 0, 0, [0; 6]),
+            FilterDecision::KillProcess,
+            "wrong architecture should keep kill action after BPF export/import"
+        );
+        assert_eq!(
+            prepared_bpf_decision_for(&imported_default, AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
+            FilterDecision::Errno(libc::ENOSYS),
+            "clone3 runtime fallback should keep ENOSYS after BPF export/import"
+        );
+        let mut execveat_args = [0_u64; 6];
+        execveat_args[EXECVEAT_FLAGS_ARG] = AT_EMPTY_PATH as u64;
+        assert_eq!(
+            prepared_bpf_decision_for(
+                &imported_default,
+                AUDIT_ARCH_X86_64,
+                SYS_EXECVEAT,
+                execveat_args
+            ),
+            FilterDecision::Errno(libc::EPERM),
+            "execveat AT_EMPTY_PATH denial should survive BPF export/import"
+        );
+
+        let blocked_policy = ProcessPolicy {
+            blocked_syscalls: vec!["getpid".into(), "clone3".into()],
+            ..Default::default()
+        };
+        let blocked_filter = prepare_seccomp(&blocked_policy).unwrap();
+        let imported_blocked =
+            PreparedSeccompFilter::from_bpf_bytes(&blocked_filter.export_bpf_bytes()).unwrap();
+        assert_eq!(
+            prepared_bpf_decision_for(&imported_blocked, AUDIT_ARCH_X86_64, 39, [0; 6]),
+            FilterDecision::Errno(libc::EPERM),
+            "policy-blocked whitelisted syscall should keep EPERM after BPF export/import"
+        );
+        assert_eq!(
+            prepared_bpf_decision_for(&imported_blocked, AUDIT_ARCH_X86_64, SYS_CLONE3, [0; 6]),
+            FilterDecision::Errno(libc::EPERM),
+            "explicitly blocked clone3 should override ENOSYS after BPF export/import"
+        );
+
+        let network_filter = prepare_seccomp_with_options(
+            &ProcessPolicy::default(),
+            SeccompOptions::deny_network_socket_domains(),
+        )
+        .unwrap();
+        let imported_network =
+            PreparedSeccompFilter::from_bpf_bytes(&network_filter.export_bpf_bytes()).unwrap();
+        assert_eq!(
+            prepared_bpf_decision_for(
+                &imported_network,
+                AUDIT_ARCH_X86_64,
+                SYS_SOCKET,
+                [libc::AF_INET as u64, 0, 0, 0, 0, 0]
+            ),
+            FilterDecision::Errno(libc::EPERM),
+            "block-mode network sockets should stay denied after BPF export/import"
+        );
+        assert_eq!(
+            prepared_bpf_decision_for(
+                &imported_network,
+                AUDIT_ARCH_X86_64,
+                SYS_SOCKETPAIR,
+                [AF_UNIX as u64, 0, 0, 0, 0, 0]
+            ),
+            FilterDecision::Allow,
+            "AF_UNIX socketpair should stay allowed after BPF export/import"
+        );
+    }
+
+    #[test]
     fn conditional_rules_deny_execveat_empty_path() {
         let spec =
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
@@ -1316,6 +1524,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seccomp_launcher_shell_smoke_under_filter() {
+        let Some(status) = run_with_seccomp_launcher(
+            "/bin/sh",
+            &["-c", "true"],
+            &ProcessPolicy::default(),
+            SeccompOptions::default(),
+        ) else {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        };
+
+        assert!(status.success(), "launcher shell smoke failed: {status}");
+    }
+
+    #[test]
+    fn seccomp_launcher_python_smoke_under_filter_when_available() {
+        let Some(python) = find_on_path("python3") else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+        let Ok(baseline) = Command::new(&python).arg("-c").arg("pass").status() else {
+            eprintln!("python3 baseline failed to start (test skipped)");
+            return;
+        };
+        if !baseline.success() {
+            eprintln!("python3 baseline failed (test skipped)");
+            return;
+        }
+
+        let status = run_with_seccomp_launcher(
+            &python,
+            &["-c", "pass"],
+            &ProcessPolicy::default(),
+            SeccompOptions::default(),
+        )
+        .expect("python3 should exist after baseline check");
+
+        assert!(status.success(), "launcher python smoke failed: {status}");
+    }
+
+    #[test]
+    fn seccomp_launcher_node_smoke_under_filter_when_available() {
+        let Some(node) = find_on_path("node") else {
+            eprintln!("node unavailable (test skipped)");
+            return;
+        };
+        let Ok(baseline) = Command::new(&node)
+            .arg("-e")
+            .arg("console.log('node-seccomp-launcher-baseline')")
+            .status()
+        else {
+            eprintln!("node baseline failed to start (test skipped)");
+            return;
+        };
+        if !baseline.success() {
+            eprintln!("node baseline failed (test skipped)");
+            return;
+        }
+
+        let status = run_with_seccomp_launcher(
+            &node,
+            &["-e", "console.log('node-seccomp-launcher-smoke')"],
+            &ProcessPolicy::default(),
+            SeccompOptions::default(),
+        )
+        .expect("node should exist after baseline check");
+
+        assert!(status.success(), "launcher node smoke failed: {status}");
+    }
+
+    #[test]
+    fn seccomp_launcher_configured_blocked_syscall_denies_process() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["write".into()],
+            ..Default::default()
+        };
+        let Some(status) = run_with_seccomp_launcher(
+            "/bin/sh",
+            &["-c", "echo denied"],
+            &policy,
+            SeccompOptions::default(),
+        ) else {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        };
+
+        assert!(
+            !status.success(),
+            "launcher write-blocked shell unexpectedly succeeded"
+        );
+    }
+
+    #[test]
+    fn seccomp_launcher_rejects_malformed_filter_before_exec() {
+        let filter = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(filter.path(), [0_u8; 3]).unwrap();
+
+        let err = run_launcher_from_args([
+            OsString::from("--filter"),
+            filter.path().as_os_str().to_owned(),
+            OsString::from("--"),
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("true"),
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("invalid byte length"));
+    }
+
     fn run_with_seccomp(
         program: &str,
         args: &[&str],
@@ -1339,6 +1658,44 @@ mod tests {
             });
         }
         Some(cmd.status().expect("seccomp runtime child should start"))
+    }
+
+    fn run_with_seccomp_launcher(
+        program: &str,
+        args: &[&str],
+        policy: &ProcessPolicy,
+        options: SeccompOptions,
+    ) -> Option<ExitStatus> {
+        if !std::path::Path::new(program).exists() {
+            return None;
+        }
+
+        let filter = prepare_seccomp_with_options(policy, options).expect("test policy prepares");
+        let mut filter_file = tempfile::NamedTempFile::new().unwrap();
+        filter_file.write_all(&filter.export_bpf_bytes()).unwrap();
+        filter_file.flush().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+
+        if pid == 0 {
+            let mut launcher_args = vec![
+                OsString::from("--filter"),
+                filter_file.path().as_os_str().to_owned(),
+                OsString::from("--"),
+                OsString::from(program),
+            ];
+            launcher_args.extend(args.iter().map(|arg| OsString::from(*arg)));
+            let code = run_launcher_from_args(launcher_args).unwrap_or(126);
+            unsafe {
+                libc::_exit(code);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid failed for seccomp launcher");
+        Some(ExitStatus::from_raw(status))
     }
 
     fn run_seccomp_probe(
@@ -1508,6 +1865,15 @@ mod tests {
         args: [u64; 6],
     ) -> FilterDecision {
         decode_seccomp_action(interpret_bpf(&spec.to_bpf(), arch, syscall_nr, args))
+    }
+
+    fn prepared_bpf_decision_for(
+        filter: &PreparedSeccompFilter,
+        arch: u32,
+        syscall_nr: u32,
+        args: [u64; 6],
+    ) -> FilterDecision {
+        decode_seccomp_action(interpret_bpf(&filter.insns, arch, syscall_nr, args))
     }
 
     fn interpret_bpf(insns: &[BpfInsn], arch: u32, syscall_nr: u32, args: [u64; 6]) -> u32 {
