@@ -3752,6 +3752,110 @@ mod tests {
     }
 
     #[test]
+    fn proxy_mode_keeps_provider_credentials_out_of_mxc_launch_state() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let argv_path = root.path().join("argv");
+        let config_copy = root.path().join("config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 printf '%s\\n' \"$@\" > {}\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 cat \"$config\" > {}\n\
+                 echo '{}'\n",
+                shell_quote_path(&argv_path),
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let proxy_port = 31_280;
+        let allocation = super::super::netns::proxy_netns_allocation(id, proxy_port);
+        let (network, proxy) = native_mxc_proxy_strategies(id, proxy_port);
+        let allowed_proxy_env = allowed_proxy_env(&proxy);
+        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
+        policy.network.policies.push(inference_endpoint_policy());
+        policy
+            .inference
+            .routes
+            .push(axis_core::policy::InferenceRoute {
+                name: "mock-provider".into(),
+                provider: Some("openai".into()),
+                endpoint: Some("https://api.openai.com/v1/chat/completions".into()),
+                model: None,
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                protocols: Vec::new(),
+            });
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.env = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("CUSTOM".into(), "kept".into()),
+            ("OPENAI_API_KEY".into(), "provider-secret".into()),
+            ("HTTPS_PROXY".into(), "http://proxy-with-creds".into()),
+        ];
+        config.proxy_port = proxy_port;
+        config.proxy_addr = Some(allocation.proxy_addr);
+
+        let _sandbox = MxcLinuxSandbox::new_with_executor_and_strategies(
+            &config,
+            executor,
+            launcher,
+            network,
+            proxy,
+            no_resource_limits_strategy(),
+        )
+        .expect("MXC construction should accept only sanitized env and Axis proxy env");
+
+        let argv = fs::read_to_string(argv_path).unwrap();
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        let captured_config: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        let captured_env = captured_config["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let mut expected_env = vec!["PATH=/usr/bin".to_string(), "CUSTOM=kept".to_string()];
+        expected_env.extend(
+            allowed_proxy_env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}")),
+        );
+        assert_eq!(captured_env, expected_env);
+
+        let forbidden = [
+            "OPENAI_API_KEY",
+            "provider-secret",
+            "proxy-with-creds",
+            "api.openai.com",
+            "mock-provider",
+            "Authorization",
+        ];
+        for captured in [&argv, &config_json] {
+            for needle in forbidden {
+                assert!(
+                    !captured.contains(needle),
+                    "MXC launch state leaked provider boundary value {needle}: {captured}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn seccomp_launch_rewrites_command_and_mounts_private_filter_readonly() {
         let root = secure_tempdir();
         let executable = root.path().join("lxc-exec");
