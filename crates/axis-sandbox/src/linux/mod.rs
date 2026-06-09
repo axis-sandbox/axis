@@ -3680,6 +3680,13 @@ mod tests {
     }
 
     fn process_exists(pid: libc::pid_t) -> bool {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some((_, rest)) = stat.rsplit_once(") ")
+            && let Some(state) = rest.split_whitespace().next()
+        {
+            return state != "Z";
+        }
+
         let ret = unsafe { libc::kill(pid, 0) };
         ret == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
