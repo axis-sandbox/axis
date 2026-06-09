@@ -101,11 +101,7 @@ impl Sandbox {
         let inner = match create_platform_sandbox_with_backend(&config, backend) {
             Ok(inner) => inner,
             Err(err) => {
-                cleanup_prepared_agent_workspace_on_setup_failure(
-                    &config,
-                    backend,
-                    &agent_symlinks,
-                );
+                cleanup_prepared_agent_workspace_on_setup_failure(&agent_symlinks);
                 return Err(err);
             }
         };
@@ -253,19 +249,8 @@ fn prepare_managed_agent_workspace(
     Ok(agent_symlinks)
 }
 
-fn cleanup_prepared_agent_workspace_on_setup_failure(
-    config: &SandboxConfig,
-    backend: PlatformBackendSelection,
-    agent_symlinks: &[(PathBuf, PathBuf)],
-) {
+fn cleanup_prepared_agent_workspace_on_setup_failure(agent_symlinks: &[(PathBuf, PathBuf)]) {
     crate::workspace::cleanup_agent_symlinks(agent_symlinks);
-
-    if uses_mxc_managed_home_for_scoped_ssh(config, backend) {
-        let ssh_dir = crate::workspace::managed_home_path(&config.policy.name).join(".ssh");
-        if let Err(err) = crate::workspace::cleanup_generated_ssh_workspace(&ssh_dir) {
-            tracing::warn!("failed to clean up generated managed SSH workspace: {err}");
-        }
-    }
 }
 
 fn uses_mxc_managed_home_for_scoped_ssh(
@@ -287,26 +272,25 @@ fn uses_mxc_managed_home_for_scoped_ssh(
 }
 
 fn prepare_mxc_managed_home_workspace(config: &mut SandboxConfig) -> Result<(), SandboxError> {
-    let managed_home = crate::workspace::prepare_managed_home_workspace(
-        &config.policy.name,
-        &config.policy.filesystem.read_write,
-    )
-    .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
-    let ssh_dir = managed_home.join(".ssh");
-    push_unique_policy_path(&mut config.policy.filesystem.read_write, &managed_home)
-        .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
-    rewrite_read_write_paths_for_mxc_managed_home_targets(
-        &config.policy.name,
-        &mut config.policy.filesystem.read_write,
-    )
-    .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
-    reject_unmanaged_home_grants_for_mxc_managed_home(config)
-        .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
-    crate::workspace::prepare_ssh_workspace_at(&config.policy.name, &config.policy.ssh, &ssh_dir)
-        .map_err(|err| SandboxError::CreationFailed(format!("scoped SSH workspace: {err}")))?;
-    set_managed_home_env(&mut config.env, &managed_home)
-        .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))?;
-    Ok(())
+    let policy_name = config.policy.name.clone();
+    crate::workspace::with_managed_home_setup_lock(&policy_name, || {
+        let managed_home = crate::workspace::prepare_managed_home_workspace(
+            &policy_name,
+            &config.policy.filesystem.read_write,
+        )?;
+        let ssh_dir = managed_home.join(".ssh");
+        push_unique_policy_path(&mut config.policy.filesystem.read_write, &managed_home)?;
+        rewrite_read_write_paths_for_mxc_managed_home_targets(
+            &policy_name,
+            &mut config.policy.filesystem.read_write,
+        )?;
+        reject_unmanaged_home_grants_for_mxc_managed_home(config)?;
+        crate::workspace::prepare_ssh_workspace_at(&policy_name, &config.policy.ssh, &ssh_dir)
+            .map_err(|err| format!("scoped SSH workspace: {err}"))?;
+        set_managed_home_env(&mut config.env, &managed_home)?;
+        Ok(())
+    })
+    .map_err(|err| SandboxError::CreationFailed(format!("managed home workspace: {err}")))
 }
 
 fn set_managed_home_env(
@@ -410,11 +394,15 @@ fn reject_unmanaged_home_grants_for_mxc_managed_home(config: &SandboxConfig) -> 
     let agent_root = normalize_existing_or_absolute_path(&crate::workspace::agent_state_root(
         &config.policy.name,
     ))?;
+    let private_setup = normalize_existing_or_absolute_path(
+        &crate::workspace::ssh_workspace_staging_parent_checked(&config.policy.name)?,
+    )?;
     let workspace = normalize_existing_or_absolute_path(&config.workspace_dir)?;
     let tmpdir = normalize_existing_or_absolute_path(&sandbox_tmpdir_path(&config.workspace_dir))?;
     let guard = ManagedHomeGrantGuard {
         home: &home,
         agent_root: &agent_root,
+        private_setup: &private_setup,
         workspace: &workspace,
         tmpdir: &tmpdir,
         raw_workspace: &config.workspace_dir,
@@ -427,6 +415,7 @@ fn reject_unmanaged_home_grants_for_mxc_managed_home(config: &SandboxConfig) -> 
 struct ManagedHomeGrantGuard<'a> {
     home: &'a Path,
     agent_root: &'a Path,
+    private_setup: &'a Path,
     workspace: &'a Path,
     tmpdir: &'a Path,
     raw_workspace: &'a Path,
@@ -441,6 +430,13 @@ fn reject_unmanaged_home_grants(
     for path in paths {
         let expanded =
             expand_managed_home_guard_path(path, guard.raw_workspace, guard.lexical_home)?;
+        if paths_overlap(&expanded, guard.private_setup) {
+            return Err(format!(
+                "MXC managed HOME cannot grant private agent setup {section} path '{}' (expanded '{}')",
+                path,
+                expanded.display()
+            ));
+        }
         if expanded.starts_with(guard.home)
             && !path_contains_or_equal(guard.agent_root, &expanded)
             && !path_contains_or_equal(guard.workspace, &expanded)
@@ -562,6 +558,10 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
 
 fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    path_contains_or_equal(left, right) || path_contains_or_equal(right, left)
 }
 
 fn remove_policy_path(paths: &mut Vec<String>, remove: &Path) -> Result<(), String> {
@@ -1400,7 +1400,7 @@ mod tests {
             std::fs::create_dir(&real_ssh).unwrap();
             std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
 
-            for grant in ["~/.ssh", "~/.axis/agents", "~/.local", "~/Documents"] {
+            for grant in ["~/.ssh", "~/.axis/cache", "~/.local", "~/Documents"] {
                 let workspace = tempfile::tempdir().unwrap();
                 let mut config = test_config();
                 config.policy.name = format!("agent-{}", grant.replace(['~', '/', '.'], "_"));
@@ -1486,6 +1486,89 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn mxc_scoped_ssh_rejects_private_setup_grants_before_copying_keys() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let real_ssh = home.path().join(".ssh");
+            std::fs::create_dir(&real_ssh).unwrap();
+            std::fs::write(real_ssh.join("id_ed25519"), "real-private-key").unwrap();
+            let agent_root = home.path().join(".axis/agents/agent-ssh");
+            let private_setup = agent_root.join("ssh-staging");
+
+            let grants = [
+                (
+                    "read_write",
+                    agent_root.to_string_lossy().into_owned(),
+                    "broad agent root",
+                ),
+                (
+                    "read_only",
+                    agent_root.to_string_lossy().into_owned(),
+                    "broad read-only agent root",
+                ),
+                (
+                    "read_write",
+                    "~/.axis/agents/agent-ssh/ssh-staging".to_string(),
+                    "private setup root",
+                ),
+                (
+                    "read_only",
+                    private_setup.join("nested").to_string_lossy().into_owned(),
+                    "private setup child",
+                ),
+                (
+                    "read_write",
+                    "{workspace}/../.axis/agents/agent-ssh/ssh-staging".to_string(),
+                    "token-expanded private setup root",
+                ),
+            ];
+
+            for (index, (section, grant, label)) in grants.into_iter().enumerate() {
+                let workspace = home.path().join(format!("workspace-{index}"));
+                std::fs::create_dir(&workspace).unwrap();
+                let mut config = test_config();
+                config.policy.name = "agent-ssh".into();
+                config.workspace_dir = workspace;
+                match section {
+                    "read_write" => config.policy.filesystem.read_write = vec![grant.clone()],
+                    "read_only" => config.policy.filesystem.read_only = vec![grant.clone()],
+                    _ => unreachable!(),
+                }
+                config.policy.ssh = SshPolicy {
+                    allowed_keys: vec![SshKeySpec {
+                        name: "github".into(),
+                        private_key: "~/.ssh/id_ed25519".into(),
+                        allowed_hosts: vec!["github.com".into()],
+                    }],
+                    generate_config: true,
+                    generate_known_hosts: false,
+                };
+
+                let err = prepare_managed_agent_workspace(
+                    &mut config,
+                    true,
+                    PlatformBackendSelection::LinuxMxc,
+                )
+                .unwrap_err();
+                let managed_home = home.path().join(".axis/agents/agent-ssh/home");
+
+                assert!(matches!(err, SandboxError::CreationFailed(_)));
+                assert!(
+                    err.to_string()
+                        .contains(&format!("cannot grant private agent setup {section} path")),
+                    "unexpected error for {label} grant {grant}: {err}"
+                );
+                assert!(
+                    !managed_home.join(".ssh/id_ed25519").exists(),
+                    "private setup grant {label} must be rejected before copying SSH keys"
+                );
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn mxc_scoped_ssh_rejects_token_expanded_real_home_escape_before_copying_keys() {
         let home = tempfile::tempdir().unwrap();
 
@@ -1497,8 +1580,8 @@ mod tests {
             std::fs::create_dir(&workspace).unwrap();
 
             for grant in [
-                "{workspace}/../.axis",
-                "{workspace}/../.axis/agents",
+                "{workspace}/../.axis/cache",
+                "{workspace}/../.axis/cache/nested",
                 "{workspace}/../.local",
                 "{workspace}/../Documents",
             ] {
@@ -1739,7 +1822,7 @@ mod tests {
             .unwrap_err();
 
             assert!(matches!(err, SandboxError::CreationFailed(_)));
-            assert!(err.to_string().contains("must not contain symlinks"));
+            assert!(err.to_string().contains("must not be a symlink"));
             assert!(!outside.join("id_ed25519").exists());
             assert_eq!(
                 std::fs::read_to_string(real_ssh.join("id_ed25519")).unwrap(),
@@ -1750,7 +1833,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mxc_scoped_ssh_cleans_generated_ssh_on_backend_setup_failure() {
+    fn mxc_scoped_ssh_preserves_generated_ssh_on_backend_setup_failure() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
 
@@ -1791,9 +1874,10 @@ mod tests {
                 std::fs::read_to_string(real_ssh.join("id_ed25519")).unwrap(),
                 "real-private-key"
             );
-            assert!(
-                !managed_home.join(".ssh").exists(),
-                "generated managed SSH state should be cleaned after backend setup failure"
+            assert_eq!(
+                std::fs::read_to_string(managed_home.join(".ssh/id_ed25519")).unwrap(),
+                "real-private-key",
+                "backend setup failure should not delete shared generated SSH state"
             );
         });
     }
