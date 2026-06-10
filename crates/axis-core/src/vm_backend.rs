@@ -1274,6 +1274,35 @@ mod tests {
     }
 
     #[test]
+    fn vm_identity_is_rejected_before_execution_spec() {
+        for descriptor in vm_backend_descriptors() {
+            let mut policy = policy_for_backend(descriptor.id);
+            policy.process.run_as_user = Some("agent".into());
+
+            let err = build_vm_backend_execution_spec(
+                &policy,
+                descriptor.id,
+                launch_for_backend(descriptor.id),
+                &present_runtime_for_backend(descriptor.id),
+                &PlannerOptions::new(),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, VmBackendSpecError::RejectedBeforeConfig(_)),
+                "{} should reject VM run_as_user before execution spec generation: {err}",
+                descriptor.id.as_str()
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("process.user_identity"),
+                "{} error should mention process.user_identity: {message}",
+                descriptor.id.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn non_vm_backend_is_not_plannable_through_vm_facade() {
         assert!(
             plan_vm_backend_policy(
