@@ -524,47 +524,39 @@ fn image_support_for_vm(
     runtime: &CapabilitySupport,
 ) -> CapabilitySupport {
     match (descriptor.id, image) {
+        (_, VmImageSource::RuntimeDefault) => runtime.clone(),
         (
             BackendCapabilityMapId::MxcLinuxMicrovm | BackendCapabilityMapId::MxcWindowsMicrovm,
             VmImageSource::MicrovmImage {
-                image_path,
-                image_home,
+                image_path: _,
+                image_home: _,
             },
-        ) if !image_path.trim().is_empty()
-            && image_home
-                .as_deref()
-                .is_none_or(|home| !home.trim().is_empty()) =>
-        {
-            runtime.clone()
-        }
+        ) => CapabilitySupport::unsupported(
+            "MXC microVM backends discover runtime images out of band; custom image sources are not represented in MXC config",
+        ),
         (
             BackendCapabilityMapId::MxcLinuxHyperlight
             | BackendCapabilityMapId::MxcWindowsHyperlight,
             VmImageSource::HyperlightSnapshot { snapshot_path },
-        ) if !snapshot_path.trim().is_empty() => runtime.clone(),
-        (
-            BackendCapabilityMapId::MxcWindowsSandbox,
-            VmImageSource::WindowsSandboxConfig { config_path },
-        ) if !config_path.trim().is_empty() => runtime.clone(),
-        (BackendCapabilityMapId::MxcWindowsIsolationSession, VmImageSource::RuntimeDefault) => {
-            runtime.clone()
-        }
-        (
-            BackendCapabilityMapId::MxcLinuxMicrovm | BackendCapabilityMapId::MxcWindowsMicrovm,
-            VmImageSource::MicrovmImage { .. },
-        ) => CapabilitySupport::unsupported(
-            "microVM image selection requires a non-empty image path and optional non-empty image home",
+        ) if snapshot_path.trim().is_empty() => CapabilitySupport::unsupported(
+            "Hyperlight snapshot selection requires a non-empty snapshot path",
         ),
         (
             BackendCapabilityMapId::MxcLinuxHyperlight
             | BackendCapabilityMapId::MxcWindowsHyperlight,
             VmImageSource::HyperlightSnapshot { .. },
         ) => CapabilitySupport::unsupported(
-            "Hyperlight snapshot selection requires a non-empty snapshot path",
+            "MXC Hyperlight backends discover snapshot homes out of band; custom snapshot sources are not represented in MXC config",
+        ),
+        (
+            BackendCapabilityMapId::MxcWindowsSandbox,
+            VmImageSource::WindowsSandboxConfig { config_path },
+        ) if config_path.trim().is_empty() => CapabilitySupport::unsupported(
+            "Windows Sandbox config selection requires a non-empty config path",
         ),
         (BackendCapabilityMapId::MxcWindowsSandbox, VmImageSource::WindowsSandboxConfig { .. }) => {
             CapabilitySupport::unsupported(
-                "Windows Sandbox selection requires a non-empty config path",
+                "MXC Windows Sandbox generates its .wsb config through the daemon; custom sandbox config paths are not represented in MXC config",
             )
         }
         (BackendCapabilityMapId::MxcWindowsIsolationSession, _) => CapabilitySupport::unsupported(
@@ -691,7 +683,7 @@ mod tests {
             let launch = launch_for_backend(descriptor.id);
             let runtime = present_runtime_for_backend(descriptor.id);
             let spec = build_vm_backend_execution_spec(
-                &policy(NetworkMode::Allow),
+                &policy_for_backend(descriptor.id),
                 descriptor.id,
                 launch,
                 &runtime,
@@ -704,8 +696,15 @@ mod tests {
             assert_eq!(spec.backend, descriptor.id.as_str());
             assert_eq!(spec.platform, descriptor.platform);
             assert_eq!(spec.config_format, descriptor.config_format);
-            assert_eq!(spec.network.mode, VmBackendNetworkMode::Allow);
-            assert_eq!(spec.filesystem.read_write, ["{workspace}"]);
+            assert_eq!(
+                spec.network.mode,
+                vm_network_mode_for_backend(descriptor.id)
+            );
+            if descriptor.id == BackendCapabilityMapId::MxcWindowsSandbox {
+                assert!(spec.filesystem.read_write.is_empty());
+            } else {
+                assert_eq!(spec.filesystem.read_write, ["{workspace}"]);
+            }
             assert_eq!(spec.suitability, descriptor.suitability);
             assert!(spec.destroy_on_exit);
         }
@@ -752,7 +751,7 @@ mod tests {
         }];
 
         let err = build_vm_backend_execution_spec(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             launch,
             &linux_microvm_runtime(),
@@ -767,16 +766,13 @@ mod tests {
     #[test]
     fn vm_execution_spec_serializes_fake_executor_boundary() {
         let launch = VmLaunchOptions {
-            image: VmImageSource::WindowsSandboxConfig {
-                config_path: "C:\\axis\\sandbox.wsb".into(),
-            },
             guest_agent: Some("axis-guest-agent.exe".into()),
             ..minimal_vm_launch()
         };
         let runtime = present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsSandbox);
 
         let spec = build_vm_backend_execution_spec(
-            &policy(NetworkMode::Allow),
+            &empty_filesystem_policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcWindowsSandbox,
             launch,
             &runtime,
@@ -787,9 +783,14 @@ mod tests {
 
         assert_eq!(json["backend"], "mxc-windows-sandbox");
         assert_eq!(json["config_format"], "mxc_windows_sandbox_json");
-        assert_eq!(json["network"]["mode"], "allow");
+        assert_eq!(json["network"]["mode"], "block");
         assert_eq!(json["guest_agent"], "axis-guest-agent.exe");
-        assert_eq!(json["filesystem"]["read_write"][0], "{workspace}");
+        assert!(
+            json["filesystem"]["read_write"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(json["suitability"]["full_agent_sessions"], false);
     }
 
@@ -803,9 +804,9 @@ mod tests {
 
         let spec = build_vm_backend_execution_spec(
             &policy,
-            BackendCapabilityMapId::MxcLinuxMicrovm,
-            microvm_launch(),
-            &linux_microvm_runtime(),
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            runtime_default_vm_launch(),
+            &linux_hyperlight_runtime(),
             &PlannerOptions::new(),
         )
         .unwrap();
@@ -826,7 +827,7 @@ mod tests {
     #[test]
     fn linux_microvm_with_present_dependencies_is_allowed_for_minimal_launch() {
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &microvm_launch(),
             &linux_microvm_runtime(),
@@ -861,7 +862,7 @@ mod tests {
             );
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &microvm_launch(),
             &runtime,
@@ -876,14 +877,15 @@ mod tests {
     }
 
     #[test]
-    fn microvm_rejects_snapshot_source() {
-        let mut launch = microvm_launch();
-        launch.image = VmImageSource::HyperlightSnapshot {
-            snapshot_path: "/var/lib/axis/snap".into(),
+    fn microvm_rejects_custom_image_source() {
+        let mut launch = runtime_default_vm_launch();
+        launch.image = VmImageSource::MicrovmImage {
+            image_path: "/var/lib/axis/microvm.img".into(),
+            image_home: Some("/var/lib/axis/images".into()),
         };
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -899,7 +901,30 @@ mod tests {
     }
 
     #[test]
-    fn hyperlight_requires_non_empty_snapshot() {
+    fn microvm_rejects_snapshot_source() {
+        let mut launch = runtime_default_vm_launch();
+        launch.image = VmImageSource::HyperlightSnapshot {
+            snapshot_path: "/var/lib/axis/snap".into(),
+        };
+
+        let plan = plan_vm_backend_policy(
+            &policy(NetworkMode::Block),
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            &launch,
+            &linux_microvm_runtime(),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan.launch_plan.outcome,
+            BackendPlanOutcome::Unsupported { .. }
+        ));
+        assert!(plan.pre_spawn_error().unwrap().contains("vm.image"));
+    }
+
+    #[test]
+    fn hyperlight_rejects_empty_snapshot_source() {
         let launch = VmLaunchOptions {
             image: VmImageSource::HyperlightSnapshot {
                 snapshot_path: String::new(),
@@ -922,12 +947,25 @@ mod tests {
     }
 
     #[test]
-    fn hyperlight_snapshot_with_present_dependencies_is_allowed() {
+    fn hyperlight_runtime_default_with_present_dependencies_is_allowed() {
+        let plan = plan_vm_backend_policy(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            &runtime_default_vm_launch(),
+            &linux_hyperlight_runtime(),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+    }
+
+    #[test]
+    fn hyperlight_rejects_custom_snapshot_source() {
         let launch = VmLaunchOptions {
             image: VmImageSource::HyperlightSnapshot {
                 snapshot_path: "/var/lib/axis/hyperlight.snap".into(),
             },
-            guest_agent: Some("axis-guest-agent".into()),
             ..minimal_vm_launch()
         };
 
@@ -940,15 +978,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+        assert!(matches!(
+            plan.launch_plan.outcome,
+            BackendPlanOutcome::Unsupported { .. }
+        ));
+        assert!(plan.pre_spawn_error().unwrap().contains("vm.image"));
     }
 
     #[test]
-    fn windows_sandbox_config_with_present_dependencies_is_allowed() {
+    fn windows_sandbox_runtime_default_with_present_dependencies_is_allowed() {
         let launch = VmLaunchOptions {
-            image: VmImageSource::WindowsSandboxConfig {
-                config_path: "C:\\axis\\sandbox.wsb".into(),
-            },
             guest_agent: Some("axis-guest-agent.exe".into()),
             ..minimal_vm_launch()
         };
@@ -957,7 +996,7 @@ mod tests {
             .with_dependency(host_dependency::WINDOWS_SANDBOX, DependencyState::Present);
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &empty_filesystem_policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcWindowsSandbox,
             &launch,
             &runtime,
@@ -971,7 +1010,7 @@ mod tests {
     #[test]
     fn isolation_session_runtime_default_with_present_dependencies_is_allowed() {
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcWindowsIsolationSession,
             &minimal_vm_launch(),
             &windows_isolation_session_runtime(),
@@ -984,10 +1023,16 @@ mod tests {
 
     #[test]
     fn isolation_session_requires_runtime_default_source() {
+        let mut launch = runtime_default_vm_launch();
+        launch.image = VmImageSource::MicrovmImage {
+            image_path: "C:\\axis\\microvm.img".into(),
+            image_home: None,
+        };
+
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcWindowsIsolationSession,
-            &microvm_launch(),
+            &launch,
             &windows_isolation_session_runtime(),
             &PlannerOptions::new(),
         )
@@ -1000,9 +1045,6 @@ mod tests {
     #[test]
     fn windows_hyperlight_missing_runtime_dependency_blocks_before_spawn() {
         let launch = VmLaunchOptions {
-            image: VmImageSource::HyperlightSnapshot {
-                snapshot_path: "C:\\axis\\hyperlight.snap".into(),
-            },
             guest_agent: Some("axis-guest-agent.exe".into()),
             ..minimal_vm_launch()
         };
@@ -1059,7 +1101,7 @@ mod tests {
         }];
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1077,7 +1119,7 @@ mod tests {
         launch.guest_working_dir = Some("/workspace".into());
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1095,7 +1137,7 @@ mod tests {
         launch.destroy_on_exit = false;
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1117,7 +1159,7 @@ mod tests {
         launch.guest_agent = None;
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1136,7 +1178,7 @@ mod tests {
         launch.architecture = Some(String::new());
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1151,14 +1193,14 @@ mod tests {
 
     #[test]
     fn microvm_rejects_empty_image_home() {
-        let mut launch = microvm_launch();
+        let mut launch = runtime_default_vm_launch();
         launch.image = VmImageSource::MicrovmImage {
             image_path: "/var/lib/axis/microvm.img".into(),
             image_home: Some(String::new()),
         };
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1180,7 +1222,7 @@ mod tests {
         }];
 
         let plan = plan_vm_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             BackendCapabilityMapId::MxcLinuxMicrovm,
             &launch,
             &linux_microvm_runtime(),
@@ -1213,21 +1255,12 @@ mod tests {
                 microvm_launch()
             }
             BackendCapabilityMapId::MxcLinuxHyperlight
-            | BackendCapabilityMapId::MxcWindowsHyperlight => VmLaunchOptions {
-                image: VmImageSource::HyperlightSnapshot {
-                    snapshot_path: "/var/lib/axis/hyperlight.snap".into(),
-                },
-                guest_agent: Some("axis-guest-agent".into()),
-                ..minimal_vm_launch()
-            },
+            | BackendCapabilityMapId::MxcWindowsHyperlight => runtime_default_vm_launch(),
             BackendCapabilityMapId::MxcWindowsSandbox => VmLaunchOptions {
-                image: VmImageSource::WindowsSandboxConfig {
-                    config_path: "C:\\axis\\sandbox.wsb".into(),
-                },
                 guest_agent: Some("axis-guest-agent.exe".into()),
                 ..minimal_vm_launch()
             },
-            BackendCapabilityMapId::MxcWindowsIsolationSession => minimal_vm_launch(),
+            BackendCapabilityMapId::MxcWindowsIsolationSession => runtime_default_vm_launch(),
             other => panic!("unexpected VM backend id {other:?}"),
         }
     }
@@ -1254,13 +1287,37 @@ mod tests {
         }
     }
 
+    fn runtime_default_vm_launch() -> VmLaunchOptions {
+        minimal_vm_launch()
+    }
+
     fn microvm_launch() -> VmLaunchOptions {
-        VmLaunchOptions {
-            image: VmImageSource::MicrovmImage {
-                image_path: "/var/lib/axis/microvm.img".into(),
-                image_home: Some("/var/lib/axis/images".into()),
-            },
-            ..minimal_vm_launch()
+        runtime_default_vm_launch()
+    }
+
+    fn policy_for_backend(id: BackendCapabilityMapId) -> Policy {
+        match id {
+            BackendCapabilityMapId::MxcLinuxMicrovm
+            | BackendCapabilityMapId::MxcWindowsMicrovm
+            | BackendCapabilityMapId::MxcWindowsIsolationSession => policy(NetworkMode::Block),
+            BackendCapabilityMapId::MxcWindowsSandbox => {
+                empty_filesystem_policy(NetworkMode::Block)
+            }
+            BackendCapabilityMapId::MxcLinuxHyperlight
+            | BackendCapabilityMapId::MxcWindowsHyperlight => policy(NetworkMode::Allow),
+            other => panic!("unexpected VM backend id {other:?}"),
+        }
+    }
+
+    fn vm_network_mode_for_backend(id: BackendCapabilityMapId) -> VmBackendNetworkMode {
+        match id {
+            BackendCapabilityMapId::MxcLinuxMicrovm
+            | BackendCapabilityMapId::MxcWindowsMicrovm
+            | BackendCapabilityMapId::MxcWindowsSandbox
+            | BackendCapabilityMapId::MxcWindowsIsolationSession => VmBackendNetworkMode::Block,
+            BackendCapabilityMapId::MxcLinuxHyperlight
+            | BackendCapabilityMapId::MxcWindowsHyperlight => VmBackendNetworkMode::Allow,
+            other => panic!("unexpected VM backend id {other:?}"),
         }
     }
 
@@ -1320,6 +1377,17 @@ mod tests {
             ssh: SshPolicy::default(),
             amd: None,
         }
+    }
+
+    fn empty_filesystem_policy(mode: NetworkMode) -> Policy {
+        let mut policy = policy(mode);
+        policy.filesystem = FilesystemPolicy {
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            deny: Vec::new(),
+            compatibility: Default::default(),
+        };
+        policy
     }
 
     fn endpoint_policy() -> EndpointPolicy {

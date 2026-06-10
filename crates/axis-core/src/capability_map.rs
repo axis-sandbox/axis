@@ -694,7 +694,7 @@ fn mxc_linux_lxc() -> BackendCapabilities {
 }
 
 fn mxc_linux_microvm() -> BackendCapabilities {
-    vm_backend(
+    microvm_backend(
         BackendCapabilityMapId::MxcLinuxMicrovm,
         BackendPlatform::Linux,
         BackendStability::Experimental,
@@ -1033,25 +1033,51 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
 }
 
 fn mxc_windows_isolation_session() -> BackendCapabilities {
-    windows_vm_like_backend(
+    let mut backend = windows_vm_like_backend(
         BackendCapabilityMapId::MxcWindowsIsolationSession,
         [
             host_dependency::MXC_EXECUTOR,
             host_dependency::WINDOWS_ISOLATION_SESSION,
         ],
         BackendStability::Preview,
-    )
+    );
+    backend.filesystem.deny = CapabilitySupport::unsupported(
+        "MXC Isolation Session rejects deniedPaths; only read-only and read-write shares are mapped",
+    );
+    backend.network.allow = CapabilitySupport::unsupported(
+        "MXC Isolation Session rejects allow-mode network policy; only default block is mapped",
+    );
+    backend.network.strict_proxy = CapabilitySupport::unsupported(
+        "MXC Isolation Session does not expose AXIS strict proxy routing",
+    );
+    backend
 }
 
 fn mxc_windows_sandbox() -> BackendCapabilities {
-    windows_vm_like_backend(
+    let mut backend = windows_vm_like_backend(
         BackendCapabilityMapId::MxcWindowsSandbox,
         [
             host_dependency::MXC_EXECUTOR,
             host_dependency::WINDOWS_SANDBOX,
         ],
         BackendStability::Preview,
-    )
+    );
+    backend.filesystem.read_only = CapabilitySupport::unsupported(
+        "MXC Windows Sandbox ignores shared filesystem policy sections",
+    );
+    backend.filesystem.read_write = CapabilitySupport::unsupported(
+        "MXC Windows Sandbox ignores shared filesystem policy sections",
+    );
+    backend.filesystem.deny = CapabilitySupport::unsupported(
+        "MXC Windows Sandbox ignores shared filesystem policy sections",
+    );
+    backend.network.allow = CapabilitySupport::unsupported(
+        "MXC Windows Sandbox does not expose allow-mode AXIS network policy; guest firewall lockdown is block-oriented",
+    );
+    backend.network.strict_proxy = CapabilitySupport::unsupported(
+        "MXC Windows Sandbox does not expose AXIS strict proxy routing",
+    );
+    backend
 }
 
 fn mxc_windows_wslc() -> BackendCapabilities {
@@ -1135,14 +1161,15 @@ fn mxc_windows_wslc() -> BackendCapabilities {
 }
 
 fn mxc_windows_microvm() -> BackendCapabilities {
-    windows_vm_like_backend(
+    microvm_backend(
         BackendCapabilityMapId::MxcWindowsMicrovm,
+        BackendPlatform::Windows,
+        BackendStability::Experimental,
         [
             host_dependency::MXC_EXECUTOR,
             host_dependency::WINDOWS_WHP,
             host_dependency::MXC_MICROVM_RUNTIME,
         ],
-        BackendStability::Experimental,
     )
 }
 
@@ -1231,6 +1258,25 @@ fn vm_backend<const N: usize>(
             ),
         },
     }
+}
+
+fn microvm_backend<const N: usize>(
+    id: BackendCapabilityMapId,
+    platform: BackendPlatform,
+    stability: BackendStability,
+    dependency_names: [&'static str; N],
+) -> BackendCapabilities {
+    let mut backend = vm_backend(id, platform, stability, dependency_names);
+    backend.filesystem.deny = CapabilitySupport::unsupported(
+        "MXC Nanvix MicroVM rejects deniedPaths; only read-only and read-write staging paths are mapped",
+    );
+    backend.network.allow = CapabilitySupport::unsupported(
+        "MXC Nanvix MicroVM has no network stack and cannot represent allow-mode network policy",
+    );
+    backend.network.strict_proxy = CapabilitySupport::unsupported(
+        "MXC Nanvix MicroVM has no network stack and cannot reach an AXIS strict proxy",
+    );
+    backend
 }
 
 fn windows_vm_like_backend<const N: usize>(
@@ -1579,7 +1625,7 @@ mod tests {
                 DependencyState::PermissionDenied,
             );
         let plan = plan_backend_policy(
-            &policy(NetworkMode::Allow),
+            &policy(NetworkMode::Block),
             &backend,
             &runtime,
             &PlannerOptions::new(),

@@ -15,6 +15,9 @@ use crate::container_backend::{
 use crate::process_backend::{
     ProcessBackendConfigFormat, ProcessBackendExecutionSpec, ProcessBackendNetworkMode,
 };
+use crate::vm_backend::{
+    VmBackendConfigFormat, VmBackendExecutionSpec, VmBackendNetworkMode, VmImageSource,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
@@ -67,6 +70,33 @@ pub enum MxcConfigError {
 
     #[error("MXC WSLC config cannot represent AXIS per-sandbox resource limits exactly")]
     WslcResourceLimitsUnsupported,
+
+    #[error("MXC VM config cannot represent custom image/config source for backend '{backend}'")]
+    VmImageSourceUnsupported { backend: String },
+
+    #[error("MXC VM config cannot represent guest working directory for backend '{backend}'")]
+    VmGuestWorkingDirectoryUnsupported { backend: String },
+
+    #[error("MXC VM config cannot represent copy-in/out for backend '{backend}'")]
+    VmCopyPathsUnsupported { backend: String },
+
+    #[error("MXC VM config cannot represent backend feature flags for backend '{backend}'")]
+    VmFeatureFlagsUnsupported { backend: String },
+
+    #[error("MXC VM config cannot represent persistent VM state for backend '{backend}'")]
+    VmPersistentStateUnsupported { backend: String },
+
+    #[error("MXC VM backend '{backend}' cannot represent denied paths exactly")]
+    VmDeniedPathsUnsupported { backend: String },
+
+    #[error("MXC VM backend '{backend}' cannot represent AXIS filesystem grants exactly")]
+    VmFilesystemUnsupported { backend: String },
+
+    #[error("MXC VM backend '{backend}' cannot represent AXIS network mode '{mode:?}' exactly")]
+    VmNetworkModeUnsupported {
+        backend: String,
+        mode: VmBackendNetworkMode,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -79,6 +109,14 @@ pub struct MxcContainerConfigOptions {
 pub struct MxcProcessConfigOptions {
     pub container_id: Option<String>,
     pub strict_proxy_enforced_by_axis: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MxcVmConfigOptions {
+    pub container_id: Option<String>,
+    pub strict_proxy_enforced_by_axis: bool,
+    pub windows_sandbox: Option<MxcWindowsSandboxConfig>,
+    pub isolation_session: Option<MxcIsolationSessionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +167,21 @@ pub struct MxcProcessWireConfig {
     pub experimental: Option<MxcExperimentalConfig>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcVmWireConfig {
+    pub version: String,
+    #[serde(rename = "containerId", skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    pub containment: MxcContainment,
+    pub platform: MxcPlatform,
+    pub process: MxcProcessConfig,
+    pub filesystem: MxcFilesystemConfig,
+    pub network: MxcNetworkConfig,
+    pub lifecycle: MxcLifecycleConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<MxcExperimentalConfig>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MxcContainment {
@@ -138,6 +191,10 @@ pub enum MxcContainment {
     ProcessContainer,
     Seatbelt,
     Wslc,
+    Microvm,
+    Hyperlight,
+    WindowsSandbox,
+    IsolationSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +262,10 @@ pub struct MxcExperimentalConfig {
     pub wslc: Option<MxcWslcConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seatbelt: Option<MxcSeatbeltConfig>,
+    #[serde(rename = "windows_sandbox", skip_serializing_if = "Option::is_none")]
+    pub windows_sandbox: Option<MxcWindowsSandboxConfig>,
+    #[serde(rename = "isolation_session", skip_serializing_if = "Option::is_none")]
+    pub isolation_session: Option<MxcIsolationSessionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +318,39 @@ impl Default for MxcSeatbeltConfig {
 pub enum MxcSeatbeltLaunchMethod {
     Exec,
     Open,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcWindowsSandboxConfig {
+    #[serde(rename = "idleTimeoutMs")]
+    pub idle_timeout_ms: u32,
+    #[serde(rename = "daemonPipeName")]
+    pub daemon_pipe_name: String,
+}
+
+impl Default for MxcWindowsSandboxConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_ms: 300_000,
+            daemon_pipe_name: "wxc-windows-sandbox".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcIsolationSessionConfig {
+    #[serde(rename = "configurationId")]
+    pub configuration_id: MxcIsolationSessionConfigurationId,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MxcIsolationSessionConfigurationId {
+    Small,
+    Medium,
+    Large,
+    #[default]
+    Composable,
 }
 
 pub fn build_mxc_container_config(
@@ -396,6 +490,73 @@ pub fn build_mxc_process_config(
     }
 }
 
+pub fn build_mxc_vm_config(
+    process: MxcProcessConfig,
+    spec: &VmBackendExecutionSpec,
+    options: MxcVmConfigOptions,
+) -> Result<MxcVmWireConfig, MxcConfigError> {
+    validate_process_config(&process)?;
+    validate_vm_launch(spec)?;
+    validate_vm_filesystem(spec)?;
+    validate_vm_network(spec, &options)?;
+
+    let filesystem = MxcFilesystemConfig {
+        readwrite_paths: spec.filesystem.read_write.clone(),
+        readonly_paths: spec.filesystem.read_only.clone(),
+        denied_paths: spec.filesystem.deny.clone(),
+    };
+    let network = MxcNetworkConfig {
+        default_policy: mxc_vm_network_policy(spec, &options)?,
+    };
+    let lifecycle = MxcLifecycleConfig {
+        destroy_on_exit: spec.destroy_on_exit,
+        preserve_policy: false,
+    };
+
+    let (containment, platform, experimental) = match spec.config_format {
+        VmBackendConfigFormat::MxcLinuxMicrovmJson => {
+            (MxcContainment::Microvm, MxcPlatform::Linux, None)
+        }
+        VmBackendConfigFormat::MxcLinuxHyperlightJson => {
+            (MxcContainment::Hyperlight, MxcPlatform::Linux, None)
+        }
+        VmBackendConfigFormat::MxcWindowsMicrovmJson => {
+            (MxcContainment::Microvm, MxcPlatform::Windows, None)
+        }
+        VmBackendConfigFormat::MxcWindowsHyperlightJson => {
+            (MxcContainment::Hyperlight, MxcPlatform::Windows, None)
+        }
+        VmBackendConfigFormat::MxcWindowsSandboxJson => (
+            MxcContainment::WindowsSandbox,
+            MxcPlatform::Windows,
+            Some(MxcExperimentalConfig {
+                windows_sandbox: Some(options.windows_sandbox.unwrap_or_default()),
+                ..Default::default()
+            }),
+        ),
+        VmBackendConfigFormat::MxcWindowsIsolationSessionJson => (
+            MxcContainment::IsolationSession,
+            MxcPlatform::Windows,
+            Some(MxcExperimentalConfig {
+                isolation_session: Some(options.isolation_session.unwrap_or_default()),
+                ..Default::default()
+            }),
+        ),
+    };
+
+    Ok(MxcVmWireConfig {
+        version: MXC_CONFIG_VERSION.into(),
+        container_id: options.container_id,
+        containment,
+        platform,
+        process,
+        filesystem,
+        network,
+        lifecycle,
+        experimental,
+    })
+}
+
 fn process_config_for_process_spec(
     command_line: String,
     spec: &ProcessBackendExecutionSpec,
@@ -473,6 +634,101 @@ fn validate_container_network(
     Ok(())
 }
 
+fn validate_vm_launch(spec: &VmBackendExecutionSpec) -> Result<(), MxcConfigError> {
+    if !matches!(spec.image, VmImageSource::RuntimeDefault) {
+        return Err(MxcConfigError::VmImageSourceUnsupported {
+            backend: spec.backend.clone(),
+        });
+    }
+    if spec.guest_working_dir.is_some() {
+        return Err(MxcConfigError::VmGuestWorkingDirectoryUnsupported {
+            backend: spec.backend.clone(),
+        });
+    }
+    if !spec.copy_in.is_empty() || !spec.copy_out.is_empty() {
+        return Err(MxcConfigError::VmCopyPathsUnsupported {
+            backend: spec.backend.clone(),
+        });
+    }
+    if !spec.required_features.is_empty() {
+        return Err(MxcConfigError::VmFeatureFlagsUnsupported {
+            backend: spec.backend.clone(),
+        });
+    }
+    if !spec.destroy_on_exit {
+        return Err(MxcConfigError::VmPersistentStateUnsupported {
+            backend: spec.backend.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_vm_filesystem(spec: &VmBackendExecutionSpec) -> Result<(), MxcConfigError> {
+    match spec.config_format {
+        VmBackendConfigFormat::MxcLinuxMicrovmJson
+        | VmBackendConfigFormat::MxcWindowsMicrovmJson
+        | VmBackendConfigFormat::MxcWindowsIsolationSessionJson
+            if !spec.filesystem.deny.is_empty() =>
+        {
+            Err(MxcConfigError::VmDeniedPathsUnsupported {
+                backend: spec.backend.clone(),
+            })
+        }
+        VmBackendConfigFormat::MxcWindowsSandboxJson
+            if !spec.filesystem.read_only.is_empty()
+                || !spec.filesystem.read_write.is_empty()
+                || !spec.filesystem.deny.is_empty() =>
+        {
+            Err(MxcConfigError::VmFilesystemUnsupported {
+                backend: spec.backend.clone(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_vm_network(
+    spec: &VmBackendExecutionSpec,
+    options: &MxcVmConfigOptions,
+) -> Result<(), MxcConfigError> {
+    let has_endpoint_policy =
+        !spec.network.endpoint_policy_names.is_empty() || spec.network.binary_attribution_required;
+    if has_endpoint_policy && spec.network.mode != VmBackendNetworkMode::StrictProxy {
+        return Err(MxcConfigError::EndpointPolicyRequiresStrictProxy);
+    }
+    if spec.network.mode == VmBackendNetworkMode::StrictProxy
+        && !options.strict_proxy_enforced_by_axis
+    {
+        return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
+    }
+
+    let supported = match spec.config_format {
+        VmBackendConfigFormat::MxcLinuxMicrovmJson
+        | VmBackendConfigFormat::MxcWindowsMicrovmJson
+        | VmBackendConfigFormat::MxcWindowsSandboxJson
+        | VmBackendConfigFormat::MxcWindowsIsolationSessionJson => {
+            spec.network.mode == VmBackendNetworkMode::Block
+        }
+        VmBackendConfigFormat::MxcLinuxHyperlightJson
+        | VmBackendConfigFormat::MxcWindowsHyperlightJson => {
+            matches!(
+                spec.network.mode,
+                VmBackendNetworkMode::Allow | VmBackendNetworkMode::Block
+            ) || (spec.network.mode == VmBackendNetworkMode::StrictProxy
+                && options.strict_proxy_enforced_by_axis)
+        }
+    };
+
+    if !supported {
+        return Err(MxcConfigError::VmNetworkModeUnsupported {
+            backend: spec.backend.clone(),
+            mode: spec.network.mode,
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_bind_mounts(spec: &ContainerBackendExecutionSpec) -> Result<(), MxcConfigError> {
     if spec.config_format == ContainerBackendConfigFormat::MxcWindowsWslcJson
         && !spec.bind_mounts.is_empty()
@@ -540,6 +796,20 @@ fn mxc_network_policy(
     }
 }
 
+fn mxc_vm_network_policy(
+    spec: &VmBackendExecutionSpec,
+    options: &MxcVmConfigOptions,
+) -> Result<MxcNetworkDefaultPolicy, MxcConfigError> {
+    match spec.network.mode {
+        VmBackendNetworkMode::Allow => Ok(MxcNetworkDefaultPolicy::Allow),
+        VmBackendNetworkMode::Block => Ok(MxcNetworkDefaultPolicy::Block),
+        VmBackendNetworkMode::StrictProxy if options.strict_proxy_enforced_by_axis => {
+            Ok(MxcNetworkDefaultPolicy::Allow)
+        }
+        VmBackendNetworkMode::StrictProxy => Err(MxcConfigError::StrictProxyRequiresAxisLayer),
+    }
+}
+
 fn lxc_distribution_release(
     spec: &ContainerBackendExecutionSpec,
 ) -> Result<(&str, &str), MxcConfigError> {
@@ -598,6 +868,10 @@ mod tests {
     };
     use crate::process_backend::{
         ProcessBackendSpecError, ProcessLaunchOptions, build_process_backend_execution_spec,
+    };
+    use crate::vm_backend::{
+        VmBackendExecutionSpec, VmBackendFilesystemSpec, VmBackendNetworkMode, VmBackendSpecError,
+        VmCopyPath, VmImageSource, VmLaunchOptions, build_vm_backend_execution_spec,
     };
     use std::collections::BTreeMap;
 
@@ -737,6 +1011,123 @@ mod tests {
             json["experimental"]["seatbelt"]
                 .get("extraMachLookups")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn linux_microvm_config_serializes_mxc_wire_shape() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let config = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-microvm")).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+
+        assert_eq!(json["version"], MXC_CONFIG_VERSION);
+        assert_eq!(json["containerId"], "axis-microvm");
+        assert_eq!(json["containment"], "microvm");
+        assert_eq!(json["platform"], "linux");
+        assert_eq!(json["process"]["commandLine"], "print('vm')");
+        assert_eq!(json["process"]["timeout"], 30000);
+        assert_eq!(json["filesystem"]["readonlyPaths"][0], "/opt/axis-ref");
+        assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
+        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert_eq!(json["lifecycle"]["destroyOnExit"], true);
+        assert!(json.get("experimental").is_none());
+    }
+
+    #[test]
+    fn linux_hyperlight_config_serializes_mxc_wire_shape() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Allow,
+            vm_policy(NetworkMode::Allow),
+        )
+        .unwrap();
+        let config =
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-hyperlight")).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+
+        assert_eq!(json["containment"], "hyperlight");
+        assert_eq!(json["platform"], "linux");
+        assert_eq!(json["network"]["defaultPolicy"], "allow");
+        assert_eq!(json["filesystem"]["readwritePaths"][0], "/workspace");
+        assert!(json.get("experimental").is_none());
+    }
+
+    #[test]
+    fn windows_sandbox_config_serializes_experimental_mxc_wire_shape() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsSandbox,
+            NetworkMode::Block,
+            vm_empty_filesystem_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let config = build_mxc_vm_config(
+            vm_process(),
+            &spec,
+            MxcVmConfigOptions {
+                container_id: Some("axis-windows-sandbox".into()),
+                windows_sandbox: Some(MxcWindowsSandboxConfig {
+                    idle_timeout_ms: 60_000,
+                    daemon_pipe_name: "axis-windows-sandbox".into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+
+        assert_eq!(json["containment"], "windows_sandbox");
+        assert_eq!(json["platform"], "windows");
+        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert!(
+            json["filesystem"]["readwritePaths"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            json["experimental"]["windows_sandbox"]["idleTimeoutMs"],
+            60_000
+        );
+        assert_eq!(
+            json["experimental"]["windows_sandbox"]["daemonPipeName"],
+            "axis-windows-sandbox"
+        );
+    }
+
+    #[test]
+    fn isolation_session_config_serializes_experimental_mxc_wire_shape() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsIsolationSession,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let config = build_mxc_vm_config(
+            vm_process(),
+            &spec,
+            MxcVmConfigOptions {
+                container_id: Some("axis-isolation-session".into()),
+                isolation_session: Some(MxcIsolationSessionConfig {
+                    configuration_id: MxcIsolationSessionConfigurationId::Medium,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+
+        assert_eq!(json["containment"], "isolation_session");
+        assert_eq!(json["platform"], "windows");
+        assert_eq!(json["network"]["defaultPolicy"], "block");
+        assert_eq!(json["filesystem"]["readonlyPaths"][0], "/opt/axis-ref");
+        assert_eq!(
+            json["experimental"]["isolation_session"]["configurationId"],
+            "medium"
         );
     }
 
@@ -976,6 +1367,237 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vm_inputs_are_validated_before_mxc_config() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let mut process_config = vm_process();
+        process_config.command_line = " ".into();
+        assert_eq!(
+            build_mxc_vm_config(process_config, &spec, vm_options("axis-vm")).unwrap_err(),
+            MxcConfigError::EmptyCommandLine
+        );
+
+        let mut process_config = vm_process();
+        process_config.env.push("BAD_ENV".into());
+        assert_eq!(
+            build_mxc_vm_config(process_config, &spec, vm_options("axis-vm")).unwrap_err(),
+            MxcConfigError::InvalidEnvironmentEntry
+        );
+    }
+
+    #[test]
+    fn vm_config_rejects_custom_image_sources_before_mxc_config() {
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        spec.image = VmImageSource::MicrovmImage {
+            image_path: "/var/lib/axis/microvm.img".into(),
+            image_home: Some("/var/lib/axis/images".into()),
+        };
+
+        let err = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-microvm")).unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::VmImageSourceUnsupported {
+                backend: "mxc-linux-microvm".into()
+            }
+        );
+    }
+
+    #[test]
+    fn vm_config_rejects_unmapped_launch_fields_before_mxc_config() {
+        let base = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+
+        let mut spec = base.clone();
+        spec.guest_working_dir = Some("/workspace".into());
+        assert_eq!(
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-vm")).unwrap_err(),
+            MxcConfigError::VmGuestWorkingDirectoryUnsupported {
+                backend: "mxc-linux-hyperlight".into()
+            }
+        );
+
+        let mut spec = base.clone();
+        spec.copy_in = vec![VmCopyPath {
+            host_path: "/tmp/in".into(),
+            guest_path: "/workspace/in".into(),
+        }];
+        assert_eq!(
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-vm")).unwrap_err(),
+            MxcConfigError::VmCopyPathsUnsupported {
+                backend: "mxc-linux-hyperlight".into()
+            }
+        );
+
+        let mut spec = base.clone();
+        spec.required_features = vec!["snapshot_restore".into()];
+        assert_eq!(
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-vm")).unwrap_err(),
+            MxcConfigError::VmFeatureFlagsUnsupported {
+                backend: "mxc-linux-hyperlight".into()
+            }
+        );
+
+        let mut spec = base;
+        spec.destroy_on_exit = false;
+        assert_eq!(
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-vm")).unwrap_err(),
+            MxcConfigError::VmPersistentStateUnsupported {
+                backend: "mxc-linux-hyperlight".into()
+            }
+        );
+    }
+
+    #[test]
+    fn vm_config_rejects_endpoint_policies_outside_strict_proxy_mode() {
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Allow,
+            vm_policy(NetworkMode::Allow),
+        )
+        .unwrap();
+        spec.network.endpoint_policy_names.push("github".into());
+
+        let err =
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-hyperlight")).unwrap_err();
+
+        assert_eq!(err, MxcConfigError::EndpointPolicyRequiresStrictProxy);
+    }
+
+    #[test]
+    fn vm_config_rejects_strict_proxy_without_axis_owned_network_layer() {
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Allow,
+            vm_policy(NetworkMode::Allow),
+        )
+        .unwrap();
+        spec.network.mode = VmBackendNetworkMode::StrictProxy;
+
+        let err =
+            build_mxc_vm_config(vm_process(), &spec, vm_options("axis-hyperlight")).unwrap_err();
+        assert_eq!(err, MxcConfigError::StrictProxyRequiresAxisLayer);
+
+        let config = build_mxc_vm_config(
+            vm_process(),
+            &spec,
+            MxcVmConfigOptions {
+                container_id: Some("axis-hyperlight".into()),
+                strict_proxy_enforced_by_axis: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.network.default_policy,
+            MxcNetworkDefaultPolicy::Allow
+        );
+    }
+
+    #[test]
+    fn vm_config_rejects_backend_network_modes_that_mxc_cannot_enforce() {
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        spec.network.mode = VmBackendNetworkMode::Allow;
+
+        let err = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-microvm")).unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::VmNetworkModeUnsupported {
+                backend: "mxc-linux-microvm".into(),
+                mode: VmBackendNetworkMode::Allow,
+            }
+        );
+
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsIsolationSession,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        spec.network.mode = VmBackendNetworkMode::StrictProxy;
+
+        let err = build_mxc_vm_config(
+            vm_process(),
+            &spec,
+            MxcVmConfigOptions {
+                strict_proxy_enforced_by_axis: true,
+                ..vm_options("axis-isolation-session")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::VmNetworkModeUnsupported {
+                backend: "mxc-windows-isolation-session".into(),
+                mode: VmBackendNetworkMode::StrictProxy,
+            }
+        );
+    }
+
+    #[test]
+    fn vm_config_rejects_filesystem_modes_that_mxc_cannot_enforce() {
+        let mut spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        spec.filesystem.deny = vec!["/home/user/.ssh".into()];
+
+        let err = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-microvm")).unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::VmDeniedPathsUnsupported {
+                backend: "mxc-linux-microvm".into()
+            }
+        );
+
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcWindowsSandbox,
+            NetworkMode::Block,
+            vm_empty_filesystem_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let mut spec = spec;
+        spec.filesystem = VmBackendFilesystemSpec {
+            read_only: vec!["C:\\reference".into()],
+            read_write: vec!["C:\\workspace".into()],
+            deny: Vec::new(),
+        };
+
+        let err = build_mxc_vm_config(vm_process(), &spec, vm_options("axis-windows-sandbox"))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::VmFilesystemUnsupported {
+                backend: "mxc-windows-sandbox".into()
+            }
+        );
+    }
+
     fn lxc_execution_spec(
         mode: NetworkMode,
     ) -> Result<ContainerBackendExecutionSpec, ContainerBackendSpecError> {
@@ -1016,6 +1638,24 @@ mod tests {
         }
     }
 
+    fn vm_options(container_id: &str) -> MxcVmConfigOptions {
+        MxcVmConfigOptions {
+            container_id: Some(container_id.into()),
+            strict_proxy_enforced_by_axis: false,
+            windows_sandbox: None,
+            isolation_session: None,
+        }
+    }
+
+    fn vm_process() -> MxcProcessConfig {
+        MxcProcessConfig {
+            command_line: "print('vm')".into(),
+            cwd: None,
+            env: vec!["AXIS_VM_TEST=1".into()],
+            timeout: Some(30_000),
+        }
+    }
+
     fn present_runtime_for_backend(id: BackendCapabilityMapId) -> RuntimeProbeSnapshot {
         backend_capability_map(id).host_dependencies.iter().fold(
             RuntimeProbeSnapshot::new(),
@@ -1023,6 +1663,41 @@ mod tests {
                 runtime.with_dependency(&dependency.name, DependencyState::Present)
             },
         )
+    }
+
+    fn vm_execution_spec(
+        id: BackendCapabilityMapId,
+        mode: NetworkMode,
+        policy: Policy,
+    ) -> Result<VmBackendExecutionSpec, VmBackendSpecError> {
+        build_vm_backend_execution_spec(
+            &policy,
+            id,
+            vm_launch(),
+            &present_runtime_for_backend(id),
+            &PlannerOptions::new(),
+        )
+        .map(|mut spec| {
+            spec.network.mode = match mode {
+                NetworkMode::Allow => VmBackendNetworkMode::Allow,
+                NetworkMode::Block => VmBackendNetworkMode::Block,
+                NetworkMode::Proxy => VmBackendNetworkMode::StrictProxy,
+            };
+            spec
+        })
+    }
+
+    fn vm_launch() -> VmLaunchOptions {
+        VmLaunchOptions {
+            image: VmImageSource::RuntimeDefault,
+            architecture: Some("x86_64".into()),
+            guest_agent: Some("axis-guest-agent".into()),
+            guest_working_dir: None,
+            copy_in: Vec::new(),
+            copy_out: Vec::new(),
+            required_features: Vec::new(),
+            destroy_on_exit: true,
+        }
     }
 
     fn lxc_launch() -> ContainerLaunchOptions {
@@ -1130,6 +1805,44 @@ mod tests {
             ssh: SshPolicy::default(),
             amd: None,
         }
+    }
+
+    fn vm_policy(mode: NetworkMode) -> Policy {
+        Policy {
+            version: 1,
+            name: "mxc-vm-config-test".into(),
+            filesystem: FilesystemPolicy {
+                read_only: vec!["/opt/axis-ref".into()],
+                read_write: vec!["/workspace".into()],
+                deny: Vec::new(),
+                compatibility: Default::default(),
+            },
+            process: ProcessPolicy {
+                max_processes: 0,
+                max_memory_mb: 0,
+                cpu_rate_percent: 0,
+                ..Default::default()
+            },
+            network: NetworkPolicy {
+                mode,
+                policies: Vec::new(),
+            },
+            inference: InferencePolicy::default(),
+            gpu: GpuPolicy::default(),
+            ssh: SshPolicy::default(),
+            amd: None,
+        }
+    }
+
+    fn vm_empty_filesystem_policy(mode: NetworkMode) -> Policy {
+        let mut policy = vm_policy(mode);
+        policy.filesystem = FilesystemPolicy {
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            deny: Vec::new(),
+            compatibility: Default::default(),
+        };
+        policy
     }
 
     fn endpoint_policy_with_binary() -> EndpointPolicy {
