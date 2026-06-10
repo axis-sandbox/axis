@@ -16,8 +16,9 @@ use crate::capability::{
 use crate::capability_map::{
     BackendCapabilityMapId, backend_capability_map, backend_capability_maps_for_platform,
 };
-use crate::policy::Policy;
+use crate::policy::{NetworkMode, Policy};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +89,46 @@ pub struct VmLaunchOptions {
     pub required_features: Vec<String>,
     #[serde(default = "default_destroy_on_exit")]
     pub destroy_on_exit: bool,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum VmBackendSpecError {
+    #[error("{0:?} is not a VM-style backend")]
+    NotVmBackend(BackendCapabilityMapId),
+
+    #[error("VM backend rejected launch before config generation: {0}")]
+    RejectedBeforeConfig(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmBackendNetworkMode {
+    Allow,
+    Block,
+    StrictProxy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmBackendExecutionSpec {
+    pub backend: String,
+    pub platform: BackendPlatform,
+    pub config_format: VmBackendConfigFormat,
+    pub image: VmImageSource,
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub guest_agent: Option<String>,
+    #[serde(default)]
+    pub guest_working_dir: Option<String>,
+    #[serde(default)]
+    pub copy_in: Vec<VmCopyPath>,
+    #[serde(default)]
+    pub copy_out: Vec<VmCopyPath>,
+    #[serde(default)]
+    pub required_features: Vec<String>,
+    pub destroy_on_exit: bool,
+    pub network_mode: VmBackendNetworkMode,
+    pub suitability: VmBackendSuitability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +293,47 @@ pub fn plan_vm_backend_policy(
         policy_plan,
         launch_plan,
     })
+}
+
+pub fn build_vm_backend_execution_spec(
+    policy: &Policy,
+    id: BackendCapabilityMapId,
+    launch: VmLaunchOptions,
+    runtime: &RuntimeProbeSnapshot,
+    options: &PlannerOptions,
+) -> Result<VmBackendExecutionSpec, VmBackendSpecError> {
+    let plan = plan_vm_backend_policy(policy, id, &launch, runtime, options)
+        .ok_or(VmBackendSpecError::NotVmBackend(id))?;
+    if !plan.spawn_allowed() {
+        return Err(VmBackendSpecError::RejectedBeforeConfig(
+            plan.pre_spawn_error()
+                .unwrap_or_else(|| "unknown VM backend planning failure".into()),
+        ));
+    }
+
+    Ok(VmBackendExecutionSpec {
+        backend: plan.descriptor.id.as_str().into(),
+        platform: plan.descriptor.platform,
+        config_format: plan.descriptor.config_format,
+        image: launch.image,
+        architecture: launch.architecture,
+        guest_agent: launch.guest_agent,
+        guest_working_dir: launch.guest_working_dir,
+        copy_in: launch.copy_in,
+        copy_out: launch.copy_out,
+        required_features: launch.required_features,
+        destroy_on_exit: launch.destroy_on_exit,
+        network_mode: vm_network_mode(policy),
+        suitability: plan.descriptor.suitability,
+    })
+}
+
+fn vm_network_mode(policy: &Policy) -> VmBackendNetworkMode {
+    match policy.network.mode {
+        NetworkMode::Allow => VmBackendNetworkMode::Allow,
+        NetworkMode::Block => VmBackendNetworkMode::Block,
+        NetworkMode::Proxy => VmBackendNetworkMode::StrictProxy,
+    }
 }
 
 fn plan_vm_launch_options(
@@ -556,6 +638,112 @@ mod tests {
             assert!(!descriptor.suitability.not_suitable);
             assert!(descriptor.suitability.reason.contains("not proven"));
         }
+    }
+
+    #[test]
+    fn vm_execution_spec_covers_all_vm_backend_formats() {
+        for descriptor in vm_backend_descriptors() {
+            let launch = launch_for_backend(descriptor.id);
+            let runtime = present_runtime_for_backend(descriptor.id);
+            let spec = build_vm_backend_execution_spec(
+                &policy(NetworkMode::Allow),
+                descriptor.id,
+                launch,
+                &runtime,
+                &PlannerOptions::new(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("{} rejected unexpectedly: {err}", descriptor.id.as_str())
+            });
+
+            assert_eq!(spec.backend, descriptor.id.as_str());
+            assert_eq!(spec.platform, descriptor.platform);
+            assert_eq!(spec.config_format, descriptor.config_format);
+            assert_eq!(spec.network_mode, VmBackendNetworkMode::Allow);
+            assert_eq!(spec.suitability, descriptor.suitability);
+            assert!(spec.destroy_on_exit);
+        }
+    }
+
+    #[test]
+    fn vm_execution_spec_rejects_non_vm_backend_before_config() {
+        let err = build_vm_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxLxc,
+            microvm_launch(),
+            &linux_microvm_runtime(),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            VmBackendSpecError::NotVmBackend(BackendCapabilityMapId::MxcLinuxLxc)
+        );
+    }
+
+    #[test]
+    fn vm_execution_spec_rejects_unmapped_proxy_before_config() {
+        let err = build_vm_backend_execution_spec(
+            &policy(NetworkMode::Proxy),
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            microvm_launch(),
+            &linux_microvm_runtime(),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VmBackendSpecError::RejectedBeforeConfig(_)));
+        assert!(err.to_string().contains("audit.bypass_evidence"));
+    }
+
+    #[test]
+    fn vm_execution_spec_rejects_unmapped_copy_before_config() {
+        let mut launch = microvm_launch();
+        launch.copy_in = vec![VmCopyPath {
+            host_path: "/tmp/in".into(),
+            guest_path: "/workspace/in".into(),
+        }];
+
+        let err = build_vm_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            launch,
+            &linux_microvm_runtime(),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VmBackendSpecError::RejectedBeforeConfig(_)));
+        assert!(err.to_string().contains("vm.copy"));
+    }
+
+    #[test]
+    fn vm_execution_spec_serializes_fake_executor_boundary() {
+        let launch = VmLaunchOptions {
+            image: VmImageSource::WindowsSandboxConfig {
+                config_path: "C:\\axis\\sandbox.wsb".into(),
+            },
+            guest_agent: Some("axis-guest-agent.exe".into()),
+            ..minimal_vm_launch()
+        };
+        let runtime = present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsSandbox);
+
+        let spec = build_vm_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcWindowsSandbox,
+            launch,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+
+        assert_eq!(json["backend"], "mxc-windows-sandbox");
+        assert_eq!(json["config_format"], "mxc_windows_sandbox_json");
+        assert_eq!(json["network_mode"], "allow");
+        assert_eq!(json["guest_agent"], "axis-guest-agent.exe");
+        assert_eq!(json["suitability"]["full_agent_sessions"], false);
     }
 
     #[test]
@@ -940,6 +1128,40 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn launch_for_backend(id: BackendCapabilityMapId) -> VmLaunchOptions {
+        match id {
+            BackendCapabilityMapId::MxcLinuxMicrovm | BackendCapabilityMapId::MxcWindowsMicrovm => {
+                microvm_launch()
+            }
+            BackendCapabilityMapId::MxcLinuxHyperlight
+            | BackendCapabilityMapId::MxcWindowsHyperlight => VmLaunchOptions {
+                image: VmImageSource::HyperlightSnapshot {
+                    snapshot_path: "/var/lib/axis/hyperlight.snap".into(),
+                },
+                guest_agent: Some("axis-guest-agent".into()),
+                ..minimal_vm_launch()
+            },
+            BackendCapabilityMapId::MxcWindowsSandbox => VmLaunchOptions {
+                image: VmImageSource::WindowsSandboxConfig {
+                    config_path: "C:\\axis\\sandbox.wsb".into(),
+                },
+                guest_agent: Some("axis-guest-agent.exe".into()),
+                ..minimal_vm_launch()
+            },
+            BackendCapabilityMapId::MxcWindowsIsolationSession => minimal_vm_launch(),
+            other => panic!("unexpected VM backend id {other:?}"),
+        }
+    }
+
+    fn present_runtime_for_backend(id: BackendCapabilityMapId) -> RuntimeProbeSnapshot {
+        backend_capability_map(id).host_dependencies.iter().fold(
+            RuntimeProbeSnapshot::new(),
+            |runtime, dependency| {
+                runtime.with_dependency(&dependency.name, DependencyState::Present)
+            },
+        )
     }
 
     fn minimal_vm_launch() -> VmLaunchOptions {
