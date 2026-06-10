@@ -1091,8 +1091,8 @@ fn mxc_windows_wslc() -> BackendCapabilities {
         filesystem: FilesystemCapabilities {
             read_only: wslc.clone(),
             read_write: wslc.clone(),
-            deny: CapabilitySupport::weaker(
-                "WSL path projection does not prove every Windows host path deny case",
+            deny: CapabilitySupport::unsupported(
+                "MXC WSLC denied-path enforcement is not mapped exactly for Windows host paths",
             ),
             workspace: wslc.clone(),
         },
@@ -1104,19 +1104,19 @@ fn mxc_windows_wslc() -> BackendCapabilities {
             user_identity: CapabilitySupport::unsupported(
                 "WSL identity mapping is not planned as AXIS run_as_user parity",
             ),
-            syscall_filtering: CapabilitySupport::weaker(
-                "WSL syscall behavior is Linux-like but not mapped to the AXIS seccomp contract",
+            syscall_filtering: CapabilitySupport::unsupported(
+                "MXC WSLC syscall behavior is not mapped to the AXIS seccomp contract",
             ),
             pty: CapabilitySupport::unsupported("MXC WSLC PTY support is not mapped"),
             timeout: CapabilitySupport::AxisOwned,
         },
         network: NetworkCapabilities {
             allow: wslc.clone(),
-            block: CapabilitySupport::weaker(
-                "WSL network isolation depends on distribution and host networking configuration",
+            block: CapabilitySupport::unsupported(
+                "MXC WSLC network block is not mapped as an exact AXIS host network boundary",
             ),
-            strict_proxy: CapabilitySupport::weaker(
-                "WSL proxy routing is not proven as a fail-closed AXIS boundary",
+            strict_proxy: CapabilitySupport::unsupported(
+                "MXC WSLC strict proxy routing is not mapped as a fail-closed AXIS boundary",
             ),
             cooperative_proxy: CapabilitySupport::weaker(
                 "cooperative proxy environment variables cannot prevent direct socket bypass",
@@ -1128,14 +1128,14 @@ fn mxc_windows_wslc() -> BackendCapabilities {
             l7_policy: CapabilitySupport::AxisOwned,
         },
         resources: ResourceCapabilities {
-            process_count: CapabilitySupport::weaker(
-                "WSL resource behavior is mediated by the distribution and not mapped to AXIS tree limits",
+            process_count: CapabilitySupport::unsupported(
+                "MXC WSLC process limits are not mapped to exact AXIS per-sandbox tree limits",
             ),
-            memory: CapabilitySupport::weaker(
-                "WSL memory limits are VM-scoped rather than per-sandbox AXIS policy",
+            memory: CapabilitySupport::unsupported(
+                "MXC WSLC memory limits are VM-scoped rather than exact AXIS per-sandbox policy",
             ),
-            cpu: CapabilitySupport::weaker(
-                "WSL CPU limits are VM-scoped rather than per-sandbox AXIS policy",
+            cpu: CapabilitySupport::unsupported(
+                "MXC WSLC CPU limits are VM-scoped rather than exact AXIS per-sandbox policy",
             ),
             timeout: CapabilitySupport::AxisOwned,
         },
@@ -1144,8 +1144,8 @@ fn mxc_windows_wslc() -> BackendCapabilities {
         lifecycle: stateful_lifecycle(),
         cleanup: CleanupCapabilities {
             process_tree: CapabilitySupport::AxisOwned,
-            resources: CapabilitySupport::weaker(
-                "WSL resource cleanup is not mapped to per-sandbox AXIS resource state",
+            resources: CapabilitySupport::unsupported(
+                "MXC WSLC resource cleanup is not mapped to exact per-sandbox AXIS resource state",
             ),
             temp_state: CapabilitySupport::AxisOwned,
             backend_state: dep_support(host_dependency::MXC_EXECUTOR),
@@ -1639,16 +1639,12 @@ mod tests {
 
     #[test]
     fn weaker_capability_requires_explicit_acceptance() {
-        let backend = backend_capability_map(BackendCapabilityMapId::MxcWindowsWslc);
+        let backend = backend_capability_map(BackendCapabilityMapId::AxisNativeMacosSeatbelt);
         let runtime = RuntimeProbeSnapshot::new()
-            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
-            .with_dependency(host_dependency::WINDOWS_WSL2, DependencyState::Present);
-        let plan = plan_backend_policy(
-            &policy(NetworkMode::Block),
-            &backend,
-            &runtime,
-            &PlannerOptions::new(),
-        );
+            .with_dependency(host_dependency::MACOS_SEATBELT, DependencyState::Present);
+        let mut policy = policy(NetworkMode::Allow);
+        policy.process.max_processes = 32;
+        let plan = plan_backend_policy(&policy, &backend, &runtime, &PlannerOptions::new());
 
         assert!(matches!(
             plan.outcome,

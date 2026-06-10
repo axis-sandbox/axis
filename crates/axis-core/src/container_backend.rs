@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn wslc_block_network_is_weaker_until_explicitly_accepted() {
+    fn wslc_block_network_is_rejected_before_spawn() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(host_dependency::WINDOWS_WSL2, DependencyState::Present);
@@ -902,26 +902,14 @@ mod tests {
 
         assert!(matches!(
             plan.policy_plan.outcome,
-            BackendPlanOutcome::WeakerOnly {
-                accepted: false,
-                ..
-            }
+            BackendPlanOutcome::Unsupported { .. }
         ));
         assert!(!plan.spawn_allowed());
-
-        let accepted = plan_container_backend_policy(
-            &policy(NetworkMode::Block),
-            BackendCapabilityMapId::MxcWindowsWslc,
-            &launch,
-            &runtime,
-            &PlannerOptions::new().accept_weaker_surface(PolicySurface::Network),
-        )
-        .unwrap();
-        assert!(accepted.spawn_allowed(), "{:?}", accepted.pre_spawn_error());
+        assert!(plan.pre_spawn_error().unwrap().contains("network.block"));
     }
 
     #[test]
-    fn wslc_denied_paths_are_weaker_and_not_spawnable_by_default() {
+    fn wslc_denied_paths_are_rejected_before_spawn() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(host_dependency::WINDOWS_WSL2, DependencyState::Present);
@@ -939,15 +927,11 @@ mod tests {
         .unwrap();
 
         assert!(!plan.spawn_allowed());
-        assert!(
-            plan.pre_spawn_error()
-                .unwrap()
-                .contains("backend offers only weaker behavior")
-        );
+        assert!(plan.pre_spawn_error().unwrap().contains("filesystem.deny"));
     }
 
     #[test]
-    fn wslc_resource_limits_are_weaker_and_not_spawnable_by_default() {
+    fn wslc_resource_limits_are_rejected_before_spawn() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(host_dependency::WINDOWS_WSL2, DependencyState::Present);

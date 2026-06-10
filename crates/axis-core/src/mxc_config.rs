@@ -55,6 +55,12 @@ pub enum MxcConfigError {
     #[error("MXC WSLC config cannot represent AXIS container bind mounts")]
     WslcBindMountsUnsupported,
 
+    #[error("MXC WSLC config cannot represent AXIS denied paths exactly")]
+    WslcDeniedPathsUnsupported,
+
+    #[error("MXC WSLC config cannot represent AXIS network mode '{mode:?}' exactly")]
+    WslcNetworkModeUnsupported { mode: ContainerBackendNetworkMode },
+
     #[error(
         "MXC container config cannot represent bind mount aliases: {host_path} -> {container_path}"
     )]
@@ -361,6 +367,7 @@ pub fn build_mxc_container_config(
     validate_process_config(&process)?;
     validate_container_network(spec, &options)?;
     validate_bind_mounts(spec)?;
+    validate_container_backend_semantics(spec)?;
 
     let filesystem = MxcFilesystemConfig {
         readwrite_paths: spec.filesystem.read_write.clone(),
@@ -766,6 +773,26 @@ fn validate_bind_mounts(spec: &ContainerBackendExecutionSpec) -> Result<(), MxcC
     Ok(())
 }
 
+fn validate_container_backend_semantics(
+    spec: &ContainerBackendExecutionSpec,
+) -> Result<(), MxcConfigError> {
+    if spec.config_format != ContainerBackendConfigFormat::MxcWindowsWslcJson {
+        return Ok(());
+    }
+
+    if !spec.filesystem.deny.is_empty() {
+        return Err(MxcConfigError::WslcDeniedPathsUnsupported);
+    }
+
+    if spec.network.mode != ContainerBackendNetworkMode::Allow {
+        return Err(MxcConfigError::WslcNetworkModeUnsupported {
+            mode: spec.network.mode,
+        });
+    }
+
+    Ok(())
+}
+
 fn mxc_process_network_policy(
     spec: &ProcessBackendExecutionSpec,
     options: &MxcProcessConfigOptions,
@@ -859,8 +886,8 @@ mod tests {
     use crate::capability::{DependencyState, PlannerOptions, RuntimeProbeSnapshot};
     use crate::capability_map::{BackendCapabilityMapId, backend_capability_map};
     use crate::container_backend::{
-        ContainerBackendSpecError, ContainerBindMount, ContainerLaunchOptions,
-        ContainerMountAccess, build_container_backend_execution_spec,
+        ContainerBackendNetworkMode, ContainerBackendSpecError, ContainerBindMount,
+        ContainerLaunchOptions, ContainerMountAccess, build_container_backend_execution_spec,
     };
     use crate::policy::{
         Access, BinaryMatch, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy,
@@ -1315,6 +1342,75 @@ mod tests {
     }
 
     #[test]
+    fn wslc_denied_paths_are_rejected_before_mxc_config() {
+        let mut spec = build_container_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcWindowsWslc,
+            wslc_launch_without_bind_mounts(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsWslc),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        spec.filesystem.deny.push("C:\\Users\\agent\\.ssh".into());
+
+        let err = build_mxc_container_config(process(), &spec, options("axis-wslc")).unwrap_err();
+
+        assert_eq!(err, MxcConfigError::WslcDeniedPathsUnsupported);
+    }
+
+    #[test]
+    fn wslc_block_network_is_rejected_before_mxc_config() {
+        let mut spec = build_container_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcWindowsWslc,
+            wslc_launch_without_bind_mounts(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsWslc),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        spec.network.mode = ContainerBackendNetworkMode::Block;
+
+        let err = build_mxc_container_config(process(), &spec, options("axis-wslc")).unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::WslcNetworkModeUnsupported {
+                mode: ContainerBackendNetworkMode::Block
+            }
+        );
+    }
+
+    #[test]
+    fn wslc_strict_proxy_is_rejected_even_with_axis_layer_before_mxc_config() {
+        let mut spec = build_container_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcWindowsWslc,
+            wslc_launch_without_bind_mounts(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsWslc),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        spec.network.mode = ContainerBackendNetworkMode::StrictProxy;
+
+        let err = build_mxc_container_config(
+            process(),
+            &spec,
+            MxcContainerConfigOptions {
+                container_id: Some("axis-wslc".into()),
+                strict_proxy_enforced_by_axis: true,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::WslcNetworkModeUnsupported {
+                mode: ContainerBackendNetworkMode::StrictProxy
+            }
+        );
+    }
+
+    #[test]
     fn bind_mounts_must_be_granted_by_axis_filesystem_policy() {
         let mut spec = lxc_execution_spec(NetworkMode::Allow).unwrap();
         spec.filesystem.read_write.clear();
@@ -1331,18 +1427,15 @@ mod tests {
 
     #[test]
     fn wslc_resource_limits_are_not_emitted_as_exact_axis_limits() {
-        let mut policy = policy(NetworkMode::Allow);
-        policy.process.max_memory_mb = 1024;
-        let spec = build_container_backend_execution_spec(
-            &policy,
+        let mut spec = build_container_backend_execution_spec(
+            &policy(NetworkMode::Allow),
             BackendCapabilityMapId::MxcWindowsWslc,
             wslc_launch_without_bind_mounts(),
             &present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsWslc),
-            &PlannerOptions::new()
-                .accept_weaker_surface(crate::capability::PolicySurface::Resources)
-                .accept_weaker_surface(crate::capability::PolicySurface::Cleanup),
+            &PlannerOptions::new(),
         )
         .unwrap();
+        spec.resources.max_memory_mb = 1024;
 
         let err = build_mxc_container_config(process(), &spec, options("axis-wslc")).unwrap_err();
 
