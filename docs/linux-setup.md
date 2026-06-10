@@ -152,10 +152,14 @@ visible skips.
 Default local Linux proof:
 
 ```bash
+bash scripts/test_security_tier0.sh
 cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 AXIS_BIN=./target/release/axis bash e2e/linux/test_sandbox.sh
 AXIS_BIN=./target/release/axis bash e2e/linux/test_e2e_daemon.sh
 ```
+
+The security harness is Tier 0/1 and must not require optional runtime tools,
+root-installed local artifacts, or host mutation.
 
 Capability-gated proofs:
 

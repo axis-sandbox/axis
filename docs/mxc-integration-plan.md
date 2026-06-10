@@ -375,6 +375,9 @@ block on new HIP Remote functionality.
 Testing must be delivered by the repository and must not depend on installing a
 locally built artifact with root privileges on a developer machine.
 
+The shared tier model, default no-dependency harness, gates, and skip rules are
+defined in [Security Test Tiers](security-test-tiers.md).
+
 ### Test Tiers
 
 | Tier | Name | Privilege model | Purpose |

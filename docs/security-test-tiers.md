@@ -1,0 +1,122 @@
+# Security Test Tiers
+
+## Purpose
+
+AXIS security testing is delivered by the repository. Normal tests must not
+depend on root-installing a locally built helper, setting file capabilities on
+local build output, changing host firewall state, or relying on artifacts from a
+previous development session.
+
+The tiers below define how backend tests are named, gated, skipped, and run.
+They apply to AXIS-native and MXC-backed work on Windows, Linux, and macOS.
+
+## Tier Model
+
+| Tier | Name | Privilege model | Purpose | Default |
+| --- | --- | --- | --- | --- |
+| 0 | Unit and translation | No special host dependencies | Policy validation, capability planning, config generation, unsupported combinations, secret stripping, and cleanup branches. | Runs by default. |
+| 1 | Fake executor e2e | No special host dependencies | End-to-end lifecycle through fake executors, fake helpers, generated configs, timeout paths, logging, and cleanup behavior. | Runs by default. |
+| 2 | Unprivileged real runtime | Optional installed tools | Smoke tests for installed non-privileged runtimes such as Bubblewrap, packaged MXC executors, or macOS Seatbelt. | Opt-in or capability-detected. |
+| 3 | Capability-gated runtime | Host feature required | Tests for host features such as Windows Sandbox, WSL2, WHP, KVM, LXC, Hyperlight snapshots, cgroups, seccomp notify, user namespaces, and platform build features. | Opt-in with explicit gates. |
+| 4 | Privileged disposable CI | Repeatable CI/container/VM setup | Helper proofs, firewall proofs, VM feature setup, privileged capability proofs, and strict network bypass proofs. | Disposable runner only. |
+
+Tier 0 and Tier 1 are the default security proof. They must run without hidden
+host setup. Tier 2 and Tier 3 may skip only when the missing dependency is
+reported clearly. Tier 4 belongs in repeatable disposable CI or VM scripts that
+build from the current checkout, perform privileged setup inside that runner,
+prove behavior as a non-root user where appropriate, and tear down all state.
+
+## Default Harness
+
+Run the default no-dependency security harness with:
+
+```bash
+bash scripts/test_security_tier0.sh
+```
+
+The harness currently runs:
+
+- `cargo test -p axis-core capability`
+- `cargo test -p axis-sandbox mxc -- --skip gated_`
+
+This covers the shared capability planner and the MXC fake executor/dry-run
+paths by default. The second command intentionally skips tests named with the
+`gated_` prefix so real-runtime and privileged proofs do not become hidden
+host-specific requirements.
+
+CI must run this harness as part of ordinary code testing. Full `cargo test`
+may also run, but this harness is the explicit signal that no-dependency
+security and fake executor coverage are part of the default gate.
+
+## Skip And Failure Rules
+
+Tests must distinguish unavailable dependencies from failed security behavior.
+
+Use these result categories:
+
+- `PASS`: the behavior was enforced and verified.
+- `FAIL`: the dependency was expected to exist, or the behavior was attempted,
+  and AXIS did not enforce the contract.
+- `SKIP`: the test was optional or explicitly gated, the dependency was absent,
+  and the skip message names the missing gate or host feature.
+
+Skip messages must include the gate or dependency. Examples:
+
+- `SKIP: AXIS_RUN_BWRAP_E2E=1 not set`
+- `SKIP: bwrap not found on PATH`
+- `SKIP: AXIS_REAL_MXC_PROXY_TESTS=1 requires a safe lxc-exec or AXIS_TEST_MXC_EXECUTOR`
+- `SKIP: Windows Sandbox feature unavailable`
+- `SKIP: /dev/kvm is not readable by the current user`
+
+A test must fail, not skip, when its gate says the dependency is required. For
+example, `AXIS_REQUIRE_KMSG_AUDIT_E2E=1` turns unreadable `/dev/kmsg` from a
+visible skip into a failure.
+
+## Current Gates
+
+| Gate | Tier | Meaning |
+| --- | --- | --- |
+| `AXIS_RUN_BWRAP_E2E=1` | 2 | Run Bubblewrap fallback e2e proof when a trusted `bwrap` exists. |
+| `AXIS_TEST_MXC_EXECUTOR=<path>` | 2 | Inject a safe MXC executor path for real-runtime tests. |
+| `AXIS_TEST_AXIS_SECCOMP_LAUNCHER=<path>` | 2 | Inject a safe AXIS seccomp launcher path for real-runtime tests. |
+| `AXIS_REAL_CGROUP_TESTS=1` | 3 | Run real cgroup tests on hosts with delegated cgroup support. |
+| `AXIS_REAL_NETNS_TESTS=1` | 3 | Run real network namespace tests on hosts with required namespace support. |
+| `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution proofs. |
+| `AXIS_TEST_RUN_AS_USER=<user>` | 3 | Run identity/resource fallback tests for an existing non-root user. |
+| `AXIS_REAL_MXC_PROXY_TESTS=1` | 3 | Run real MXC strict proxy tests when executor, launcher, and network prerequisites are present. |
+| `AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1` | 4 | Run tests against an installed privileged netns helper in a prepared runner. |
+| `AXIS_RUN_PRIVILEGED_E2E=1` | 4 | Run the disposable privileged helper e2e script. |
+| `AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E=1` | 4 | Treat missing built proxy prerequisites as failures. |
+| `AXIS_REQUIRE_KMSG_AUDIT_E2E=1` | 4 | Treat missing kernel-log audit evidence as failure. |
+
+Platform-specific test plans may add gates, but they must document the tier,
+host dependency, skip message, and failure behavior.
+
+## Invalid Normal Test Dependencies
+
+These are not valid requirements for Tier 0, Tier 1, or ordinary local tests:
+
+- root-installing an AXIS-built helper on a developer host;
+- setting setuid or file capabilities on a locally built artifact;
+- changing host firewall, OS feature, cgroup, VM, or container state without an
+  explicit Tier 3 or Tier 4 gate;
+- relying on a helper, executor, cgroup, namespace, image, snapshot, or firewall
+  rule installed by a previous manual test;
+- weakening a policy so the test passes on the current host;
+- using real cloud provider credentials.
+
+Privileged setup is valid only when it is scripted, repeatable, tied to a Tier
+4 gate, runs in a disposable environment, and cleans up after itself.
+
+## Review Requirements
+
+Every backend test change must review:
+
+- whether the test proves policy behavior rather than a private implementation
+  detail;
+- whether missing dependencies produce exact skip or failure messages;
+- whether a gate hides a real security failure;
+- whether any local artifact install, host mutation, or credential dependency
+  has leaked into ordinary tests;
+- whether fake executor tests cover success, failure, malformed output,
+  timeout, cleanup, and secret-handling branches.
