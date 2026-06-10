@@ -15,6 +15,7 @@ use crate::container_backend::{
 use crate::process_backend::{
     ProcessBackendConfigFormat, ProcessBackendExecutionSpec, ProcessBackendNetworkMode,
 };
+use crate::sandbox_env;
 use crate::vm_backend::{
     VmBackendConfigFormat, VmBackendExecutionSpec, VmBackendNetworkMode, VmImageSource,
 };
@@ -31,6 +32,9 @@ pub enum MxcConfigError {
 
     #[error("MXC process environment entry must be KEY=VALUE with a non-empty key")]
     InvalidEnvironmentEntry,
+
+    #[error("MXC process environment entry is filtered by AXIS sandbox policy: {key}")]
+    FilteredEnvironmentEntry { key: String },
 
     #[error(
         "AXIS strict proxy must be enforced outside MXC before emitting allow-mode MXC network config"
@@ -615,6 +619,15 @@ fn validate_process_config(process: &MxcProcessConfig) -> Result<(), MxcConfigEr
         key.trim().is_empty()
     }) {
         return Err(MxcConfigError::InvalidEnvironmentEntry);
+    }
+
+    for entry in &process.env {
+        let (key, _value) = entry
+            .split_once('=')
+            .expect("process env entry shape is validated above");
+        if sandbox_env::is_secret_env_key(key) || sandbox_env::is_proxy_env_key(key) {
+            return Err(MxcConfigError::FilteredEnvironmentEntry { key: key.into() });
+        }
     }
 
     Ok(())
@@ -1318,6 +1331,47 @@ mod tests {
     }
 
     #[test]
+    fn process_config_rejects_secret_and_inherited_proxy_env_before_mxc_json() {
+        let mut spec = process_execution_spec(
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            NetworkMode::Allow,
+        )
+        .unwrap();
+        spec.environment
+            .insert("OPENAI_API_KEY".into(), "super-secret-token".into());
+
+        let err = build_mxc_process_config("agent --version", &spec, process_options("axis-bwrap"))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::FilteredEnvironmentEntry {
+                key: "OPENAI_API_KEY".into()
+            }
+        );
+        assert!(!err.to_string().contains("super-secret-token"));
+
+        let mut spec = process_execution_spec(
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            NetworkMode::Allow,
+        )
+        .unwrap();
+        spec.environment
+            .insert("HTTPS_PROXY".into(), "http://proxy-with-creds".into());
+
+        let err = build_mxc_process_config("agent --version", &spec, process_options("axis-bwrap"))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::FilteredEnvironmentEntry {
+                key: "HTTPS_PROXY".into()
+            }
+        );
+        assert!(!err.to_string().contains("proxy-with-creds"));
+    }
+
+    #[test]
     fn process_timeout_overflow_is_rejected_before_mxc_process_config() {
         let mut spec = process_execution_spec(
             BackendCapabilityMapId::MxcLinuxBubblewrap,
@@ -1607,6 +1661,26 @@ mod tests {
     }
 
     #[test]
+    fn container_config_rejects_secret_env_before_mxc_json() {
+        let spec = lxc_execution_spec(NetworkMode::Allow).unwrap();
+        let mut process_config = process();
+        process_config
+            .env
+            .push("ANTHROPIC_API_KEY=super-secret-token".into());
+
+        let err =
+            build_mxc_container_config(process_config, &spec, options("axis-lxc")).unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::FilteredEnvironmentEntry {
+                key: "ANTHROPIC_API_KEY".into()
+            }
+        );
+        assert!(!err.to_string().contains("super-secret-token"));
+    }
+
+    #[test]
     fn vm_inputs_are_validated_before_mxc_config() {
         let spec = vm_execution_spec(
             BackendCapabilityMapId::MxcLinuxHyperlight,
@@ -1627,6 +1701,30 @@ mod tests {
             build_mxc_vm_config(process_config, &spec, vm_options("axis-vm")).unwrap_err(),
             MxcConfigError::InvalidEnvironmentEntry
         );
+    }
+
+    #[test]
+    fn vm_config_rejects_inherited_proxy_env_before_mxc_json() {
+        let spec = vm_execution_spec(
+            BackendCapabilityMapId::MxcLinuxHyperlight,
+            NetworkMode::Block,
+            vm_policy(NetworkMode::Block),
+        )
+        .unwrap();
+        let mut process_config = vm_process();
+        process_config
+            .env
+            .push("HTTPS_PROXY=http://proxy-with-creds".into());
+
+        let err = build_mxc_vm_config(process_config, &spec, vm_options("axis-vm")).unwrap_err();
+
+        assert_eq!(
+            err,
+            MxcConfigError::FilteredEnvironmentEntry {
+                key: "HTTPS_PROXY".into()
+            }
+        );
+        assert!(!err.to_string().contains("proxy-with-creds"));
     }
 
     #[test]
