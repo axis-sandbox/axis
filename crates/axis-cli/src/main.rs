@@ -634,6 +634,11 @@ async fn main() -> Result<()> {
                     Ok(policy) => {
                         println!("Policy '{}' is valid.", policy.name);
                         println!(
+                            "  Runtime: {} via {}",
+                            policy.runtime.containment.as_str(),
+                            policy.runtime.provider.as_str(),
+                        );
+                        println!(
                             "  Filesystem: {} read-only, {} read-write, {} deny paths",
                             policy.filesystem.read_only.len(),
                             policy.filesystem.read_write.len(),
@@ -1356,6 +1361,7 @@ mod tests {
         Policy {
             version: 1,
             name: "test-policy".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy::default(),
             process: ProcessPolicy::default(),
             network: NetworkPolicy {

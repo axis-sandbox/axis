@@ -156,6 +156,10 @@ Policies are declarative YAML:
 version: 1
 name: my-agent
 
+runtime:
+  containment: process   # default
+  provider: auto         # auto | mxc | axis_native
+
 filesystem:
   read_only: [/usr, /lib, /etc/ssl/certs]
   read_write: ["{workspace}"]
@@ -186,6 +190,12 @@ inference:
       endpoint: http://localhost:8080
       model: llama-4-scout-109b
 ```
+
+`runtime` is launch metadata, not a replacement for the security sections below
+it. Omit it for the default process sandbox; set `provider: axis_native` only
+when you explicitly want the retained native process backend instead of the
+automatic provider choice. `provider: mxc` pins the MXC provider and should be
+used only on hosts where AXIS has an MXC process provider available.
 
 Validate: `axis policy validate my-policy.yaml`
 

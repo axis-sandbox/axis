@@ -2150,6 +2150,7 @@ mod tests {
         Policy {
             version: 1,
             name: "mxc-process-config-test".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy {
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/workspace".into()],
@@ -2189,6 +2190,7 @@ mod tests {
         Policy {
             version: 1,
             name: "mxc-container-config-test".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy {
                 read_only: Vec::new(),
                 read_write: vec!["/workspace".into()],
@@ -2216,6 +2218,7 @@ mod tests {
         Policy {
             version: 1,
             name: "mxc-vm-config-test".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy {
                 read_only: vec!["/opt/axis-ref".into()],
                 read_write: vec!["/workspace".into()],

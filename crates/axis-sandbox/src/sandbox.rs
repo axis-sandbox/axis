@@ -4,7 +4,7 @@
 //! Sandbox trait and configuration.
 
 use axis_core::connect_attribution::ConnectAttributionStore;
-use axis_core::policy::Policy;
+use axis_core::policy::{Policy, RuntimeContainment, RuntimeProvider};
 use axis_core::types::{SandboxId, SandboxStatus};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
@@ -77,7 +77,8 @@ pub struct Sandbox {
 impl Sandbox {
     /// Create a new sandbox with platform-specific isolation.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
-        Self::create_inner_with_backend(config, true, PlatformBackendSelection::Default)
+        let backend = platform_backend_for_policy(&config.policy)?;
+        Self::create_inner_with_backend(config, true, backend)
     }
 
     /// Create an isolated process for an already prepared managed workspace.
@@ -85,7 +86,8 @@ impl Sandbox {
     /// This skips agent workspace symlink setup/cleanup so short-lived daemon
     /// exec commands do not disturb symlinks owned by the primary sandbox.
     pub fn create_for_exec(config: SandboxConfig) -> Result<Self, SandboxError> {
-        Self::create_inner_with_backend(config, false, PlatformBackendSelection::Default)
+        let backend = platform_backend_for_policy(&config.policy)?;
+        Self::create_inner_with_backend(config, false, backend)
     }
 
     fn create_inner_with_backend(
@@ -619,6 +621,33 @@ pub(crate) enum PlatformBackendSelection {
     LinuxMxc,
 }
 
+fn platform_backend_for_policy(policy: &Policy) -> Result<PlatformBackendSelection, SandboxError> {
+    match policy.runtime.containment {
+        RuntimeContainment::Process => process_backend_for_provider(policy.runtime.provider),
+    }
+}
+
+fn process_backend_for_provider(
+    provider: RuntimeProvider,
+) -> Result<PlatformBackendSelection, SandboxError> {
+    match provider {
+        #[cfg(target_os = "linux")]
+        RuntimeProvider::Auto | RuntimeProvider::Mxc => Ok(PlatformBackendSelection::LinuxMxc),
+        #[cfg(target_os = "linux")]
+        RuntimeProvider::AxisNative => Ok(PlatformBackendSelection::LinuxNative),
+
+        #[cfg(not(target_os = "linux"))]
+        RuntimeProvider::Auto | RuntimeProvider::AxisNative => {
+            Ok(PlatformBackendSelection::Default)
+        }
+        #[cfg(not(target_os = "linux"))]
+        RuntimeProvider::Mxc => Err(SandboxError::Unsupported(format!(
+            "runtime provider 'mxc' is not available on {}",
+            std::env::consts::OS
+        ))),
+    }
+}
+
 /// Platform-specific sandbox implementation trait.
 pub(crate) trait SandboxImpl: Send {
     /// Start the isolated process. Returns the PID.
@@ -711,7 +740,7 @@ mod tests {
     use super::*;
     use axis_core::policy::{
         Compatibility, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy,
-        ProcessPolicy, SshKeySpec, SshPolicy,
+        ProcessPolicy, RuntimeProvider, SshKeySpec, SshPolicy,
     };
     use std::path::Path;
 
@@ -721,6 +750,7 @@ mod tests {
             policy: Policy {
                 version: 1,
                 name: "test".into(),
+                runtime: Default::default(),
                 filesystem: FilesystemPolicy::default(),
                 process: ProcessPolicy::default(),
                 network: NetworkPolicy {
@@ -782,6 +812,40 @@ mod tests {
 
         assert!(matches!(err, SandboxError::CreationFailed(_)));
         assert!(err.to_string().contains("cpu_rate_percent"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_runtime_provider_selects_linux_backend() {
+        let mut policy = test_config().policy;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc
+        );
+
+        policy.runtime.provider = RuntimeProvider::Mxc;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::LinuxMxc
+        );
+
+        policy.runtime.provider = RuntimeProvider::AxisNative;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::LinuxNative
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn mxc_runtime_provider_is_rejected_without_platform_backend() {
+        let mut policy = test_config().policy;
+        policy.runtime.provider = RuntimeProvider::Mxc;
+
+        let err = platform_backend_for_policy(&policy).unwrap_err();
+
+        assert!(matches!(err, SandboxError::Unsupported(_)));
+        assert!(err.to_string().contains("provider 'mxc'"));
     }
 
     #[cfg(unix)]

@@ -29,6 +29,9 @@ pub struct Policy {
     pub name: String,
 
     #[serde(default)]
+    pub runtime: RuntimePolicy,
+
+    #[serde(default)]
     pub filesystem: FilesystemPolicy,
 
     #[serde(default)]
@@ -72,6 +75,7 @@ impl Policy {
             return Err(PolicyError::UnsupportedVersion(self.version));
         }
         validate_policy_name_component(&self.name)?;
+        self.runtime.validate()?;
         self.process.validate()?;
         self.network.validate()?;
         Ok(())
@@ -99,6 +103,77 @@ pub fn validate_policy_name_component(name: &str) -> Result<(), PolicyError> {
         ));
     }
     Ok(())
+}
+
+/// Runtime launch metadata. This selects a sandbox implementation without
+/// changing the security policy semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePolicy {
+    #[serde(default = "default_runtime_containment")]
+    pub containment: RuntimeContainment,
+
+    #[serde(default = "default_runtime_provider")]
+    pub provider: RuntimeProvider,
+}
+
+impl Default for RuntimePolicy {
+    fn default() -> Self {
+        Self {
+            containment: default_runtime_containment(),
+            provider: default_runtime_provider(),
+        }
+    }
+}
+
+impl RuntimePolicy {
+    fn validate(&self) -> Result<(), PolicyError> {
+        match self.containment {
+            RuntimeContainment::Process => Ok(()),
+        }
+    }
+}
+
+fn default_runtime_containment() -> RuntimeContainment {
+    RuntimeContainment::Process
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContainment {
+    #[default]
+    Process,
+}
+
+impl RuntimeContainment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+        }
+    }
+}
+
+fn default_runtime_provider() -> RuntimeProvider {
+    RuntimeProvider::Auto
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProvider {
+    #[default]
+    Auto,
+    Mxc,
+    #[serde(alias = "axis-native")]
+    AxisNative,
+}
+
+impl RuntimeProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Mxc => "mxc",
+            Self::AxisNative => "axis_native",
+        }
+    }
 }
 
 /// Filesystem access policy — controls what paths the sandboxed process can read/write.
@@ -499,6 +574,10 @@ name: test-sandbox
 version: 1
 name: coding-agent-sandbox
 
+runtime:
+  containment: process
+  provider: auto
+
 filesystem:
   read_only:
     - /usr
@@ -562,6 +641,8 @@ amd:
         let policy = Policy::from_yaml(MINIMAL_POLICY).unwrap();
         assert_eq!(policy.version, 1);
         assert_eq!(policy.name, "test-sandbox");
+        assert_eq!(policy.runtime.containment, RuntimeContainment::Process);
+        assert_eq!(policy.runtime.provider, RuntimeProvider::Auto);
         assert_eq!(policy.process.max_processes, 32);
         assert_eq!(policy.process.cpu_rate_percent, 80);
     }
@@ -570,6 +651,8 @@ amd:
     fn parse_full_policy() {
         let policy = Policy::from_yaml(FULL_POLICY).unwrap();
         assert_eq!(policy.name, "coding-agent-sandbox");
+        assert_eq!(policy.runtime.containment, RuntimeContainment::Process);
+        assert_eq!(policy.runtime.provider, RuntimeProvider::Auto);
         assert_eq!(policy.filesystem.read_only.len(), 3);
         assert_eq!(policy.filesystem.deny.len(), 2);
         assert_eq!(policy.network.policies.len(), 1);
@@ -631,6 +714,35 @@ amd:
         let yaml = "version: 1\nname: agent.codex_1-test\n";
         let policy = Policy::from_yaml(yaml).unwrap();
         assert_eq!(policy.name, "agent.codex_1-test");
+    }
+
+    #[test]
+    fn parse_runtime_provider_override() {
+        let yaml = "\
+version: 1
+name: test
+runtime:
+  containment: process
+  provider: mxc
+";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert_eq!(policy.runtime.containment, RuntimeContainment::Process);
+        assert_eq!(policy.runtime.provider, RuntimeProvider::Mxc);
+        assert_eq!(policy.runtime.containment.as_str(), "process");
+        assert_eq!(policy.runtime.provider.as_str(), "mxc");
+    }
+
+    #[test]
+    fn parse_runtime_axis_native_alias() {
+        let yaml = "\
+version: 1
+name: test
+runtime:
+  provider: axis-native
+";
+        let policy = Policy::from_yaml(yaml).unwrap();
+        assert_eq!(policy.runtime.provider, RuntimeProvider::AxisNative);
+        assert_eq!(policy.runtime.provider.as_str(), "axis_native");
     }
 
     #[test]

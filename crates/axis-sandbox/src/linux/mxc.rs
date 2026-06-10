@@ -3663,6 +3663,7 @@ mod tests {
         Policy {
             version: 1,
             name: "test".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy::default(),
             process: ProcessPolicy::default(),
             network: NetworkPolicy {

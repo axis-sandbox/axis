@@ -1149,6 +1149,7 @@ mod tests {
         Policy {
             version: 1,
             name: "container-backend-test".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy {
                 read_only: Vec::new(),
                 read_write: vec!["{workspace}".into()],

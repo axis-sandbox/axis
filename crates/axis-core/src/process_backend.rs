@@ -1110,6 +1110,7 @@ mod tests {
         Policy {
             version: 1,
             name: "process-backend-test".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy {
                 read_only: vec!["/usr".into()],
                 read_write: vec!["{workspace}".into()],

@@ -920,6 +920,7 @@ mod tests {
         Policy {
             version: 1,
             name: "test-policy".into(),
+            runtime: Default::default(),
             filesystem: FilesystemPolicy {
                 read_only: vec!["/usr".into()],
                 read_write: vec!["{workspace}".into()],
