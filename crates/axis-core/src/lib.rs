@@ -10,5 +10,6 @@ pub mod capability_map;
 pub mod connect_attribution;
 pub mod opa;
 pub mod policy;
+pub mod process_backend;
 pub mod sandbox_env;
 pub mod types;

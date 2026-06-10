@@ -9,14 +9,13 @@
 //! mapped to weaker MXC behavior.
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
-use axis_core::capability::{
-    DependencyState, PlannerOptions, RuntimeProbeSnapshot, plan_backend_policy,
-};
-use axis_core::capability_map::{BackendCapabilityMapId, backend_capability_map, host_dependency};
+use axis_core::capability::{DependencyState, PlannerOptions, RuntimeProbeSnapshot};
+use axis_core::capability_map::{BackendCapabilityMapId, host_dependency};
 use axis_core::connect_attribution::{
     ConnectAttributionStore, policy_requires_connect_attribution,
 };
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
+use axis_core::process_backend::plan_process_backend_policy;
 use axis_core::types::SandboxId;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -833,9 +832,18 @@ fn validate_mxc_linux_capability_plan(
     resources: &super::strategy::ResourceStrategy,
     notify_connect: bool,
 ) -> Result<(), SandboxError> {
-    let backend = backend_capability_map(BackendCapabilityMapId::MxcLinuxBubblewrap);
     let runtime = mxc_linux_runtime_snapshot(network, resources, notify_connect);
-    let plan = plan_backend_policy(&config.policy, &backend, &runtime, &PlannerOptions::new());
+    let plan = plan_process_backend_policy(
+        &config.policy,
+        BackendCapabilityMapId::MxcLinuxBubblewrap,
+        &runtime,
+        &PlannerOptions::new(),
+    )
+    .ok_or_else(|| {
+        SandboxError::IsolationFailed(
+            "MXC Linux bubblewrap is not registered as a process backend".into(),
+        )
+    })?;
 
     if plan.spawn_allowed() {
         return Ok(());

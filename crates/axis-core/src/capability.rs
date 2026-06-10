@@ -89,6 +89,7 @@ pub struct ProcessCapabilities {
     pub command: CapabilitySupport,
     pub working_dir: CapabilitySupport,
     pub environment: CapabilitySupport,
+    pub stdio: CapabilitySupport,
     pub user_identity: CapabilitySupport,
     pub syscall_filtering: CapabilitySupport,
     pub pty: CapabilitySupport,
@@ -526,6 +527,12 @@ fn requirements_for_policy(
         "process.environment",
         &backend.process.environment,
     );
+    push(
+        &mut requirements,
+        PolicySurface::Process,
+        "process.stdio",
+        &backend.process.stdio,
+    );
     if policy.process.run_as_user.is_some() {
         push(
             &mut requirements,
@@ -838,6 +845,7 @@ mod tests {
                 command: CapabilitySupport::exact(),
                 working_dir: CapabilitySupport::exact(),
                 environment: CapabilitySupport::exact(),
+                stdio: CapabilitySupport::exact(),
                 user_identity: CapabilitySupport::exact(),
                 syscall_filtering: CapabilitySupport::exact(),
                 pty: CapabilitySupport::unsupported("pty not implemented"),

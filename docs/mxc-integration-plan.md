@@ -213,6 +213,11 @@ The repository-owned backend map lives in `axis_core::capability_map`. Platform
 adapters should consume those maps rather than inferring security properties
 from backend names, executable names, or host-specific probes alone.
 
+Process-style backend selection lives in `axis_core::process_backend`. That
+facade catalogs AXIS-native and MXC process backends, records the config format
+each adapter must generate, and returns only planner-approved launch plans to
+platform code.
+
 ## Platform Coverage
 
 Each platform needs the same planning artifacts: capability map, dependency

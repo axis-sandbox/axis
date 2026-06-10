@@ -235,6 +235,12 @@ pub fn validate_backend_capability_map(backend: &BackendCapabilities) -> Result<
         &mut problems,
     );
     validate_support(
+        &backend.process.stdio,
+        "process.stdio",
+        &declared,
+        &mut problems,
+    );
+    validate_support(
         &backend.process.user_identity,
         "process.user_identity",
         &declared,
@@ -501,6 +507,7 @@ fn axis_native_linux() -> BackendCapabilities {
             command: CapabilitySupport::Exact,
             working_dir: CapabilitySupport::Exact,
             environment: CapabilitySupport::Exact,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "run_as_user needs a platform identity adapter before it can be planned generically",
             ),
@@ -575,6 +582,7 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             command: dep_support(host_dependency::MXC_EXECUTOR),
             working_dir: dep_support(host_dependency::MXC_EXECUTOR),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::AxisOwned,
             syscall_filtering: dep_support(host_dependency::AXIS_SECCOMP_LAUNCHER),
             pty: CapabilitySupport::unsupported("MXC bubblewrap PTY support is not mapped by AXIS"),
@@ -639,6 +647,7 @@ fn mxc_linux_lxc() -> BackendCapabilities {
             command: mxc_lxc.clone(),
             working_dir: mxc_lxc.clone(),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: mxc_lxc.clone(),
             syscall_filtering: CapabilitySupport::weaker(
                 "LXC profile support is host configuration dependent and not yet proven against the AXIS syscall matrix",
@@ -733,6 +742,7 @@ fn axis_native_macos_seatbelt() -> BackendCapabilities {
             command: CapabilitySupport::Exact,
             working_dir: CapabilitySupport::Exact,
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "macOS run_as_user parity is not part of the current AXIS contract",
             ),
@@ -815,6 +825,7 @@ fn mxc_macos_seatbelt() -> BackendCapabilities {
             command: dep_support(host_dependency::MXC_EXECUTOR),
             working_dir: dep_support(host_dependency::MXC_EXECUTOR),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "MXC Seatbelt run_as_user parity is not mapped by AXIS",
             ),
@@ -893,6 +904,7 @@ fn axis_native_windows() -> BackendCapabilities {
             command: windows_native.clone(),
             working_dir: windows_native.clone(),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "Windows run_as_user parity is not mapped by AXIS",
             ),
@@ -970,6 +982,7 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             command: dep_support(host_dependency::MXC_EXECUTOR),
             working_dir: dep_support(host_dependency::MXC_EXECUTOR),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "MXC ProcessContainer run_as_user parity is not mapped",
             ),
@@ -1061,6 +1074,7 @@ fn mxc_windows_wslc() -> BackendCapabilities {
             command: wslc.clone(),
             working_dir: wslc.clone(),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "WSL identity mapping is not planned as AXIS run_as_user parity",
             ),
@@ -1167,6 +1181,7 @@ fn vm_backend<const N: usize>(
             command: vm.clone(),
             working_dir: vm.clone(),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "VM identity mapping is not planned as AXIS run_as_user parity",
             ),
@@ -1240,6 +1255,7 @@ fn windows_vm_like_backend<const N: usize>(
             command: vm.clone(),
             working_dir: vm.clone(),
             environment: CapabilitySupport::AxisOwned,
+            stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "Windows VM-style identity mapping is not planned as AXIS run_as_user parity",
             ),

@@ -15,5 +15,8 @@ echo ""
 echo "--- Shared capability planner ---"
 "${CARGO_BIN}" test -p axis-core capability
 
+echo "--- Shared process backend planner ---"
+"${CARGO_BIN}" test -p axis-core process_backend
+
 echo "--- MXC fake executor and translation paths ---"
 "${CARGO_BIN}" test -p axis-sandbox mxc -- --skip gated_
