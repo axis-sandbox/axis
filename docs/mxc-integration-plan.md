@@ -349,6 +349,8 @@ Requirements:
 
 AXIS native platform backends remain valid alternatives until MXC-backed paths
 match the required behavior.
+Current process-backend retention decisions are documented in
+[Native Backend Retention](native-backend-retention.md).
 
 Exit criteria for replacing a native backend:
 

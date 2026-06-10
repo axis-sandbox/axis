@@ -35,6 +35,22 @@ pub struct ProcessBackendDescriptor {
     pub native_axis_backend: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeBackendRetentionDecision {
+    Retain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NativeProcessBackendRetention {
+    pub id: BackendCapabilityMapId,
+    pub platform: BackendPlatform,
+    pub decision: NativeBackendRetentionDecision,
+    pub rationale: &'static str,
+    pub advantages: &'static [&'static str],
+    pub replacement_requirements: &'static [&'static str],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessBackendPlan {
     pub descriptor: ProcessBackendDescriptor,
@@ -90,8 +106,74 @@ pub const PROCESS_BACKEND_DESCRIPTORS: &[ProcessBackendDescriptor] = &[
     },
 ];
 
+pub const NATIVE_PROCESS_BACKEND_RETENTION: &[NativeProcessBackendRetention] = &[
+    NativeProcessBackendRetention {
+        id: BackendCapabilityMapId::AxisNativeLinux,
+        platform: BackendPlatform::Linux,
+        decision: NativeBackendRetentionDecision::Retain,
+        rationale: "Retain the direct Landlock plus seccomp path for the no-container quickstart, direct syscall filtering, and AXIS strict-proxy integration until an MXC process backend proves equivalent semantics and startup behavior.",
+        advantages: &[
+            "direct seccomp filtering",
+            "Landlock filesystem deny semantics",
+            "lightweight process startup",
+            "strict proxy integration",
+            "seccomp-notify binary attribution",
+        ],
+        replacement_requirements: &[
+            "matching AXIS policy semantics",
+            "equivalent native backend tests",
+            "benchmark evidence for startup, teardown, memory, and density",
+        ],
+    },
+    NativeProcessBackendRetention {
+        id: BackendCapabilityMapId::AxisNativeMacosSeatbelt,
+        platform: BackendPlatform::Macos,
+        decision: NativeBackendRetentionDecision::Retain,
+        rationale: "Retain the direct Seatbelt path while it provides the no-extra-runtime macOS process sandbox and until the MXC Seatbelt path proves the same profile, lifecycle, and packaging behavior.",
+        advantages: &[
+            "direct Seatbelt profile generation",
+            "no packaged MXC executor dependency for default process sandboxing",
+            "platform-native filesystem and network-deny controls",
+        ],
+        replacement_requirements: &[
+            "matching AXIS policy semantics",
+            "equivalent native backend tests",
+            "benchmark evidence for startup, teardown, memory, and density",
+        ],
+    },
+    NativeProcessBackendRetention {
+        id: BackendCapabilityMapId::AxisNativeWindows,
+        platform: BackendPlatform::Windows,
+        decision: NativeBackendRetentionDecision::Retain,
+        rationale: "Retain the native Windows path while Job Object, Low Integrity, and process-container primitives provide the current process sandbox vocabulary and until MXC ProcessContainer proves equivalent AXIS-owned lifecycle and resource behavior.",
+        advantages: &[
+            "Job Object resource controls",
+            "Low Integrity process boundary",
+            "platform-native process containment",
+            "AXIS-owned credential and lifecycle handling",
+        ],
+        replacement_requirements: &[
+            "matching AXIS policy semantics",
+            "equivalent native backend tests",
+            "benchmark evidence for startup, teardown, memory, and density",
+        ],
+    },
+];
+
 pub fn process_backend_descriptors() -> &'static [ProcessBackendDescriptor] {
     PROCESS_BACKEND_DESCRIPTORS
+}
+
+pub fn native_process_backend_retention_decisions() -> &'static [NativeProcessBackendRetention] {
+    NATIVE_PROCESS_BACKEND_RETENTION
+}
+
+pub fn native_process_backend_retention(
+    id: BackendCapabilityMapId,
+) -> Option<&'static NativeProcessBackendRetention> {
+    NATIVE_PROCESS_BACKEND_RETENTION
+        .iter()
+        .find(|retention| retention.id == id)
 }
 
 pub fn process_backend_descriptor(
@@ -253,6 +335,91 @@ mod tests {
                 other => panic!("unexpected process backend descriptor {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn native_retention_decisions_cover_every_native_process_backend() {
+        let native_ids = process_backend_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.native_axis_backend)
+            .map(|descriptor| descriptor.id)
+            .collect::<BTreeSet<_>>();
+        let retention_ids = native_process_backend_retention_decisions()
+            .iter()
+            .map(|retention| retention.id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(native_ids, retention_ids);
+    }
+
+    #[test]
+    fn native_retention_decisions_are_planner_backed() {
+        for retention in native_process_backend_retention_decisions() {
+            let descriptor = process_backend_descriptor(retention.id)
+                .expect("retained native backend must be a process descriptor");
+            let backend = crate::capability_map::backend_capability_map(retention.id);
+
+            assert!(descriptor.native_axis_backend);
+            assert_eq!(descriptor.platform, retention.platform);
+            assert_eq!(backend.platform, retention.platform);
+            assert_eq!(retention.decision, NativeBackendRetentionDecision::Retain);
+            assert!(!retention.rationale.trim().is_empty());
+            assert!(!retention.advantages.is_empty());
+            assert!(!retention.replacement_requirements.is_empty());
+            for value in retention
+                .advantages
+                .iter()
+                .chain(retention.replacement_requirements.iter())
+            {
+                assert!(!value.trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn native_retention_decisions_require_tests_and_benchmarks_before_replacement() {
+        for retention in native_process_backend_retention_decisions() {
+            assert!(
+                retention
+                    .replacement_requirements
+                    .iter()
+                    .any(|requirement| requirement.contains("matching AXIS policy semantics")),
+                "{retention:?}"
+            );
+            assert!(
+                retention
+                    .replacement_requirements
+                    .iter()
+                    .any(|requirement| requirement.contains("tests")),
+                "{retention:?}"
+            );
+            assert!(
+                retention
+                    .replacement_requirements
+                    .iter()
+                    .any(|requirement| requirement.contains("benchmark evidence")),
+                "{retention:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_native_retention_identifies_seccomp_and_strict_proxy_advantages() {
+        let retention =
+            native_process_backend_retention(BackendCapabilityMapId::AxisNativeLinux).unwrap();
+
+        assert!(
+            retention
+                .advantages
+                .iter()
+                .any(|advantage| advantage.contains("direct seccomp filtering"))
+        );
+        assert!(
+            retention
+                .advantages
+                .iter()
+                .any(|advantage| advantage.contains("strict proxy integration"))
+        );
     }
 
     #[test]
