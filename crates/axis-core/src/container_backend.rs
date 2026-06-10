@@ -17,8 +17,9 @@ use crate::capability_map::{
     BackendCapabilityMapId, backend_capability_map, backend_capability_maps_for_platform,
     host_dependency,
 };
-use crate::policy::Policy;
+use crate::policy::{NetworkMode, Policy};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +79,66 @@ pub struct ContainerLaunchOptions {
     pub bind_mounts: Vec<ContainerBindMount>,
     #[serde(default = "default_destroy_on_exit")]
     pub destroy_on_exit: bool,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ContainerBackendSpecError {
+    #[error("{0:?} is not a container-style backend")]
+    NotContainerBackend(BackendCapabilityMapId),
+
+    #[error("container backend rejected launch before config generation: {0}")]
+    RejectedBeforeConfig(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerBackendNetworkMode {
+    Allow,
+    Block,
+    StrictProxy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerBackendFilesystemSpec {
+    #[serde(default)]
+    pub read_only: Vec<String>,
+    #[serde(default)]
+    pub read_write: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerBackendNetworkSpec {
+    pub mode: ContainerBackendNetworkMode,
+    #[serde(default)]
+    pub endpoint_policy_names: Vec<String>,
+    pub binary_attribution_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerBackendResourceSpec {
+    pub max_processes: u32,
+    pub max_memory_mb: u64,
+    pub cpu_rate_percent: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerBackendExecutionSpec {
+    pub backend: String,
+    pub platform: BackendPlatform,
+    pub config_format: ContainerBackendConfigFormat,
+    pub rootfs: ContainerRootfsSource,
+    #[serde(default)]
+    pub storage_path: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub bind_mounts: Vec<ContainerBindMount>,
+    pub destroy_on_exit: bool,
+    pub filesystem: ContainerBackendFilesystemSpec,
+    pub network: ContainerBackendNetworkSpec,
+    pub resources: ContainerBackendResourceSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +237,70 @@ pub fn plan_container_backend_policy(
         policy_plan,
         launch_plan,
     })
+}
+
+pub fn build_container_backend_execution_spec(
+    policy: &Policy,
+    id: BackendCapabilityMapId,
+    launch: ContainerLaunchOptions,
+    runtime: &RuntimeProbeSnapshot,
+    options: &PlannerOptions,
+) -> Result<ContainerBackendExecutionSpec, ContainerBackendSpecError> {
+    let plan = plan_container_backend_policy(policy, id, &launch, runtime, options)
+        .ok_or(ContainerBackendSpecError::NotContainerBackend(id))?;
+    if !plan.spawn_allowed() {
+        return Err(ContainerBackendSpecError::RejectedBeforeConfig(
+            plan.pre_spawn_error()
+                .unwrap_or_else(|| "unknown container backend planning failure".into()),
+        ));
+    }
+
+    Ok(ContainerBackendExecutionSpec {
+        backend: plan.descriptor.id.as_str().into(),
+        platform: plan.descriptor.platform,
+        config_format: plan.descriptor.config_format,
+        rootfs: launch.rootfs,
+        storage_path: launch.storage_path,
+        working_dir: launch.working_dir,
+        bind_mounts: launch.bind_mounts,
+        destroy_on_exit: launch.destroy_on_exit,
+        filesystem: container_filesystem_spec(policy),
+        network: container_network_spec(policy),
+        resources: ContainerBackendResourceSpec {
+            max_processes: policy.process.max_processes,
+            max_memory_mb: policy.process.max_memory_mb,
+            cpu_rate_percent: policy.process.cpu_rate_percent,
+        },
+    })
+}
+
+fn container_filesystem_spec(policy: &Policy) -> ContainerBackendFilesystemSpec {
+    ContainerBackendFilesystemSpec {
+        read_only: policy.filesystem.read_only.clone(),
+        read_write: policy.filesystem.read_write.clone(),
+        deny: policy.filesystem.deny.clone(),
+    }
+}
+
+fn container_network_spec(policy: &Policy) -> ContainerBackendNetworkSpec {
+    ContainerBackendNetworkSpec {
+        mode: match policy.network.mode {
+            NetworkMode::Allow => ContainerBackendNetworkMode::Allow,
+            NetworkMode::Block => ContainerBackendNetworkMode::Block,
+            NetworkMode::Proxy => ContainerBackendNetworkMode::StrictProxy,
+        },
+        endpoint_policy_names: policy
+            .network
+            .policies
+            .iter()
+            .map(|policy| policy.name.clone())
+            .collect(),
+        binary_attribution_required: policy
+            .network
+            .policies
+            .iter()
+            .any(|policy| !policy.binaries.is_empty()),
+    }
 }
 
 fn plan_container_launch_options(
@@ -401,8 +526,8 @@ mod tests {
     use super::*;
     use crate::capability::{BackendPlanOutcome, DependencyState, PolicySurface};
     use crate::policy::{
-        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, Policy,
-        ProcessPolicy, SshPolicy,
+        Access, BinaryMatch, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy,
+        InferencePolicy, NetworkMode, NetworkPolicy, Policy, ProcessPolicy, SshPolicy,
     };
     use std::collections::BTreeSet;
 
@@ -439,6 +564,122 @@ mod tests {
         assert_eq!(linux_maps[0].name, "mxc-linux-lxc");
         assert_eq!(windows_maps.len(), 1);
         assert_eq!(windows_maps[0].name, "mxc-windows-wslc");
+    }
+
+    #[test]
+    fn container_execution_spec_covers_all_container_backend_formats() {
+        for descriptor in container_backend_descriptors() {
+            let launch = launch_for_backend(descriptor.id);
+            let runtime = present_runtime_for_backend(descriptor.id);
+            let spec = build_container_backend_execution_spec(
+                &policy(NetworkMode::Allow),
+                descriptor.id,
+                launch,
+                &runtime,
+                &PlannerOptions::new(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("{} rejected unexpectedly: {err}", descriptor.id.as_str())
+            });
+
+            assert_eq!(spec.backend, descriptor.id.as_str());
+            assert_eq!(spec.platform, descriptor.platform);
+            assert_eq!(spec.config_format, descriptor.config_format);
+            assert_eq!(spec.network.mode, ContainerBackendNetworkMode::Allow);
+            assert_eq!(spec.filesystem.read_write, ["{workspace}"]);
+            assert_eq!(spec.resources.max_processes, 0);
+            assert!(spec.destroy_on_exit);
+        }
+    }
+
+    #[test]
+    fn container_execution_spec_rejects_non_container_backend_before_config() {
+        let err = build_container_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            lxc_launch(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxLxc),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ContainerBackendSpecError::NotContainerBackend(
+                BackendCapabilityMapId::MxcLinuxBubblewrap
+            )
+        );
+    }
+
+    #[test]
+    fn container_execution_spec_rejects_unmapped_lxc_storage_before_config() {
+        let mut launch = lxc_launch();
+        launch.storage_path = Some("/var/lib/axis/lxc".into());
+
+        let err = build_container_backend_execution_spec(
+            &policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxLxc,
+            launch,
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxLxc),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ContainerBackendSpecError::RejectedBeforeConfig(_)
+        ));
+        assert!(err.to_string().contains("container.storage"));
+    }
+
+    #[test]
+    fn container_execution_spec_rejects_wslc_proxy_before_config() {
+        let err = build_container_backend_execution_spec(
+            &policy(NetworkMode::Proxy),
+            BackendCapabilityMapId::MxcWindowsWslc,
+            wslc_launch(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsWslc),
+            &PlannerOptions::new().accept_weaker_surface(PolicySurface::Network),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ContainerBackendSpecError::RejectedBeforeConfig(_)
+        ));
+        assert!(err.to_string().contains("audit.bypass_evidence"));
+    }
+
+    #[test]
+    fn container_execution_spec_serializes_fake_executor_boundary() {
+        let mut policy = policy(NetworkMode::Proxy);
+        policy.filesystem.read_only.push("/usr".into());
+        policy.filesystem.deny.push("~/.ssh".into());
+        policy.network.policies.push(endpoint_policy_with_binary());
+
+        let spec = build_container_backend_execution_spec(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxLxc,
+            lxc_launch(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxLxc),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+
+        assert_eq!(json["backend"], "mxc-linux-lxc");
+        assert_eq!(json["config_format"], "mxc_linux_lxc_json");
+        assert_eq!(json["network"]["mode"], "strict_proxy");
+        assert_eq!(json["network"]["endpoint_policy_names"][0], "github");
+        assert_eq!(json["network"]["binary_attribution_required"], true);
+        assert_eq!(json["filesystem"]["read_write"][0], "{workspace}");
+        assert_eq!(json["filesystem"]["read_only"][0], "/usr");
+        assert_eq!(json["filesystem"]["deny"][0], "~/.ssh");
+        assert_eq!(
+            json["rootfs"]["lxc_distribution_release"]["distribution"],
+            "alpine"
+        );
+        assert_eq!(json["bind_mounts"][0]["container_path"], "/workspace");
     }
 
     #[test]
@@ -824,6 +1065,23 @@ mod tests {
         );
     }
 
+    fn launch_for_backend(id: BackendCapabilityMapId) -> ContainerLaunchOptions {
+        match id {
+            BackendCapabilityMapId::MxcLinuxLxc => lxc_launch(),
+            BackendCapabilityMapId::MxcWindowsWslc => wslc_launch(),
+            other => panic!("unexpected container backend id {other:?}"),
+        }
+    }
+
+    fn present_runtime_for_backend(id: BackendCapabilityMapId) -> RuntimeProbeSnapshot {
+        backend_capability_map(id).host_dependencies.iter().fold(
+            RuntimeProbeSnapshot::new(),
+            |runtime, dependency| {
+                runtime.with_dependency(&dependency.name, DependencyState::Present)
+            },
+        )
+    }
+
     fn lxc_launch() -> ContainerLaunchOptions {
         ContainerLaunchOptions {
             rootfs: ContainerRootfsSource::LxcDistributionRelease {
@@ -881,6 +1139,22 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+        }
+    }
+
+    fn endpoint_policy_with_binary() -> EndpointPolicy {
+        EndpointPolicy {
+            name: "github".into(),
+            endpoints: vec![Endpoint {
+                host: "api.github.com".into(),
+                port: 443,
+                access: Access::ReadOnly,
+                protocol: Some("https".into()),
+                rules: Vec::new(),
+            }],
+            binaries: vec![BinaryMatch {
+                path: "/usr/bin/git".into(),
+            }],
         }
     }
 }
