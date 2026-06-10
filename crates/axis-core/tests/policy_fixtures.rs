@@ -41,7 +41,12 @@ const AGENT_FIXTURES: &[AgentFixture] = &[
         target: "Codex",
         path: "policies/agents/codex.yaml",
         mode: ExpectedNetworkMode::Proxy,
-        hosts: &["api.openai.com", "api.github.com", "github.com"],
+        hosts: &[
+            "api.openai.com",
+            "chatgpt.com",
+            "api.github.com",
+            "github.com",
+        ],
     },
     AgentFixture {
         target: "Gemini CLI",

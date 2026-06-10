@@ -414,6 +414,7 @@ pub(crate) struct MxcLinuxSandbox {
 }
 
 struct MxcPtyBridge {
+    runtime_parent: PathBuf,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
     relay: Option<PtyRelay>,
@@ -435,10 +436,12 @@ struct MxcNetnsOverride {
 
 impl MxcPtyBridge {
     fn new(id: SandboxId, workspace: &Path) -> Result<Self, SandboxError> {
-        let runtime_dir = workspace.join(".axis-pty").join(id.to_string());
+        let runtime_parent = workspace.join(".axis-pty");
+        let runtime_dir = runtime_parent.join(id.to_string());
         let socket_path = runtime_dir.join("stdio.sock");
         validate_unix_socket_path(&socket_path)?;
         Ok(Self {
+            runtime_parent,
             runtime_dir,
             socket_path,
             relay: None,
@@ -450,6 +453,20 @@ impl MxcPtyBridge {
             return Ok(());
         }
 
+        fs::create_dir_all(&self.runtime_parent).map_err(|err| {
+            SandboxError::IsolationFailed(format!(
+                "MXC PTY bridge runtime parent '{}': {err}",
+                self.runtime_parent.display()
+            ))
+        })?;
+        fs::set_permissions(&self.runtime_parent, fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                SandboxError::IsolationFailed(format!(
+                    "MXC PTY bridge runtime parent '{}': {err}",
+                    self.runtime_parent.display()
+                ))
+            },
+        )?;
         fs::create_dir_all(&self.runtime_dir).map_err(|err| {
             SandboxError::IsolationFailed(format!(
                 "MXC PTY bridge runtime dir '{}': {err}",
@@ -498,22 +515,39 @@ impl MxcPtyBridge {
             relay.stop();
         }
         let mut errors = Vec::new();
-        if self.socket_path.exists()
-            && let Err(err) = fs::remove_file(&self.socket_path)
-        {
-            errors.push(format!(
-                "remove socket '{}': {err}",
-                self.socket_path.display()
-            ));
+        match fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                errors.push(format!(
+                    "remove socket '{}': {err}",
+                    self.socket_path.display()
+                ));
+            }
         }
-        if self.runtime_dir.exists()
-            && let Err(err) = fs::remove_dir(&self.runtime_dir)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            errors.push(format!(
-                "remove runtime dir '{}': {err}",
-                self.runtime_dir.display()
-            ));
+        match fs::remove_dir(&self.runtime_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                errors.push(format!(
+                    "remove runtime dir '{}': {err}",
+                    self.runtime_dir.display()
+                ));
+            }
+        }
+        match fs::remove_dir(&self.runtime_parent) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(err) => {
+                errors.push(format!(
+                    "remove runtime parent '{}': {err}",
+                    self.runtime_parent.display()
+                ));
+            }
         }
         (!errors.is_empty()).then(|| errors.join("; "))
     }
@@ -5708,6 +5742,7 @@ mod tests {
         );
         config.capture_output = false;
         config.interactive_terminal = true;
+        let bridge_root = workspace.path().join(".axis-pty");
         let bridge_dir = workspace
             .path()
             .join(".axis-pty")
@@ -5724,6 +5759,48 @@ mod tests {
         assert!(
             !bridge_dir.exists(),
             "PTY bridge runtime directory should be removed after wait"
+        );
+        assert!(
+            !bridge_root.exists(),
+            "PTY bridge runtime parent should be removed when empty"
+        );
+    }
+
+    #[test]
+    fn mxc_pty_bridge_connected_cleanup_removes_runtime_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut bridge = MxcPtyBridge::new(SandboxId::new(), workspace.path()).unwrap();
+        let bridge_root = workspace.path().join(".axis-pty");
+
+        bridge.start().unwrap();
+        assert_eq!(
+            fs::metadata(&bridge_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&bridge.runtime_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let stream = UnixStream::connect(&bridge.socket_path).unwrap();
+        drop(stream);
+
+        assert_eq!(bridge.cleanup(), None);
+        assert!(
+            !bridge.socket_path.exists(),
+            "PTY bridge socket should be removed after connected cleanup"
+        );
+        assert!(
+            !bridge.runtime_dir.exists(),
+            "PTY bridge runtime directory should be removed after connected cleanup"
+        );
+        assert!(
+            !bridge_root.exists(),
+            "PTY bridge runtime parent should be removed after connected cleanup"
         );
     }
 

@@ -38,6 +38,8 @@ network:
       endpoints:
         - host: "api.openai.com"
           port: 443
+        - host: "chatgpt.com"
+          port: 443
     - name: github
       endpoints:
         - host: "api.github.com"
