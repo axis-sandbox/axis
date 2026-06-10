@@ -1937,6 +1937,7 @@ fn translate_sandbox_config_with_metadata(
         shared_mxc::MxcProcessConfigOptions {
             strict_proxy_enforced_by_axis: network_mode
                 == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis,
+            resource_limits_enforced_by_axis: true,
             ..Default::default()
         },
     )

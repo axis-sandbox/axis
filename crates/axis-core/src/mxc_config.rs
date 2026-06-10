@@ -46,6 +46,11 @@ pub enum MxcConfigError {
     #[error("MXC process timeout {timeout_ms}ms exceeds the MXC wire limit")]
     ProcessTimeoutOverflow { timeout_ms: u64 },
 
+    #[error(
+        "AXIS process resource limits must be enforced outside MXC before emitting process config"
+    )]
+    ProcessResourceLimitsRequireAxisLayer,
+
     #[error("MXC LXC config requires a distribution/release rootfs source")]
     LxcRootfsRequired,
 
@@ -115,6 +120,7 @@ pub struct MxcContainerConfigOptions {
 pub struct MxcProcessConfigOptions {
     pub container_id: Option<String>,
     pub strict_proxy_enforced_by_axis: bool,
+    pub resource_limits_enforced_by_axis: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -427,7 +433,9 @@ pub fn build_mxc_process_config(
     spec: &ProcessBackendExecutionSpec,
     options: MxcProcessConfigOptions,
 ) -> Result<MxcProcessWireConfig, MxcConfigError> {
+    validate_process_backend_supported(spec)?;
     validate_process_network(spec, &options)?;
+    validate_process_resources(spec, &options)?;
     let process = process_config_for_process_spec(command_line.into(), spec)?;
     let filesystem = MxcFilesystemConfig {
         readwrite_paths: spec.filesystem.read_write.clone(),
@@ -489,11 +497,9 @@ pub fn build_mxc_process_config(
         }),
         ProcessBackendConfigFormat::AxisNativeLinux
         | ProcessBackendConfigFormat::AxisNativeMacosSeatbeltProfile
-        | ProcessBackendConfigFormat::AxisNativeWindowsProcess => {
-            Err(MxcConfigError::NativeProcessBackendUnsupported {
-                backend: spec.backend.clone(),
-            })
-        }
+        | ProcessBackendConfigFormat::AxisNativeWindowsProcess => unreachable!(
+            "native AXIS process backends are rejected before MXC process config emission"
+        ),
     }
 }
 
@@ -605,6 +611,39 @@ fn validate_process_config(process: &MxcProcessConfig) -> Result<(), MxcConfigEr
     }
 
     Ok(())
+}
+
+fn validate_process_backend_supported(
+    spec: &ProcessBackendExecutionSpec,
+) -> Result<(), MxcConfigError> {
+    match spec.config_format {
+        ProcessBackendConfigFormat::AxisNativeLinux
+        | ProcessBackendConfigFormat::AxisNativeMacosSeatbeltProfile
+        | ProcessBackendConfigFormat::AxisNativeWindowsProcess => {
+            Err(MxcConfigError::NativeProcessBackendUnsupported {
+                backend: spec.backend.clone(),
+            })
+        }
+        ProcessBackendConfigFormat::MxcLinuxJson
+        | ProcessBackendConfigFormat::MxcWindowsProcessContainer
+        | ProcessBackendConfigFormat::MxcMacosSeatbeltProfile => Ok(()),
+    }
+}
+
+fn validate_process_resources(
+    spec: &ProcessBackendExecutionSpec,
+    options: &MxcProcessConfigOptions,
+) -> Result<(), MxcConfigError> {
+    if process_resources_requested(spec) && !options.resource_limits_enforced_by_axis {
+        return Err(MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
+    }
+    Ok(())
+}
+
+fn process_resources_requested(spec: &ProcessBackendExecutionSpec) -> bool {
+    spec.resources.max_processes != 0
+        || spec.resources.max_memory_mb != 0
+        || spec.resources.cpu_rate_percent != 0
 }
 
 fn validate_process_network(
@@ -1194,6 +1233,7 @@ mod tests {
             MxcProcessConfigOptions {
                 container_id: Some("axis-bwrap".into()),
                 strict_proxy_enforced_by_axis: true,
+                resource_limits_enforced_by_axis: true,
             },
         )
         .unwrap();
@@ -1261,6 +1301,43 @@ mod tests {
                 timeout_ms: u64::from(u32::MAX) + 1
             }
         );
+    }
+
+    #[test]
+    fn process_resource_limits_require_axis_owned_layer_before_mxc_config() {
+        let mut spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            NetworkMode::Allow,
+        )
+        .unwrap();
+        spec.resources.max_processes = 32;
+        spec.resources.max_memory_mb = 1024;
+        spec.resources.cpu_rate_percent = 50;
+
+        let err = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows".into()),
+                strict_proxy_enforced_by_axis: false,
+                resource_limits_enforced_by_axis: false,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
+
+        let config = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows".into()),
+                strict_proxy_enforced_by_axis: false,
+                resource_limits_enforced_by_axis: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(config.containment, MxcContainment::ProcessContainer);
     }
 
     #[test]
@@ -1728,6 +1805,7 @@ mod tests {
         MxcProcessConfigOptions {
             container_id: Some(container_id.into()),
             strict_proxy_enforced_by_axis: false,
+            resource_limits_enforced_by_axis: true,
         }
     }
 
