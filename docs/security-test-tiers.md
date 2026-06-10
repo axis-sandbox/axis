@@ -90,6 +90,7 @@ visible skip into a failure.
 | `AXIS_TEST_RUN_AS_USER=<user>` | 3 | Run identity/resource fallback tests for an existing non-root user. |
 | `AXIS_RUN_MXC_PROCESS_E2E=1` | 3 | Run Linux MXC Bubblewrap process-runtime proofs when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, `bwrap`, unprivileged user namespaces, and `python3` are present. |
 | `AXIS_REAL_MXC_PROXY_TESTS=1` | 3 | Run real MXC strict proxy tests when executor, launcher, and network prerequisites are present. |
+| `AXIS_RUN_MXC_LXC_E2E=1` | 3 | Run Linux MXC LXC smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR` and configured LXC runtime/image inputs are present. |
 | `AXIS_RUN_MXC_MICROVM_E2E=1` | 3 | Run Linux MXC MicroVM smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
 | `AXIS_RUN_MXC_HYPERLIGHT_E2E=1` | 3 | Run Linux MXC Hyperlight smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_MICROVM=1` | 3 | Run Linux MXC MicroVM cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
