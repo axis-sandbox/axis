@@ -109,6 +109,24 @@ pub enum VmBackendNetworkMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmBackendFilesystemSpec {
+    #[serde(default)]
+    pub read_only: Vec<String>,
+    #[serde(default)]
+    pub read_write: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VmBackendNetworkSpec {
+    pub mode: VmBackendNetworkMode,
+    #[serde(default)]
+    pub endpoint_policy_names: Vec<String>,
+    pub binary_attribution_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VmBackendExecutionSpec {
     pub backend: String,
     pub platform: BackendPlatform,
@@ -127,7 +145,8 @@ pub struct VmBackendExecutionSpec {
     #[serde(default)]
     pub required_features: Vec<String>,
     pub destroy_on_exit: bool,
-    pub network_mode: VmBackendNetworkMode,
+    pub filesystem: VmBackendFilesystemSpec,
+    pub network: VmBackendNetworkSpec,
     pub suitability: VmBackendSuitability,
 }
 
@@ -323,7 +342,8 @@ pub fn build_vm_backend_execution_spec(
         copy_out: launch.copy_out,
         required_features: launch.required_features,
         destroy_on_exit: launch.destroy_on_exit,
-        network_mode: vm_network_mode(policy),
+        filesystem: vm_filesystem_spec(policy),
+        network: vm_network_spec(policy),
         suitability: plan.descriptor.suitability,
     })
 }
@@ -333,6 +353,31 @@ fn vm_network_mode(policy: &Policy) -> VmBackendNetworkMode {
         NetworkMode::Allow => VmBackendNetworkMode::Allow,
         NetworkMode::Block => VmBackendNetworkMode::Block,
         NetworkMode::Proxy => VmBackendNetworkMode::StrictProxy,
+    }
+}
+
+fn vm_filesystem_spec(policy: &Policy) -> VmBackendFilesystemSpec {
+    VmBackendFilesystemSpec {
+        read_only: policy.filesystem.read_only.clone(),
+        read_write: policy.filesystem.read_write.clone(),
+        deny: policy.filesystem.deny.clone(),
+    }
+}
+
+fn vm_network_spec(policy: &Policy) -> VmBackendNetworkSpec {
+    VmBackendNetworkSpec {
+        mode: vm_network_mode(policy),
+        endpoint_policy_names: policy
+            .network
+            .policies
+            .iter()
+            .map(|policy| policy.name.clone())
+            .collect(),
+        binary_attribution_required: policy
+            .network
+            .policies
+            .iter()
+            .any(|policy| !policy.binaries.is_empty()),
     }
 }
 
@@ -573,8 +618,8 @@ mod tests {
     use crate::capability::{BackendPlanOutcome, DependencyState};
     use crate::capability_map::host_dependency;
     use crate::policy::{
-        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, Policy,
-        ProcessPolicy, SshPolicy,
+        Access, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy, InferencePolicy,
+        NetworkMode, NetworkPolicy, Policy, ProcessPolicy, SshPolicy,
     };
     use std::collections::BTreeSet;
 
@@ -659,7 +704,8 @@ mod tests {
             assert_eq!(spec.backend, descriptor.id.as_str());
             assert_eq!(spec.platform, descriptor.platform);
             assert_eq!(spec.config_format, descriptor.config_format);
-            assert_eq!(spec.network_mode, VmBackendNetworkMode::Allow);
+            assert_eq!(spec.network.mode, VmBackendNetworkMode::Allow);
+            assert_eq!(spec.filesystem.read_write, ["{workspace}"]);
             assert_eq!(spec.suitability, descriptor.suitability);
             assert!(spec.destroy_on_exit);
         }
@@ -741,9 +787,40 @@ mod tests {
 
         assert_eq!(json["backend"], "mxc-windows-sandbox");
         assert_eq!(json["config_format"], "mxc_windows_sandbox_json");
-        assert_eq!(json["network_mode"], "allow");
+        assert_eq!(json["network"]["mode"], "allow");
         assert_eq!(json["guest_agent"], "axis-guest-agent.exe");
+        assert_eq!(json["filesystem"]["read_write"][0], "{workspace}");
         assert_eq!(json["suitability"]["full_agent_sessions"], false);
+    }
+
+    #[test]
+    fn vm_execution_spec_preserves_policy_metadata_for_fake_executor() {
+        let mut policy = policy(NetworkMode::Allow);
+        policy.filesystem.read_only = vec!["/usr".into()];
+        policy.filesystem.read_write = vec!["/workspace".into()];
+        policy.filesystem.deny = vec!["/home/user/.ssh".into()];
+        policy.network.policies.push(endpoint_policy());
+
+        let spec = build_vm_backend_execution_spec(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxMicrovm,
+            microvm_launch(),
+            &linux_microvm_runtime(),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+
+        assert_eq!(spec.filesystem.read_only, ["/usr"]);
+        assert_eq!(spec.filesystem.read_write, ["/workspace"]);
+        assert_eq!(spec.filesystem.deny, ["/home/user/.ssh"]);
+        assert_eq!(spec.network.endpoint_policy_names, ["github".to_string()]);
+        assert!(!spec.network.binary_attribution_required);
+        assert_eq!(json["filesystem"]["read_only"][0], "/usr");
+        assert_eq!(json["filesystem"]["read_write"][0], "/workspace");
+        assert_eq!(json["filesystem"]["deny"][0], "/home/user/.ssh");
+        assert_eq!(json["network"]["endpoint_policy_names"][0], "github");
+        assert_eq!(json["network"]["binary_attribution_required"], false);
     }
 
     #[test]
@@ -1242,6 +1319,20 @@ mod tests {
             gpu: GpuPolicy::default(),
             ssh: SshPolicy::default(),
             amd: None,
+        }
+    }
+
+    fn endpoint_policy() -> EndpointPolicy {
+        EndpointPolicy {
+            name: "github".into(),
+            endpoints: vec![Endpoint {
+                host: "api.github.com".into(),
+                port: 443,
+                access: Access::ReadOnly,
+                protocol: Some("https".into()),
+                rules: Vec::new(),
+            }],
+            binaries: Vec::new(),
         }
     }
 }
