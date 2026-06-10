@@ -13,8 +13,10 @@ use crate::capability::{
 use crate::capability_map::{
     BackendCapabilityMapId, backend_capability_map, backend_capability_maps_for_platform,
 };
-use crate::policy::Policy;
+use crate::policy::{NetworkMode, Policy};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +51,90 @@ pub struct NativeProcessBackendRetention {
     pub rationale: &'static str,
     pub advantages: &'static [&'static str],
     pub replacement_requirements: &'static [&'static str],
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProcessBackendSpecError {
+    #[error("{0:?} is not a process-style backend")]
+    NotProcessBackend(BackendCapabilityMapId),
+
+    #[error("process backend rejected policy before config generation: {0}")]
+    RejectedBeforeConfig(String),
+
+    #[error("process command must not be empty")]
+    EmptyCommand,
+
+    #[error("process environment key must not be empty")]
+    EmptyEnvironmentKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessLaunchOptions {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub capture_output: bool,
+    #[serde(default)]
+    pub timeout_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessBackendNetworkMode {
+    Allow,
+    Block,
+    StrictProxy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessBackendFilesystemSpec {
+    #[serde(default)]
+    pub read_only: Vec<String>,
+    #[serde(default)]
+    pub read_write: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessBackendNetworkSpec {
+    pub mode: ProcessBackendNetworkMode,
+    #[serde(default)]
+    pub endpoint_policy_names: Vec<String>,
+    pub binary_attribution_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessBackendResourceSpec {
+    pub max_processes: u32,
+    pub max_memory_mb: u64,
+    pub cpu_rate_percent: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessBackendExecutionSpec {
+    pub backend: String,
+    pub platform: BackendPlatform,
+    pub config_format: ProcessBackendConfigFormat,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    pub filesystem: ProcessBackendFilesystemSpec,
+    pub network: ProcessBackendNetworkSpec,
+    pub resources: ProcessBackendResourceSpec,
+    #[serde(default)]
+    pub capture_output: bool,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,11 +308,93 @@ pub fn process_backend_maps_for_platform(
         .collect()
 }
 
+pub fn build_process_backend_execution_spec(
+    policy: &Policy,
+    id: BackendCapabilityMapId,
+    launch: ProcessLaunchOptions,
+    runtime: &RuntimeProbeSnapshot,
+    options: &PlannerOptions,
+) -> Result<ProcessBackendExecutionSpec, ProcessBackendSpecError> {
+    validate_process_launch_options(&launch)?;
+
+    let plan = plan_process_backend_policy(policy, id, runtime, options)
+        .ok_or(ProcessBackendSpecError::NotProcessBackend(id))?;
+    if !plan.spawn_allowed() {
+        return Err(ProcessBackendSpecError::RejectedBeforeConfig(
+            plan.pre_spawn_error()
+                .unwrap_or_else(|| "unknown process backend planning failure".into()),
+        ));
+    }
+
+    Ok(ProcessBackendExecutionSpec {
+        backend: plan.descriptor.id.as_str().into(),
+        platform: plan.descriptor.platform,
+        config_format: plan.descriptor.config_format,
+        command: launch.command,
+        args: launch.args,
+        working_dir: launch.working_dir,
+        environment: launch.environment,
+        filesystem: process_filesystem_spec(policy),
+        network: process_network_spec(policy),
+        resources: ProcessBackendResourceSpec {
+            max_processes: policy.process.max_processes,
+            max_memory_mb: policy.process.max_memory_mb,
+            cpu_rate_percent: policy.process.cpu_rate_percent,
+        },
+        capture_output: launch.capture_output,
+        timeout_ms: launch
+            .timeout_sec
+            .or(policy.process.timeout_sec)
+            .map(|seconds| seconds.saturating_mul(1000)),
+    })
+}
+
+fn validate_process_launch_options(
+    launch: &ProcessLaunchOptions,
+) -> Result<(), ProcessBackendSpecError> {
+    if launch.command.trim().is_empty() {
+        return Err(ProcessBackendSpecError::EmptyCommand);
+    }
+    if launch.environment.keys().any(|key| key.trim().is_empty()) {
+        return Err(ProcessBackendSpecError::EmptyEnvironmentKey);
+    }
+    Ok(())
+}
+
+fn process_filesystem_spec(policy: &Policy) -> ProcessBackendFilesystemSpec {
+    ProcessBackendFilesystemSpec {
+        read_only: policy.filesystem.read_only.clone(),
+        read_write: policy.filesystem.read_write.clone(),
+        deny: policy.filesystem.deny.clone(),
+    }
+}
+
+fn process_network_spec(policy: &Policy) -> ProcessBackendNetworkSpec {
+    ProcessBackendNetworkSpec {
+        mode: match policy.network.mode {
+            NetworkMode::Allow => ProcessBackendNetworkMode::Allow,
+            NetworkMode::Block => ProcessBackendNetworkMode::Block,
+            NetworkMode::Proxy => ProcessBackendNetworkMode::StrictProxy,
+        },
+        endpoint_policy_names: policy
+            .network
+            .policies
+            .iter()
+            .map(|policy| policy.name.clone())
+            .collect(),
+        binary_attribution_required: policy
+            .network
+            .policies
+            .iter()
+            .any(|policy| !policy.binaries.is_empty()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capability::{BackendPlanOutcome, CapabilitySupport, DependencyState};
-    use crate::capability_map::host_dependency;
+    use crate::capability_map::{backend_capability_map, host_dependency};
     use crate::policy::{
         Access, BinaryMatch, Endpoint, EndpointPolicy, FilesystemPolicy, GpuPolicy,
         InferencePolicy, NetworkMode, NetworkPolicy, Policy, ProcessPolicy, SshPolicy,
@@ -420,6 +588,145 @@ mod tests {
                 .iter()
                 .any(|advantage| advantage.contains("strict proxy integration"))
         );
+    }
+
+    #[test]
+    fn process_execution_spec_covers_all_process_backend_formats() {
+        for descriptor in process_backend_descriptors() {
+            let policy = process_policy(NetworkMode::Allow);
+            let runtime = present_runtime_for_backend(descriptor.id);
+            let spec = build_process_backend_execution_spec(
+                &policy,
+                descriptor.id,
+                launch_options(),
+                &runtime,
+                &PlannerOptions::new(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("{} rejected unexpectedly: {err}", descriptor.id.as_str())
+            });
+
+            assert_eq!(spec.backend, descriptor.id.as_str());
+            assert_eq!(spec.platform, descriptor.platform);
+            assert_eq!(spec.config_format, descriptor.config_format);
+            assert_eq!(spec.command, "agent");
+            assert_eq!(spec.args, ["--version"]);
+            assert_eq!(spec.network.mode, ProcessBackendNetworkMode::Allow);
+            assert_eq!(spec.filesystem.read_write, ["{workspace}"]);
+            assert_eq!(spec.resources.max_processes, 0);
+        }
+    }
+
+    #[test]
+    fn process_execution_spec_rejects_non_process_backend_before_config() {
+        let err = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxLxc,
+            launch_options(),
+            &RuntimeProbeSnapshot::new(),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ProcessBackendSpecError::NotProcessBackend(BackendCapabilityMapId::MxcLinuxLxc)
+        );
+    }
+
+    #[test]
+    fn process_execution_spec_rejects_invalid_launch_options_before_planning() {
+        let mut launch = launch_options();
+        launch.command = " ".into();
+        let err = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            launch,
+            &RuntimeProbeSnapshot::new(),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ProcessBackendSpecError::EmptyCommand);
+
+        let mut launch = launch_options();
+        launch.environment.insert(" ".into(), "bad".into());
+        let err = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Allow),
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            launch,
+            &RuntimeProbeSnapshot::new(),
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ProcessBackendSpecError::EmptyEnvironmentKey);
+    }
+
+    #[test]
+    fn process_execution_spec_for_macos_mxc_rejects_syscall_filtering_before_config() {
+        let mut policy = process_policy(NetworkMode::Allow);
+        policy.process.blocked_syscalls.push("ptrace".into());
+        let runtime = present_runtime_for_backend(BackendCapabilityMapId::MxcMacosSeatbelt);
+
+        let err = build_process_backend_execution_spec(
+            &policy,
+            BackendCapabilityMapId::MxcMacosSeatbelt,
+            launch_options(),
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ProcessBackendSpecError::RejectedBeforeConfig(_)
+        ));
+        assert!(err.to_string().contains("process.syscall_filtering"));
+    }
+
+    #[test]
+    fn process_execution_spec_for_windows_mxc_rejects_proxy_before_config() {
+        let runtime =
+            present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
+
+        let err = build_process_backend_execution_spec(
+            &process_policy(NetworkMode::Proxy),
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            launch_options(),
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ProcessBackendSpecError::RejectedBeforeConfig(_)
+        ));
+        assert!(err.to_string().contains("audit.bypass_evidence"));
+    }
+
+    #[test]
+    fn process_execution_spec_serializes_fake_executor_boundary() {
+        let policy = process_policy(NetworkMode::Block);
+        let runtime = present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap);
+        let mut launch = launch_options();
+        launch.timeout_sec = Some(2);
+        launch.environment.insert("AXIS_TEST".into(), "1".into());
+
+        let spec = build_process_backend_execution_spec(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            launch,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+
+        assert_eq!(json["backend"], "mxc-linux-bubblewrap");
+        assert_eq!(json["config_format"], "mxc_linux_json");
+        assert_eq!(json["network"]["mode"], "block");
+        assert_eq!(json["timeout_ms"], 2000);
+        assert_eq!(json["environment"]["AXIS_TEST"], "1");
     }
 
     #[test]
@@ -664,6 +971,26 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn present_runtime_for_backend(id: BackendCapabilityMapId) -> RuntimeProbeSnapshot {
+        backend_capability_map(id).host_dependencies.iter().fold(
+            RuntimeProbeSnapshot::new(),
+            |runtime, dependency| {
+                runtime.with_dependency(&dependency.name, DependencyState::Present)
+            },
+        )
+    }
+
+    fn launch_options() -> ProcessLaunchOptions {
+        ProcessLaunchOptions {
+            command: "agent".into(),
+            args: vec!["--version".into()],
+            working_dir: Some("{workspace}".into()),
+            environment: BTreeMap::new(),
+            capture_output: true,
+            timeout_sec: None,
+        }
     }
 
     fn process_policy(mode: NetworkMode) -> Policy {
