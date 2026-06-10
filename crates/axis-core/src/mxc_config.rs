@@ -67,6 +67,11 @@ pub enum MxcConfigError {
     WslcNetworkModeUnsupported { mode: ContainerBackendNetworkMode },
 
     #[error(
+        "AXIS container resource limits must be enforced outside MXC before emitting container config"
+    )]
+    ContainerResourceLimitsRequireAxisLayer,
+
+    #[error(
         "MXC container config cannot represent bind mount aliases: {host_path} -> {container_path}"
     )]
     BindMountAliasUnsupported {
@@ -114,6 +119,7 @@ pub enum MxcConfigError {
 pub struct MxcContainerConfigOptions {
     pub container_id: Option<String>,
     pub strict_proxy_enforced_by_axis: bool,
+    pub resource_limits_enforced_by_axis: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -374,6 +380,7 @@ pub fn build_mxc_container_config(
     validate_container_network(spec, &options)?;
     validate_bind_mounts(spec)?;
     validate_container_backend_semantics(spec)?;
+    validate_container_resources(spec, &options)?;
 
     let filesystem = MxcFilesystemConfig {
         readwrite_paths: spec.filesystem.read_write.clone(),
@@ -830,6 +837,33 @@ fn validate_container_backend_semantics(
     }
 
     Ok(())
+}
+
+fn validate_container_resources(
+    spec: &ContainerBackendExecutionSpec,
+    options: &MxcContainerConfigOptions,
+) -> Result<(), MxcConfigError> {
+    if !container_resources_requested(spec) {
+        return Ok(());
+    }
+
+    match spec.config_format {
+        ContainerBackendConfigFormat::MxcWindowsWslcJson => {
+            Err(MxcConfigError::WslcResourceLimitsUnsupported)
+        }
+        ContainerBackendConfigFormat::MxcLinuxLxcJson
+            if !options.resource_limits_enforced_by_axis =>
+        {
+            Err(MxcConfigError::ContainerResourceLimitsRequireAxisLayer)
+        }
+        ContainerBackendConfigFormat::MxcLinuxLxcJson => Ok(()),
+    }
+}
+
+fn container_resources_requested(spec: &ContainerBackendExecutionSpec) -> bool {
+    spec.resources.max_processes != 0
+        || spec.resources.max_memory_mb != 0
+        || spec.resources.cpu_rate_percent != 0
 }
 
 fn mxc_process_network_policy(
@@ -1353,6 +1387,7 @@ mod tests {
             MxcContainerConfigOptions {
                 container_id: Some("axis-lxc".into()),
                 strict_proxy_enforced_by_axis: true,
+                resource_limits_enforced_by_axis: true,
             },
         )
         .unwrap();
@@ -1475,6 +1510,7 @@ mod tests {
             MxcContainerConfigOptions {
                 container_id: Some("axis-wslc".into()),
                 strict_proxy_enforced_by_axis: true,
+                resource_limits_enforced_by_axis: false,
             },
         )
         .unwrap_err();
@@ -1500,6 +1536,39 @@ mod tests {
                 host_path: "/workspace".into()
             }
         );
+    }
+
+    #[test]
+    fn lxc_resource_limits_require_axis_owned_layer_before_mxc_config() {
+        let mut spec = lxc_execution_spec(NetworkMode::Allow).unwrap();
+        spec.resources.max_processes = 64;
+        spec.resources.max_memory_mb = 512;
+        spec.resources.cpu_rate_percent = 25;
+
+        let err = build_mxc_container_config(
+            process(),
+            &spec,
+            MxcContainerConfigOptions {
+                container_id: Some("axis-lxc".into()),
+                strict_proxy_enforced_by_axis: false,
+                resource_limits_enforced_by_axis: false,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, MxcConfigError::ContainerResourceLimitsRequireAxisLayer);
+
+        let config = build_mxc_container_config(
+            process(),
+            &spec,
+            MxcContainerConfigOptions {
+                container_id: Some("axis-lxc".into()),
+                strict_proxy_enforced_by_axis: false,
+                resource_limits_enforced_by_axis: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(config.containment, MxcContainment::Lxc);
     }
 
     #[test]
@@ -1798,6 +1867,7 @@ mod tests {
         MxcContainerConfigOptions {
             container_id: Some(container_id.into()),
             strict_proxy_enforced_by_axis: false,
+            resource_limits_enforced_by_axis: true,
         }
     }
 

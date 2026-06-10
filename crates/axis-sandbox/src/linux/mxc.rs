@@ -1986,7 +1986,10 @@ fn translate_lxc_container_config(
     let wire = shared_mxc::build_mxc_container_config(
         mxc_process_config_from_translated(&process),
         &spec,
-        shared_mxc::MxcContainerConfigOptions::default(),
+        shared_mxc::MxcContainerConfigOptions {
+            resource_limits_enforced_by_axis: true,
+            ..Default::default()
+        },
     )
     .map_err(|err| MxcTranslationError::Container(err.to_string()))?;
     mxc_execution_spec_from_container_wire(wire)
