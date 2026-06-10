@@ -362,6 +362,8 @@ Exit criteria for replacing a native backend:
 
 ## Agent, Provider, And Inference Targets
 
+The maintained target matrix is
+[Agent, Provider, And Inference Targets](agent-provider-inference-targets.md).
 AXIS should keep support for the existing agent policy templates and make MXC
 backend selection transparent to the agent command where possible.
 

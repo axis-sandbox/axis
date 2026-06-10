@@ -937,3 +937,90 @@ async fn inference_local_routes_to_endpoint() {
         "expected mock inference response, got: {body}"
     );
 }
+
+#[tokio::test]
+async fn inference_local_relays_streaming_responses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"delta\":\"one\"}\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stream.write_all(b"data: [DONE]\n\n").await.unwrap();
+        }
+    });
+
+    let (_sandbox_id, addr) = start_proxy_with_inference(Some(mock_addr)).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).await.unwrap();
+    assert!(
+        response_line.contains("200"),
+        "expected 200 for inference.local with endpoint, got: {response_line}"
+    );
+
+    let inner = reader.into_inner();
+    let (mut read_half, mut write_half) = tokio::io::split(inner);
+    write_half
+        .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: inference.local\r\n\r\n")
+        .await
+        .unwrap();
+
+    let received = rx.await.unwrap();
+    assert!(
+        received.starts_with("POST /v1/responses HTTP/1.1"),
+        "expected streaming request to reach mock provider, got: {received}"
+    );
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1024];
+    for _ in 0..4 {
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut read_half, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+        if String::from_utf8_lossy(&response).contains("data: [DONE]") {
+            break;
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.contains("data: {\"delta\":\"one\"}") && response.contains("data: [DONE]"),
+        "expected streaming chunks to relay through proxy, got: {response}"
+    );
+}

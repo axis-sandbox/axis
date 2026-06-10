@@ -742,21 +742,67 @@ inference:
         );
         let injector = CredentialInjector::from_policy(&policy).unwrap();
 
-        let rewritten = injector
-            .rewrite_http_request_head(
-                "inference.local",
-                80,
-                false,
-                b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local\r\nAuthorization: Bearer sandbox-placeholder\r\n\r\n",
-            )
-            .unwrap()
-            .unwrap();
-        let rewritten = String::from_utf8(rewritten).unwrap();
+        for request in [
+            "POST /v1/chat/completions HTTP/1.1",
+            "POST /v1/completions HTTP/1.1",
+            "POST /v1/responses HTTP/1.1",
+            "POST /v1/embeddings HTTP/1.1",
+            "GET /v1/models HTTP/1.1",
+        ] {
+            let head = format!(
+                "{request}\r\nHost: inference.local\r\nAuthorization: Bearer sandbox-placeholder\r\n\r\n"
+            );
+            let rewritten = injector
+                .rewrite_http_request_head("inference.local", 80, false, head.as_bytes())
+                .unwrap()
+                .unwrap();
+            let rewritten = String::from_utf8(rewritten).unwrap();
 
-        assert!(rewritten.contains("Authorization: Bearer provider-secret\r\n"));
-        assert!(!rewritten.contains("sandbox-placeholder"));
+            assert!(rewritten.contains("Authorization: Bearer provider-secret\r\n"));
+            assert!(!rewritten.contains("sandbox-placeholder"));
+        }
         unsafe {
             std::env::remove_var("AXIS_TEST_PROVIDER_KEY");
+        }
+    }
+
+    #[test]
+    fn openai_api_key_env_injects_for_all_supported_openai_compatible_paths() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("AXIS_TEST_OPENAI_KEY", "openai-secret");
+        }
+        let policy = policy(
+            r#"
+version: 1
+name: inject-openai
+inference:
+  routes:
+    - name: openai
+      provider: openai
+      api_key_env: AXIS_TEST_OPENAI_KEY
+"#,
+        );
+        let injector = CredentialInjector::from_policy(&policy).unwrap();
+
+        for request in [
+            "POST /v1/chat/completions HTTP/1.1",
+            "POST /v1/completions HTTP/1.1",
+            "POST /v1/responses HTTP/1.1",
+            "POST /v1/embeddings HTTP/1.1",
+            "GET /v1/models HTTP/1.1",
+        ] {
+            let head = format!("{request}\r\nHost: api.openai.com\r\n\r\n");
+            let rewritten = injector
+                .rewrite_http_request_head("api.openai.com", 443, true, head.as_bytes())
+                .unwrap()
+                .unwrap();
+            let rewritten = String::from_utf8(rewritten).unwrap();
+
+            assert!(rewritten.contains("Authorization: Bearer openai-secret\r\n"));
+        }
+        unsafe {
+            std::env::remove_var("AXIS_TEST_OPENAI_KEY");
         }
     }
 
