@@ -8,6 +8,10 @@ license.workspace = true
 name = "success-metrics"
 path = "success_metrics.rs"
 
+[[bin]]
+name = "backend-defaults"
+path = "backend_defaults.rs"
+
 [dependencies]
 axis-core = { workspace = true }
 axis-sandbox = { workspace = true }
@@ -15,3 +19,4 @@ axis-proxy = { workspace = true }
 axis-safety = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
+serde_json = { workspace = true }

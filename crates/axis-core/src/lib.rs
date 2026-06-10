@@ -4,6 +4,7 @@
 //! AXIS Core — policy model, OPA engine, audit events, and shared types.
 
 pub mod audit;
+pub mod backend_defaults;
 pub mod bench;
 pub mod capability;
 pub mod capability_map;

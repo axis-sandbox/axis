@@ -4,7 +4,9 @@ AXIS keeps native process backends only where they provide a current capability,
 dependency, or performance advantage that MXC-backed paths have not yet matched.
 The retention decisions below are represented in
 `axis_core::process_backend` and use the same backend capability vocabulary as
-MXC process backends.
+MXC process backends. Current default-backend status and benchmark evidence
+requirements are documented in
+[Backend Default Decisions](backend-default-decisions.md).
 
 ## Current Decisions
 

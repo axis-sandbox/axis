@@ -88,13 +88,15 @@ visible skip into a failure.
 | `AXIS_REAL_NETNS_TESTS=1` | 3 | Run real network namespace tests on hosts with required namespace support. |
 | `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution proofs. |
 | `AXIS_TEST_RUN_AS_USER=<user>` | 3 | Run identity/resource fallback tests for an existing non-root user. |
-| `AXIS_RUN_MXC_PROCESS_E2E=1` | 3 | Run Linux MXC Bubblewrap process-runtime proofs when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, `bwrap`, unprivileged user namespaces, and `python3` are present. |
+| `AXIS_RUN_MXC_PROCESS_E2E=1` | 3 | Run platform MXC process-runtime proofs when a safe MXC executor and backend prerequisites are present. Linux Bubblewrap proofs also require `bwrap`, unprivileged user namespaces, and `python3`. |
 | `AXIS_REAL_MXC_PROXY_TESTS=1` | 3 | Run real MXC strict proxy tests when executor, launcher, and network prerequisites are present. |
 | `AXIS_RUN_MXC_LXC_E2E=1` | 3 | Run Linux MXC LXC smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR` and configured LXC runtime/image inputs are present. |
+| `AXIS_RUN_MXC_WSLC_E2E=1` | 3 | Run Windows MXC WSLC smoke tests when a safe MXC executor, WSL2, and configured distribution inputs are present. |
 | `AXIS_RUN_MXC_MICROVM_E2E=1` | 3 | Run Linux MXC MicroVM smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
 | `AXIS_RUN_MXC_HYPERLIGHT_E2E=1` | 3 | Run Linux MXC Hyperlight smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_MICROVM=1` | 3 | Run Linux MXC MicroVM cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_HYPERLIGHT=1` | 3 | Run Linux MXC Hyperlight cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
+| `AXIS_BENCH_MXC_WINDOWS_VM=1` | 3 | Run Windows MXC VM-style cold/warm, memory, and density benchmarks when a safe MXC executor, required Windows VM feature, and runtime artifacts are present. |
 | `AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1` | 4 | Run tests against an installed privileged netns helper in a prepared runner. |
 | `AXIS_RUN_PRIVILEGED_E2E=1` | 4 | Run the disposable privileged helper e2e script. |
 | `AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E=1` | 4 | Treat missing built proxy prerequisites as failures. |
