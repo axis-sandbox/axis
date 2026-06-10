@@ -34,6 +34,7 @@ pub enum BackendStability {
 pub enum PolicySurface {
     Filesystem,
     Process,
+    Container,
     Network,
     Resources,
     Credentials,
@@ -390,6 +391,24 @@ pub fn plan_backend_policy(
     options: &PlannerOptions,
 ) -> BackendPolicyPlan {
     let requirements = requirements_for_policy(policy, backend);
+    plan_backend_requirements(
+        backend.name.clone(),
+        backend.platform,
+        backend.stability,
+        requirements,
+        runtime,
+        options,
+    )
+}
+
+pub fn plan_backend_requirements(
+    backend_name: impl Into<String>,
+    platform: BackendPlatform,
+    stability: BackendStability,
+    requirements: Vec<CapabilityRequirement>,
+    runtime: &RuntimeProbeSnapshot,
+    options: &PlannerOptions,
+) -> BackendPolicyPlan {
     let mut decisions = Vec::with_capacity(requirements.len());
     let mut dependency_decisions = Vec::new();
     let mut weaker_reasons = Vec::new();
@@ -454,9 +473,9 @@ pub fn plan_backend_policy(
     };
 
     BackendPolicyPlan {
-        backend_name: backend.name.clone(),
-        platform: backend.platform,
-        stability: backend.stability,
+        backend_name: backend_name.into(),
+        platform,
+        stability,
         outcome,
         decisions,
     }

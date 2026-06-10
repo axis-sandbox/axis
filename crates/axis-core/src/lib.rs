@@ -8,6 +8,7 @@ pub mod bench;
 pub mod capability;
 pub mod capability_map;
 pub mod connect_attribution;
+pub mod container_backend;
 pub mod opa;
 pub mod policy;
 pub mod process_backend;

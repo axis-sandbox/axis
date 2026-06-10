@@ -218,6 +218,11 @@ facade catalogs AXIS-native and MXC process backends, records the config format
 each adapter must generate, and returns only planner-approved launch plans to
 platform code.
 
+Container-style backend selection lives in `axis_core::container_backend`.
+That facade keeps rootfs/image source, storage, bind mounts, and destroy-on-exit
+requirements visible to the planner before an adapter emits MXC LXC or WSLC
+configuration.
+
 ## Platform Coverage
 
 Each platform needs the same planning artifacts: capability map, dependency

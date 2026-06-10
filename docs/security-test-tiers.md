@@ -38,12 +38,13 @@ The harness currently runs:
 
 - `cargo test -p axis-core capability`
 - `cargo test -p axis-core process_backend`
+- `cargo test -p axis-core container_backend`
 - `cargo test -p axis-sandbox mxc -- --skip gated_`
 
-This covers the shared capability planner, process backend planning, and the
-MXC fake executor/dry-run paths by default. The MXC command intentionally skips
-tests named with the `gated_` prefix so real-runtime and privileged proofs do
-not become hidden host-specific requirements.
+This covers the shared capability planner, process backend planning, container
+backend planning, and the MXC fake executor/dry-run paths by default. The MXC
+command intentionally skips tests named with the `gated_` prefix so real-runtime
+and privileged proofs do not become hidden host-specific requirements.
 
 CI must run this harness as part of ordinary code testing. Full `cargo test`
 may also run, but this harness is the explicit signal that no-dependency
