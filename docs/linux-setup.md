@@ -4,6 +4,9 @@ This page describes the Linux behavior shipped by the current source tree.
 It is a platform mapping for the shared
 [AXIS Isolation Contract](axis-isolation-contract.md). Linux sandboxing is
 direct process execution, not Docker or a VM.
+The cross-platform install, optional dependency, and package boundary is
+documented in
+[Install And Runtime Dependencies](install-and-runtime-dependencies.md).
 
 ## Quickstart
 

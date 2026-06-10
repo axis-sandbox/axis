@@ -64,6 +64,9 @@ exercise the real MXC runtime also need an `lxc-exec` binary built from the
 pinned MXC revision and placed on `PATH` from a safe, non-writable executable
 directory.
 
+For the cross-platform dependency and package boundary, see
+[Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md).
+
 ## Quick Start
 
 ```bash
@@ -92,7 +95,9 @@ cgroups v2 or a documented fallback. `network.mode: proxy` additionally needs
 native `CAP_NET_ADMIN` support or the optional AXIS netns helper. Missing
 capabilities are fatal for the requested policy rather than silently weakening
 the sandbox. See [Linux Setup](docs/linux-setup.md) for the mode matrix and
-test commands.
+test commands, and
+[Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md)
+for optional backend dependencies.
 
 ## Platform Details
 
