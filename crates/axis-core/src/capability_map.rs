@@ -1234,11 +1234,15 @@ fn vm_backend<const N: usize>(
             l7_policy: CapabilitySupport::AxisOwned,
         },
         resources: ResourceCapabilities {
-            process_count: CapabilitySupport::weaker(
-                "VM process limits are guest-scoped and not mapped to AXIS process-tree limits",
+            process_count: CapabilitySupport::unsupported(
+                "VM process limits are not mapped to exact AXIS per-sandbox process-tree limits",
             ),
-            memory: vm.clone(),
-            cpu: vm.clone(),
+            memory: CapabilitySupport::unsupported(
+                "VM memory limits are not carried in the AXIS VM execution spec yet",
+            ),
+            cpu: CapabilitySupport::unsupported(
+                "VM CPU limits are not carried in the AXIS VM execution spec yet",
+            ),
             timeout: CapabilitySupport::AxisOwned,
         },
         credentials: axis_credentials(),
@@ -1246,7 +1250,9 @@ fn vm_backend<const N: usize>(
         lifecycle: stateful_lifecycle(),
         cleanup: CleanupCapabilities {
             process_tree: CapabilitySupport::AxisOwned,
-            resources: vm.clone(),
+            resources: CapabilitySupport::unsupported(
+                "VM resource cleanup is not mapped for per-sandbox AXIS resource limits",
+            ),
             temp_state: CapabilitySupport::AxisOwned,
             backend_state: vm,
         },
@@ -1327,11 +1333,15 @@ fn windows_vm_like_backend<const N: usize>(
             l7_policy: CapabilitySupport::AxisOwned,
         },
         resources: ResourceCapabilities {
-            process_count: CapabilitySupport::weaker(
-                "process limits are guest-scoped and not mapped to AXIS process-tree limits",
+            process_count: CapabilitySupport::unsupported(
+                "Windows VM-style process limits are not mapped to exact AXIS per-sandbox process-tree limits",
             ),
-            memory: vm.clone(),
-            cpu: vm.clone(),
+            memory: CapabilitySupport::unsupported(
+                "Windows VM-style memory limits are not carried in the AXIS VM execution spec yet",
+            ),
+            cpu: CapabilitySupport::unsupported(
+                "Windows VM-style CPU limits are not carried in the AXIS VM execution spec yet",
+            ),
             timeout: CapabilitySupport::AxisOwned,
         },
         credentials: axis_credentials(),
@@ -1339,7 +1349,9 @@ fn windows_vm_like_backend<const N: usize>(
         lifecycle: stateful_lifecycle(),
         cleanup: CleanupCapabilities {
             process_tree: CapabilitySupport::AxisOwned,
-            resources: vm.clone(),
+            resources: CapabilitySupport::unsupported(
+                "Windows VM-style resource cleanup is not mapped for per-sandbox AXIS resource limits",
+            ),
             temp_state: CapabilitySupport::AxisOwned,
             backend_state: vm,
         },

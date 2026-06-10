@@ -1236,6 +1236,44 @@ mod tests {
     }
 
     #[test]
+    fn vm_resource_limits_are_rejected_before_execution_spec() {
+        for descriptor in vm_backend_descriptors() {
+            let mut policy = policy_for_backend(descriptor.id);
+            policy.process.max_processes = 16;
+            policy.process.max_memory_mb = 1024;
+            policy.process.cpu_rate_percent = 50;
+
+            let err = build_vm_backend_execution_spec(
+                &policy,
+                descriptor.id,
+                launch_for_backend(descriptor.id),
+                &present_runtime_for_backend(descriptor.id),
+                &PlannerOptions::new(),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, VmBackendSpecError::RejectedBeforeConfig(_)),
+                "{} should reject VM resource limits before execution spec generation: {err}",
+                descriptor.id.as_str()
+            );
+            let message = err.to_string();
+            for requirement in [
+                "resources.process_count",
+                "resources.memory",
+                "resources.cpu",
+                "cleanup.resources",
+            ] {
+                assert!(
+                    message.contains(requirement),
+                    "{} error should mention {requirement}: {message}",
+                    descriptor.id.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn non_vm_backend_is_not_plannable_through_vm_facade() {
         assert!(
             plan_vm_backend_policy(
