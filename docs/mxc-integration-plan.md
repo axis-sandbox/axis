@@ -209,6 +209,10 @@ policy/backend pair:
 | `WeakerOnly` | The backend offers a weaker behavior that must be selected explicitly by policy. |
 | `Unsupported` | The policy/backend pair is rejected before spawn. |
 
+The repository-owned backend map lives in `axis_core::capability_map`. Platform
+adapters should consume those maps rather than inferring security properties
+from backend names, executable names, or host-specific probes alone.
+
 ## Platform Coverage
 
 Each platform needs the same planning artifacts: capability map, dependency

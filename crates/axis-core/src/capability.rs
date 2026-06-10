@@ -200,11 +200,22 @@ impl CapabilitySupport {
 pub enum DependencyState {
     Present,
     Missing,
+    Malformed,
+    PermissionDenied,
 }
 
 impl DependencyState {
     fn is_present(self) -> bool {
         matches!(self, Self::Present)
+    }
+
+    fn failure_label(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::Malformed => "malformed",
+            Self::PermissionDenied => "permission-denied",
+        }
     }
 }
 
@@ -285,6 +296,7 @@ pub struct DependencyDecision {
     pub requirement: &'static str,
     pub dependency: String,
     pub present: bool,
+    pub state: DependencyState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,10 +343,19 @@ impl BackendPolicyPlan {
                     .iter()
                     .filter(|dependency| !dependency.present)
                     .map(|dependency| {
-                        format!(
-                            "{} requires missing host dependency '{}'",
-                            dependency.requirement, dependency.dependency
-                        )
+                        if matches!(dependency.state, DependencyState::Missing) {
+                            format!(
+                                "{} requires missing host dependency '{}'",
+                                dependency.requirement, dependency.dependency
+                            )
+                        } else {
+                            format!(
+                                "{} requires host dependency '{}' but probe reported {}",
+                                dependency.requirement,
+                                dependency.dependency,
+                                dependency.state.failure_label()
+                            )
+                        }
                     })
                     .collect::<Vec<_>>();
                 if missing.is_empty() {
@@ -378,11 +399,13 @@ pub fn plan_backend_policy(
             CapabilitySupport::Exact | CapabilitySupport::AxisOwned => {}
             CapabilitySupport::ExactWithHostDependency { dependencies } => {
                 for dependency in dependencies {
+                    let state = runtime.dependency_state(dependency);
                     dependency_decisions.push(DependencyDecision {
                         surface: requirement.surface,
                         requirement: requirement.name,
                         dependency: dependency.clone(),
-                        present: runtime.dependency_state(dependency).is_present(),
+                        present: state.is_present(),
+                        state,
                     });
                 }
             }
