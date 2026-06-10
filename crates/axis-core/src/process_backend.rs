@@ -955,6 +955,24 @@ mod tests {
                 .unwrap()
                 .contains("process.user_identity")
         );
+
+        let windows_runtime =
+            present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
+        let windows = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            &windows_runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(!windows.spawn_allowed());
+        assert!(
+            windows
+                .pre_spawn_error()
+                .unwrap()
+                .contains("process.user_identity")
+        );
     }
 
     #[test]
