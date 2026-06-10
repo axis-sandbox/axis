@@ -955,6 +955,52 @@ mod tests {
     }
 
     #[test]
+    fn container_identity_is_planned_or_rejected_by_backend() {
+        let mut policy = policy(NetworkMode::Allow);
+        policy.process.run_as_user = Some("agent".into());
+
+        let lxc_runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+            .with_dependency(host_dependency::LINUX_LXC, DependencyState::Present)
+            .with_dependency(host_dependency::LINUX_CGROUP_V2, DependencyState::Present);
+        let lxc = plan_container_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxLxc,
+            &lxc_launch(),
+            &lxc_runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(lxc.spawn_allowed(), "{:?}", lxc.pre_spawn_error());
+        assert!(
+            lxc.policy_plan
+                .decisions
+                .iter()
+                .any(|decision| decision.requirement == "process.user_identity")
+        );
+
+        let wslc_runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+            .with_dependency(host_dependency::WINDOWS_WSL2, DependencyState::Present);
+        let wslc = plan_container_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcWindowsWslc,
+            &wslc_launch(),
+            &wslc_runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(!wslc.spawn_allowed());
+        assert!(
+            wslc.pre_spawn_error()
+                .unwrap()
+                .contains("process.user_identity")
+        );
+    }
+
+    #[test]
     fn wslc_proxy_remains_rejected_when_bypass_evidence_is_unmapped() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
