@@ -35,10 +35,10 @@ cargo run -p axis-bench --bin success-metrics
 
 | Backend | Class | Status | Benchmark gate |
 | --- | --- | --- | --- |
-| `mxc-linux-bubblewrap` | Process | Candidate | `AXIS_RUN_MXC_PROCESS_E2E=1` |
+| `mxc-linux-bubblewrap` | Process | Candidate | `AXIS_BENCH_MXC_BUBBLEWRAP=1` |
 | `mxc-macos-seatbelt` | Process | Candidate | `AXIS_RUN_MXC_PROCESS_E2E=1` |
 | `mxc-windows-processcontainer` | Process | Candidate | `AXIS_RUN_MXC_PROCESS_E2E=1` |
-| `mxc-linux-lxc` | Container | Candidate | `AXIS_RUN_MXC_LXC_E2E=1` |
+| `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |
 | `mxc-windows-wslc` | Container | Candidate | `AXIS_RUN_MXC_WSLC_E2E=1` |
 | `mxc-linux-microvm` | VM | Experimental opt-in | `AXIS_BENCH_MXC_MICROVM=1` |
 | `mxc-linux-hyperlight` | VM | Experimental opt-in | `AXIS_BENCH_MXC_HYPERLIGHT=1` |

@@ -138,7 +138,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC Bubblewrap is a process-backend candidate, but it cannot become the default until AXIS strict proxy, seccomp, resource, cleanup, and filesystem semantics are proven with matching benchmark evidence.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_RUN_MXC_PROCESS_E2E=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_BUBBLEWRAP=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcLinuxLxc,
@@ -148,7 +148,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC LXC is evaluated as a container backend, not a lightweight process default, because it carries image/runtime dependency cost and different lifecycle semantics.",
         required_benchmark_metrics: CONTAINER_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_RUN_MXC_LXC_E2E=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_LXC=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcLinuxMicrovm,

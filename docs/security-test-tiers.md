@@ -94,6 +94,8 @@ visible skip into a failure.
 | `AXIS_RUN_MXC_WSLC_E2E=1` | 3 | Run Windows MXC WSLC smoke tests when a safe MXC executor, WSL2, and configured distribution inputs are present. |
 | `AXIS_RUN_MXC_MICROVM_E2E=1` | 3 | Run Linux MXC MicroVM smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
 | `AXIS_RUN_MXC_HYPERLIGHT_E2E=1` | 3 | Run Linux MXC Hyperlight smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
+| `AXIS_BENCH_MXC_BUBBLEWRAP=1` | 3 | Run Linux MXC Bubblewrap lifecycle, memory, and density benchmarks when executor, `bwrap`, unprivileged user namespaces, `/usr/bin/time`, and `python3` are present. |
+| `AXIS_BENCH_MXC_LXC=1` | 3 | Run Linux MXC LXC lifecycle, memory, and density benchmarks when executor, LXC runtime/image inputs, `/usr/bin/time`, and `python3` are present. |
 | `AXIS_BENCH_MXC_MICROVM=1` | 3 | Run Linux MXC MicroVM cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_HYPERLIGHT=1` | 3 | Run Linux MXC Hyperlight cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_WINDOWS_VM=1` | 3 | Run Windows MXC VM-style cold/warm, memory, and density benchmarks when a safe MXC executor, required Windows VM feature, and runtime artifacts are present. |
