@@ -23,9 +23,9 @@ filesystem:
     - "~/.aws"
 
 process:
-  max_processes: 32
+  max_processes: 0
   max_memory_mb: 4096
-  cpu_rate_percent: 50
+  cpu_rate_percent: 0
   timeout_sec: 300
 
 network:

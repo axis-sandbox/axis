@@ -25,9 +25,9 @@ filesystem:
     - "~/.docker"
 
 process:
-  max_processes: 64
+  max_processes: 0
   max_memory_mb: 8192
-  cpu_rate_percent: 80
+  cpu_rate_percent: 0
   timeout_sec: 600
   blocked_syscalls:
     - fork

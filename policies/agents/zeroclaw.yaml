@@ -26,9 +26,9 @@ filesystem:
     - "~/.config"
 
 process:
-  max_processes: 16
+  max_processes: 0
   max_memory_mb: 2048
-  cpu_rate_percent: 50
+  cpu_rate_percent: 0
   timeout_sec: 120
 
 network:

@@ -1397,6 +1397,28 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_absence_allows_memory_only_rlimit_fallback_without_run_as_user() {
+        let mut caps = full_caps();
+        caps.cgroup_v2 = CgroupV2Support::Unavailable;
+
+        let mut policy = policy(NetworkMode::Allow);
+        policy.process.max_processes = 0;
+        policy.process.cpu_rate_percent = 0;
+
+        let plan = plan(&policy, caps, 0);
+
+        assert_eq!(
+            plan.resources,
+            ResourceStrategy::RlimitFallback {
+                memory_limit: true,
+                process_limit: ProcessLimitFallback::NotRequested,
+                cpu_limit: CpuLimitFallback::NotRequested,
+            }
+        );
+        assert!(plan.fallbacks.iter().any(|f| f.area == "resources"));
+    }
+
+    #[test]
     fn rlimit_process_fallback_uses_dedicated_user_when_configured() {
         let mut caps = full_caps();
         caps.cgroup_v2 = CgroupV2Support::Unavailable;

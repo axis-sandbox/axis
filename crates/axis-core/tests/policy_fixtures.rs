@@ -106,6 +106,7 @@ fn bundled_agent_policy_fixtures_parse_and_cover_expected_targets() {
 
         assert_network_mode(&policy, fixture.mode, fixture.target);
         assert_agent_secret_stores_denied(&policy, fixture.target);
+        assert_agent_policy_avoids_cgroup_only_limits(&policy, fixture.target);
 
         let actual_hosts = endpoint_hosts(&policy);
         for expected_host in fixture.hosts {
@@ -263,6 +264,21 @@ fn assert_agent_secret_stores_denied(policy: &Policy, target: &str) {
             "{target} fixture must deny {denied_path}"
         );
     }
+}
+
+fn assert_agent_policy_avoids_cgroup_only_limits(policy: &Policy, target: &str) {
+    assert_eq!(
+        policy.process.max_processes, 0,
+        "{target} fixture must not require writable cgroups v2 for process-count limits"
+    );
+    assert_eq!(
+        policy.process.cpu_rate_percent, 0,
+        "{target} fixture must not require writable cgroups v2 for CPU quota"
+    );
+    assert!(
+        policy.process.max_memory_mb > 0,
+        "{target} fixture should keep a memory limit because memory has a no-admin rlimit fallback"
+    );
 }
 
 fn endpoint_hosts(policy: &Policy) -> BTreeSet<&str> {
