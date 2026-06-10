@@ -485,6 +485,26 @@ impl MxcLinuxSandbox {
         )
     }
 
+    #[cfg(test)]
+    fn new_lxc_container_with_executor(
+        config: &SandboxConfig,
+        launch: ContainerLaunchOptions,
+        runtime: RuntimeProbeSnapshot,
+        executor: MxcExecutor,
+        seccomp_launcher: MxcSeccompLauncher,
+    ) -> Result<Self, SandboxError> {
+        Self::new_with_spec_builder(
+            config,
+            || Ok(executor),
+            || Ok(seccomp_launcher),
+            || Ok(no_proxy_network_strategy()),
+            || Ok(no_resource_limits_strategy()),
+            move |config, _network_translation| {
+                MxcExecutionSpec::from_lxc_container_config(config, &launch, &runtime)
+            },
+        )
+    }
+
     fn new_with_resolvers<F, G, H, I>(
         config: &SandboxConfig,
         resolve_executor: F,
@@ -503,6 +523,42 @@ impl MxcLinuxSandbox {
             SandboxError,
         >,
         I: FnOnce() -> Result<super::strategy::ResourceStrategy, SandboxError>,
+    {
+        Self::new_with_spec_builder(
+            config,
+            resolve_executor,
+            resolve_seccomp_launcher,
+            resolve_network,
+            resolve_resources,
+            |config, network_translation| {
+                MxcExecutionSpec::from_sandbox_config_with_network_mode(config, network_translation)
+            },
+        )
+    }
+
+    fn new_with_spec_builder<F, G, H, I, J>(
+        config: &SandboxConfig,
+        resolve_executor: F,
+        resolve_seccomp_launcher: G,
+        resolve_network: H,
+        resolve_resources: I,
+        build_spec: J,
+    ) -> Result<Self, SandboxError>
+    where
+        F: FnOnce() -> Result<MxcExecutor, SandboxError>,
+        G: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
+        H: FnOnce() -> Result<
+            (
+                super::strategy::NetworkStrategy,
+                super::strategy::ProxyStrategy,
+            ),
+            SandboxError,
+        >,
+        I: FnOnce() -> Result<super::strategy::ResourceStrategy, SandboxError>,
+        J: FnOnce(
+            &SandboxConfig,
+            MxcNetworkTranslationMode,
+        ) -> Result<MxcExecutionSpec, MxcTranslationError>,
     {
         let resolved_identity = resolve_mxc_identity(&config.policy.process)?;
         let (network_strategy, proxy_strategy) = resolve_network()?;
@@ -533,18 +589,14 @@ impl MxcLinuxSandbox {
         }
 
         let network_translation = mxc_network_translation_mode(&network_strategy);
-        let spec =
-            MxcExecutionSpec::from_sandbox_config_with_network_mode(config, network_translation)
-                .map_err(|err| {
-                    let cleanup_error =
-                        cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-                    append_cleanup_failure(
-                        SandboxError::IsolationFailed(format!(
-                            "MXC Linux backend unsupported: {err}"
-                        )),
-                        cleanup_error,
-                    )
-                })?;
+        let spec = build_spec(config, network_translation).map_err(|err| {
+            let cleanup_error =
+                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+            append_cleanup_failure(
+                SandboxError::IsolationFailed(format!("MXC Linux backend unsupported: {err}")),
+                cleanup_error,
+            )
+        })?;
         let mut spec = spec;
         apply_proxy_env_to_spec(&mut spec, &proxy_strategy);
         let seccomp_filter_file =
@@ -5506,6 +5558,221 @@ mod tests {
         assert!(
             !filter_path.exists(),
             "start failure should remove private seccomp filter"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lxc_runtime_captures_output_exit_code_and_removes_private_config() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let config_path_record = root.path().join("lxc-config-path");
+        let config_copy = root.path().join("lxc-config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 printf '%s\\n' \"$config\" > {}\n\
+                 cat \"$config\" > {}\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 if IFS= read -r _line; then\n\
+                   echo stdin was not closed >&2\n\
+                   exit 8\n\
+                 fi\n\
+                 echo lxc-stdout\n\
+                 echo lxc-stderr >&2\n\
+                 exit 7\n",
+                shell_quote_path(&config_path_record),
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            lxc_representable_policy(NetworkMode::Block),
+            workspace.path().into(),
+        );
+        config.capture_output = true;
+        let launch = lxc_launch_for_workspace(workspace.path());
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_lxc_container_with_executor(
+            &config,
+            launch,
+            lxc_runtime(),
+            executor,
+            launcher,
+        )
+        .unwrap();
+
+        assert_eq!(sandbox.spec.containment, MXC_LXC_CONTAINMENT);
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 7);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("stdout.log")).unwrap(),
+            "lxc-stdout\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("stderr.log")).unwrap(),
+            "lxc-stderr\n"
+        );
+        let config_path = fs::read_to_string(config_path_record).unwrap();
+        assert!(
+            config_path.trim().starts_with("/proc/self/fd/"),
+            "runtime LXC config should be passed by inherited fd, got {config_path:?}"
+        );
+        assert!(sandbox.config_file.is_none());
+        assert!(sandbox.seccomp_filter_file.is_none());
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        assert_eq!(parsed["containment"], "lxc");
+        assert_eq!(parsed["lxc"]["distribution"], "alpine");
+        assert_eq!(parsed["lxc"]["release"], "3.23");
+        assert_eq!(parsed["lifecycle"]["destroyOnExit"], true);
+        assert!(!config_json.contains("ANTHROPIC_API_KEY"));
+        assert!(!config_json.contains("proxy-with-creds"));
+        assert!(!config_json.contains("secret"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lxc_runtime_timeout_kills_executor_process_group_and_cleans_tmpdir() {
+        let root = secure_tempdir();
+        let descendant_pid = root.path().join("lxc-descendant.pid");
+        let executor = fake_mxc_runtime_executor(
+            &root,
+            &format!(
+                "sleep 30 &\n\
+                 echo $! > {}\n\
+                 wait",
+                shell_quote_path(&descendant_pid)
+            ),
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = lxc_representable_policy(NetworkMode::Block);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let mut config = config(policy, workspace.path().into());
+        config.timeout_sec = Some(1);
+        let launch = lxc_launch_for_workspace(workspace.path());
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_lxc_container_with_executor(
+            &config,
+            launch,
+            lxc_runtime(),
+            executor,
+            launcher,
+        )
+        .unwrap();
+
+        assert!(tmpdir.exists(), "MXC LXC setup should create AXIS tmpdir");
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, -1);
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_process_stopped(pid);
+        assert!(!tmpdir.exists(), "MXC LXC wait should clean AXIS tmpdir");
+    }
+
+    #[test]
+    fn lxc_runtime_start_failure_cleans_tmpdir_and_private_seccomp_filter() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\necho '{}'\n", MXC_DRY_RUN_SUCCESS),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = lxc_representable_policy(NetworkMode::Block);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let config = config(policy, workspace.path().into());
+        let launch = lxc_launch_for_workspace(workspace.path());
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_lxc_container_with_executor(
+            &config,
+            launch,
+            lxc_runtime(),
+            executor,
+            launcher,
+        )
+        .unwrap();
+        let filter_path = sandbox
+            .seccomp_filter_file
+            .as_ref()
+            .map(|file| file.path().to_path_buf())
+            .expect("MXC LXC setup should create private seccomp filter");
+
+        assert!(tmpdir.exists(), "MXC LXC setup should create AXIS tmpdir");
+        assert!(
+            filter_path.exists(),
+            "private seccomp filter should exist before LXC start"
+        );
+        std::fs::remove_file(&executable).unwrap();
+
+        let err = SandboxImpl::start(&mut sandbox).unwrap_err();
+
+        assert!(matches!(err, SandboxError::SpawnFailed(_)));
+        assert!(!tmpdir.exists(), "start failure should clean AXIS tmpdir");
+        assert!(
+            !filter_path.exists(),
+            "start failure should remove private seccomp filter"
+        );
+    }
+
+    #[test]
+    fn lxc_runtime_destroy_is_idempotent_and_cleans_tmpdir() {
+        let root = secure_tempdir();
+        let executor = fake_mxc_runtime_executor(&root, "sleep 30");
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = lxc_representable_policy(NetworkMode::Block);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let config = config(policy, workspace.path().into());
+        let launch = lxc_launch_for_workspace(workspace.path());
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_lxc_container_with_executor(
+            &config,
+            launch,
+            lxc_runtime(),
+            executor,
+            launcher,
+        )
+        .unwrap();
+
+        assert!(tmpdir.exists(), "MXC LXC setup should create AXIS tmpdir");
+        SandboxImpl::start(&mut sandbox).unwrap();
+        SandboxImpl::destroy(&mut sandbox).unwrap();
+        assert!(!tmpdir.exists(), "destroy should clean AXIS tmpdir");
+        assert!(sandbox.child.is_none());
+        assert!(sandbox.config_file.is_none());
+        assert!(sandbox.seccomp_filter_file.is_none());
+
+        SandboxImpl::destroy(&mut sandbox).unwrap();
+        assert!(
+            !tmpdir.exists(),
+            "repeated destroy should leave tmpdir clean"
         );
     }
 
