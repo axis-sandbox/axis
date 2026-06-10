@@ -20,10 +20,13 @@ use axis_core::container_backend::{
 };
 use axis_core::mxc_config as shared_mxc;
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
-use axis_core::process_backend::plan_process_backend_policy;
+use axis_core::process_backend::{
+    ProcessBackendFilesystemSpec, ProcessLaunchOptions, build_process_backend_execution_spec,
+    plan_process_backend_policy,
+};
 use axis_core::types::SandboxId;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -37,7 +40,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const MXC_SCHEMA_VERSION: &str = "0.6.0-alpha";
 const MXC_LINUX_PLATFORM: &str = "linux";
 const MXC_BUBBLEWRAP_CONTAINMENT: &str = "bubblewrap";
 const MXC_LXC_CONTAINMENT: &str = "lxc";
@@ -67,6 +69,9 @@ pub enum MxcTranslationError {
 
     #[error("container launch cannot be represented by MXC LXC: {0}")]
     Container(String),
+
+    #[error("process launch cannot be represented by MXC Bubblewrap: {0}")]
+    Process(String),
 
     #[error(
         "MXC Bubblewrap filesystem isolation cannot preserve AXIS default-deny semantics: current MXC Bubblewrap mounts the host root read-only"
@@ -1861,20 +1866,34 @@ fn translate_sandbox_config_with_metadata(
     network_mode: MxcNetworkTranslationMode,
 ) -> Result<MxcTranslatedConfig, MxcTranslationError> {
     let process = translate_process(config)?;
-    let network = translate_network(&config.policy, network_mode)?;
+    translate_network(&config.policy, network_mode)?;
     let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
+    let mut spec = build_process_backend_execution_spec(
+        &config.policy,
+        BackendCapabilityMapId::MxcLinuxBubblewrap,
+        process_launch_options_from_translated(config, &process)?,
+        &mxc_process_config_runtime_snapshot(network_mode),
+        &PlannerOptions::new(),
+    )
+    .map_err(process_spec_error)?;
+    spec.filesystem = process_filesystem_spec_from_mxc(&filesystem.filesystem);
+    spec.timeout_ms = process.timeout.map(u64::from);
+
+    let wire = shared_mxc::build_mxc_process_config(
+        process.command_line.clone(),
+        &spec,
+        shared_mxc::MxcProcessConfigOptions {
+            strict_proxy_enforced_by_axis: network_mode
+                == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis,
+            ..Default::default()
+        },
+    )
+    .map_err(|err| MxcTranslationError::Process(err.to_string()))?;
+    let mut translated_spec = mxc_execution_spec_from_process_wire(wire)?;
+    translated_spec.process.env = process.env;
 
     Ok(MxcTranslatedConfig {
-        spec: MxcExecutionSpec {
-            version: MXC_SCHEMA_VERSION.into(),
-            platform: MXC_LINUX_PLATFORM.into(),
-            containment: MXC_BUBBLEWRAP_CONTAINMENT.into(),
-            process,
-            filesystem: filesystem.filesystem,
-            network,
-            lifecycle: None,
-            lxc: None,
-        },
+        spec: translated_spec,
         root_read_substrate_acknowledged: filesystem.root_read_substrate_acknowledged,
     })
 }
@@ -1928,10 +1947,26 @@ fn lxc_spec_error(
     ))
 }
 
+fn process_spec_error(
+    error: axis_core::process_backend::ProcessBackendSpecError,
+) -> MxcTranslationError {
+    MxcTranslationError::Process(format!(
+        "process backend plan rejected launch before spawn: {error}"
+    ))
+}
+
 fn container_filesystem_spec_from_mxc(
     filesystem: &MxcFilesystem,
 ) -> ContainerBackendFilesystemSpec {
     ContainerBackendFilesystemSpec {
+        read_only: filesystem.readonly_paths.clone(),
+        read_write: filesystem.readwrite_paths.clone(),
+        deny: filesystem.denied_paths.clone(),
+    }
+}
+
+fn process_filesystem_spec_from_mxc(filesystem: &MxcFilesystem) -> ProcessBackendFilesystemSpec {
+    ProcessBackendFilesystemSpec {
         read_only: filesystem.readonly_paths.clone(),
         read_write: filesystem.readwrite_paths.clone(),
         deny: filesystem.denied_paths.clone(),
@@ -1945,6 +1980,110 @@ fn mxc_process_config_from_translated(process: &MxcProcess) -> shared_mxc::MxcPr
         env: process.env.clone(),
         timeout: process.timeout,
     }
+}
+
+fn process_launch_options_from_translated(
+    config: &SandboxConfig,
+    process: &MxcProcess,
+) -> Result<ProcessLaunchOptions, MxcTranslationError> {
+    Ok(ProcessLaunchOptions {
+        command: config.command.clone(),
+        args: config.args.clone(),
+        working_dir: Some(process.cwd.clone()),
+        environment: process_environment_from_mxc(&process.env)?,
+        capture_output: config.capture_output,
+        timeout_sec: config.timeout_sec,
+    })
+}
+
+fn process_environment_from_mxc(
+    env: &[String],
+) -> Result<BTreeMap<String, String>, MxcTranslationError> {
+    let mut environment = BTreeMap::new();
+    for entry in env {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(MxcTranslationError::InvalidEnv(entry.clone()));
+        };
+        if key.trim().is_empty() {
+            return Err(MxcTranslationError::InvalidEnv(key.into()));
+        }
+        environment.insert(key.into(), value.into());
+    }
+    Ok(environment)
+}
+
+fn mxc_process_config_runtime_snapshot(
+    network_mode: MxcNetworkTranslationMode,
+) -> RuntimeProbeSnapshot {
+    // Spawn-time capability planning uses the strategy-selected runtime
+    // snapshot. Config translation keeps this side-effect-free snapshot so
+    // serializer tests do not probe or mutate the host.
+    let mut runtime = RuntimeProbeSnapshot::new()
+        .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+        .with_dependency(host_dependency::LINUX_BUBBLEWRAP, DependencyState::Present)
+        .with_dependency(host_dependency::LINUX_USERNS, DependencyState::Present)
+        .with_dependency(
+            host_dependency::AXIS_SECCOMP_LAUNCHER,
+            DependencyState::Present,
+        )
+        .with_dependency(host_dependency::LINUX_CGROUP_V2, DependencyState::Present);
+
+    if network_mode == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis {
+        runtime = runtime
+            .with_dependency(host_dependency::LINUX_NETNS, DependencyState::Present)
+            .with_dependency(
+                host_dependency::LINUX_SECCOMP_NOTIFY,
+                DependencyState::Present,
+            )
+            .with_dependency(host_dependency::AXIS_NETNS_HELPER, DependencyState::Present);
+    }
+
+    runtime
+}
+
+fn mxc_execution_spec_from_process_wire(
+    wire: shared_mxc::MxcProcessWireConfig,
+) -> Result<MxcExecutionSpec, MxcTranslationError> {
+    if wire.platform != shared_mxc::MxcPlatform::Linux
+        || wire.containment != shared_mxc::MxcContainment::Bubblewrap
+    {
+        return Err(MxcTranslationError::Process(
+            "Linux MXC adapter can only execute MXC Bubblewrap process wire configs".into(),
+        ));
+    }
+    if wire.process_container.is_some() || wire.fallback.is_some() || wire.experimental.is_some() {
+        return Err(MxcTranslationError::Process(
+            "MXC Bubblewrap process wire config contains foreign backend sections".into(),
+        ));
+    }
+
+    Ok(MxcExecutionSpec {
+        version: wire.version,
+        platform: MXC_LINUX_PLATFORM.into(),
+        containment: MXC_BUBBLEWRAP_CONTAINMENT.into(),
+        process: MxcProcess {
+            command_line: wire.process.command_line,
+            cwd: wire.process.cwd.unwrap_or_default(),
+            env: wire.process.env,
+            timeout: wire.process.timeout,
+        },
+        filesystem: MxcFilesystem {
+            readwrite_paths: wire.filesystem.readwrite_paths,
+            readonly_paths: wire.filesystem.readonly_paths,
+            denied_paths: wire.filesystem.denied_paths,
+        },
+        network: MxcNetwork {
+            default_policy: match wire.network.default_policy {
+                shared_mxc::MxcNetworkDefaultPolicy::Allow => MxcNetworkDefaultPolicy::Allow,
+                shared_mxc::MxcNetworkDefaultPolicy::Block => MxcNetworkDefaultPolicy::Block,
+            },
+        },
+        lifecycle: Some(MxcLifecycle {
+            destroy_on_exit: wire.lifecycle.destroy_on_exit,
+            preserve_policy: wire.lifecycle.preserve_policy,
+        }),
+        lxc: None,
+    })
 }
 
 fn mxc_execution_spec_from_container_wire(
@@ -3063,7 +3202,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(spec.version, MXC_SCHEMA_VERSION);
+        assert_eq!(spec.version, shared_mxc::MXC_CONFIG_VERSION);
         assert_eq!(spec.platform, MXC_LINUX_PLATFORM);
         assert_eq!(spec.containment, MXC_BUBBLEWRAP_CONTAINMENT);
         assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
@@ -3167,7 +3306,7 @@ mod tests {
         let spec =
             MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime()).unwrap();
 
-        assert_eq!(spec.version, MXC_SCHEMA_VERSION);
+        assert_eq!(spec.version, shared_mxc::MXC_CONFIG_VERSION);
         assert_eq!(spec.platform, MXC_LINUX_PLATFORM);
         assert_eq!(spec.containment, MXC_LXC_CONTAINMENT);
         assert_eq!(spec.process.cwd, "/workspace");
