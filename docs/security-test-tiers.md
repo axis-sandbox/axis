@@ -98,7 +98,13 @@ visible skip into a failure.
 | `AXIS_BENCH_MXC_LXC=1` | 3 | Run Linux MXC LXC lifecycle, memory, and density benchmarks when executor, LXC runtime/image inputs, `/usr/bin/time`, and `python3` are present. |
 | `AXIS_BENCH_MXC_MICROVM=1` | 3 | Run Linux MXC MicroVM cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
 | `AXIS_BENCH_MXC_HYPERLIGHT=1` | 3 | Run Linux MXC Hyperlight cold/warm, memory, and density benchmarks when executor, KVM, `/usr/bin/time`, and runtime artifacts are present. |
-| `AXIS_BENCH_MXC_WINDOWS_VM=1` | 3 | Run Windows MXC VM-style cold/warm, memory, and density benchmarks when a safe MXC executor, required Windows VM feature, and runtime artifacts are present. |
+| `AXIS_BENCH_MXC_MACOS_SEATBELT=1` | 3 | Run macOS MXC Seatbelt lifecycle, memory, and density benchmarks when a safe MXC executor, `/usr/bin/time`, and `python3` are present. |
+| `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` | 3 | Run Windows MXC ProcessContainer lifecycle, memory, and density benchmarks when a safe MXC executor and ProcessContainer prerequisites are present. |
+| `AXIS_BENCH_MXC_WINDOWS_WSLC=1` | 3 | Run Windows MXC WSLC lifecycle, memory, and density benchmarks when a safe MXC executor, WSL2, and repeatable image inputs such as `AXIS_MXC_WSLC_IMAGE_TAR_PATH` are present. |
+| `AXIS_BENCH_MXC_WINDOWS_SANDBOX=1` | 3 | Run Windows MXC Windows Sandbox cold/warm, memory, and density benchmarks when a safe MXC executor, Windows Sandbox, and runtime artifacts are present. |
+| `AXIS_BENCH_MXC_WINDOWS_ISOLATION_SESSION=1` | 3 | Run Windows MXC Isolation Session cold/warm, memory, and density benchmarks when a safe MXC executor, Isolation Session support, and runtime artifacts are present. |
+| `AXIS_BENCH_MXC_WINDOWS_MICROVM=1` | 3 | Run Windows MXC MicroVM cold/warm, memory, and density benchmarks when a safe MXC executor, WHP, and runtime artifacts are present. |
+| `AXIS_BENCH_MXC_WINDOWS_HYPERLIGHT=1` | 3 | Run Windows MXC Hyperlight cold/warm, memory, and density benchmarks when a safe MXC executor and runtime artifacts are present. |
 | `AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1` | 4 | Run tests against an installed privileged netns helper in a prepared runner. |
 | `AXIS_RUN_PRIVILEGED_E2E=1` | 4 | Run the disposable privileged helper e2e script. |
 | `AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E=1` | 4 | Treat missing built proxy prerequisites as failures. |

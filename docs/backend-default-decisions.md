@@ -36,16 +36,16 @@ cargo run -p axis-bench --bin success-metrics
 | Backend | Class | Status | Benchmark gate |
 | --- | --- | --- | --- |
 | `mxc-linux-bubblewrap` | Process | Candidate | `AXIS_BENCH_MXC_BUBBLEWRAP=1` |
-| `mxc-macos-seatbelt` | Process | Candidate | `AXIS_RUN_MXC_PROCESS_E2E=1` |
-| `mxc-windows-processcontainer` | Process | Candidate | `AXIS_RUN_MXC_PROCESS_E2E=1` |
+| `mxc-macos-seatbelt` | Process | Candidate | `AXIS_BENCH_MXC_MACOS_SEATBELT=1` |
+| `mxc-windows-processcontainer` | Process | Candidate | `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` |
 | `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |
-| `mxc-windows-wslc` | Container | Candidate | `AXIS_RUN_MXC_WSLC_E2E=1` |
+| `mxc-windows-wslc` | Container | Candidate | `AXIS_BENCH_MXC_WINDOWS_WSLC=1` |
 | `mxc-linux-microvm` | VM | Experimental opt-in | `AXIS_BENCH_MXC_MICROVM=1` |
 | `mxc-linux-hyperlight` | VM | Experimental opt-in | `AXIS_BENCH_MXC_HYPERLIGHT=1` |
-| `mxc-windows-isolation-session` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_VM=1` |
-| `mxc-windows-sandbox` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_VM=1` |
-| `mxc-windows-microvm` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_VM=1` |
-| `mxc-windows-hyperlight` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_VM=1` |
+| `mxc-windows-isolation-session` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_ISOLATION_SESSION=1` |
+| `mxc-windows-sandbox` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_SANDBOX=1` |
+| `mxc-windows-microvm` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_MICROVM=1` |
+| `mxc-windows-hyperlight` | VM | Experimental opt-in | `AXIS_BENCH_MXC_WINDOWS_HYPERLIGHT=1` |
 
 Container and VM backends are not process-default replacements by default. They
 may be better choices for specific high-risk or image-oriented workloads, but

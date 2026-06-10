@@ -188,7 +188,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC Seatbelt is a macOS process candidate and must prove equivalent profile generation, lifecycle, packaging, startup, and dependency cost before replacing the native default.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_RUN_MXC_PROCESS_E2E=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_MACOS_SEATBELT=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::AxisNativeWindows,
@@ -208,7 +208,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC ProcessContainer is the Windows process candidate and must prove equivalent resource, lifecycle, startup, and policy behavior before replacing the native default.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_RUN_MXC_PROCESS_E2E=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcWindowsIsolationSession,
@@ -218,7 +218,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC Isolation Session remains opt-in because VM-style provisioning has distinct dependency, lifecycle, and density costs from process backends.",
         required_benchmark_metrics: VM_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_VM=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_ISOLATION_SESSION=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcWindowsSandbox,
@@ -228,7 +228,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "Windows Sandbox remains opt-in for high-risk tasks until startup, density, filesystem mapping, and cleanup behavior are measured against process alternatives.",
         required_benchmark_metrics: VM_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_VM=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_SANDBOX=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcWindowsWslc,
@@ -238,7 +238,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC WSLC is evaluated as a container backend because WSL2 distribution lifecycle and VM-scoped resources differ from AXIS process-backend defaults.",
         required_benchmark_metrics: CONTAINER_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_RUN_MXC_WSLC_E2E=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_WSLC=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcWindowsMicrovm,
@@ -248,7 +248,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "Windows MicroVM remains experimental until WHP dependency cost, startup, memory, density, and policy limitations are proven.",
         required_benchmark_metrics: VM_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_VM=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_MICROVM=1"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcWindowsHyperlight,
@@ -258,7 +258,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "Windows Hyperlight remains experimental until runtime artifact handling, startup, density, and policy limitations are proven.",
         required_benchmark_metrics: VM_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_VM=1"),
+        benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_HYPERLIGHT=1"),
     },
 ];
 
@@ -354,6 +354,21 @@ mod tests {
             assert!(
                 record.benchmark_gate.is_some(),
                 "{} must name its benchmark gate or smoke command",
+                record.id.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn non_default_records_use_backend_specific_benchmark_gates() {
+        for record in backend_default_records()
+            .iter()
+            .filter(|record| record.status != BackendDefaultStatus::CurrentDefault)
+        {
+            let gate = record.benchmark_gate.unwrap();
+            assert!(
+                gate.starts_with("AXIS_BENCH_MXC_"),
+                "{} must use a backend-specific benchmark gate, got {gate}",
                 record.id.as_str()
             );
         }
