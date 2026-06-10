@@ -14,6 +14,10 @@ use axis_core::capability_map::{BackendCapabilityMapId, host_dependency};
 use axis_core::connect_attribution::{
     ConnectAttributionStore, policy_requires_connect_attribution,
 };
+use axis_core::container_backend::{
+    ContainerBindMount, ContainerLaunchOptions, ContainerMountAccess, ContainerRootfsSource,
+    plan_container_backend_policy,
+};
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
 use axis_core::process_backend::plan_process_backend_policy;
 use axis_core::types::SandboxId;
@@ -35,6 +39,7 @@ use thiserror::Error;
 const MXC_SCHEMA_VERSION: &str = "0.6.0-alpha";
 const MXC_LINUX_PLATFORM: &str = "linux";
 const MXC_BUBBLEWRAP_CONTAINMENT: &str = "bubblewrap";
+const MXC_LXC_CONTAINMENT: &str = "lxc";
 const MXC_EXECUTOR_NAME: &str = "lxc-exec";
 const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
 const AXIS_SECCOMP_LAUNCHER_NAME: &str = "axis-seccomp-launcher";
@@ -58,6 +63,9 @@ pub enum MxcTranslationError {
 
     #[error("filesystem policy cannot be represented by MXC: {0}")]
     Filesystem(String),
+
+    #[error("container launch cannot be represented by MXC LXC: {0}")]
+    Container(String),
 
     #[error(
         "MXC Bubblewrap filesystem isolation cannot preserve AXIS default-deny semantics: current MXC Bubblewrap mounts the host root read-only"
@@ -129,6 +137,10 @@ pub struct MxcExecutionSpec {
     pub process: MxcProcess,
     pub filesystem: MxcFilesystem,
     pub network: MxcNetwork,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<MxcLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lxc: Option<MxcLxcConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1793,6 +1805,14 @@ impl MxcExecutionSpec {
         Self::from_sandbox_config_with_network_mode(config, MxcNetworkTranslationMode::Standalone)
     }
 
+    pub fn from_lxc_container_config(
+        config: &SandboxConfig,
+        launch: &ContainerLaunchOptions,
+        runtime: &RuntimeProbeSnapshot,
+    ) -> Result<Self, MxcTranslationError> {
+        translate_lxc_container_config(config, launch, runtime)
+    }
+
     fn from_sandbox_config_with_network_mode(
         config: &SandboxConfig,
         network_mode: MxcNetworkTranslationMode,
@@ -1851,9 +1871,174 @@ fn translate_sandbox_config_with_metadata(
             process,
             filesystem: filesystem.filesystem,
             network,
+            lifecycle: None,
+            lxc: None,
         },
         root_read_substrate_acknowledged: filesystem.root_read_substrate_acknowledged,
     })
+}
+
+fn translate_lxc_container_config(
+    config: &SandboxConfig,
+    launch: &ContainerLaunchOptions,
+    runtime: &RuntimeProbeSnapshot,
+) -> Result<MxcExecutionSpec, MxcTranslationError> {
+    let plan = plan_container_backend_policy(
+        &config.policy,
+        BackendCapabilityMapId::MxcLinuxLxc,
+        launch,
+        runtime,
+        &PlannerOptions::new(),
+    )
+    .ok_or_else(|| MxcTranslationError::Container("MXC LXC is not a container backend".into()))?;
+
+    if !plan.spawn_allowed() {
+        let reason = plan
+            .pre_spawn_error()
+            .unwrap_or_else(|| "container backend plan rejected launch".into());
+        return Err(MxcTranslationError::Container(format!(
+            "container backend plan rejected launch before spawn: {reason}"
+        )));
+    }
+
+    validate_lxc_launch_options(launch)?;
+
+    if matches!(config.policy.network.mode, NetworkMode::Proxy) {
+        return Err(MxcTranslationError::ProxyModeUnsupported(
+            "MXC LXC config generation cannot preserve AXIS strict proxy isolation until AXIS owns the LXC network namespace proxy path".into(),
+        ));
+    }
+
+    let mut process = translate_process(config)?;
+    if let Some(working_dir) = &launch.working_dir {
+        process.cwd = working_dir.clone();
+    }
+
+    validate_lxc_filesystem_policy(&config.policy.filesystem)?;
+    let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
+    validate_lxc_bind_mounts(launch, &filesystem.filesystem)?;
+    let network = translate_network(&config.policy, MxcNetworkTranslationMode::Standalone)?;
+    let (distribution, release) = lxc_distribution_release(launch)?;
+
+    Ok(MxcExecutionSpec {
+        version: MXC_SCHEMA_VERSION.into(),
+        platform: MXC_LINUX_PLATFORM.into(),
+        containment: MXC_LXC_CONTAINMENT.into(),
+        process,
+        filesystem: filesystem.filesystem,
+        network,
+        lifecycle: Some(MxcLifecycle {
+            destroy_on_exit: true,
+            preserve_policy: false,
+        }),
+        lxc: Some(MxcLxcConfig {
+            distribution: distribution.into(),
+            release: release.into(),
+        }),
+    })
+}
+
+fn validate_lxc_launch_options(launch: &ContainerLaunchOptions) -> Result<(), MxcTranslationError> {
+    lxc_distribution_release(launch)?;
+
+    if launch.storage_path.is_some() {
+        return Err(MxcTranslationError::Container(
+            "custom LXC storage paths are not mapped by AXIS".into(),
+        ));
+    }
+
+    if !launch.destroy_on_exit {
+        return Err(MxcTranslationError::Container(
+            "persistent LXC state is not mapped to AXIS lifecycle cleanup".into(),
+        ));
+    }
+
+    for mount in &launch.bind_mounts {
+        validate_lxc_bind_mount_shape(mount)?;
+    }
+
+    Ok(())
+}
+
+fn validate_lxc_filesystem_policy(policy: &FilesystemPolicy) -> Result<(), MxcTranslationError> {
+    if policy
+        .read_only
+        .iter()
+        .chain(policy.read_write.iter())
+        .any(|path| Path::new(path.trim()) == Path::new("/"))
+    {
+        return Err(MxcTranslationError::Container(
+            "MXC LXC uses a container rootfs; AXIS host root grants cannot be represented as LXC filesystem binds".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_lxc_bind_mount_shape(mount: &ContainerBindMount) -> Result<(), MxcTranslationError> {
+    if mount.host_path.trim().is_empty() || mount.container_path.trim().is_empty() {
+        return Err(MxcTranslationError::Container(
+            "LXC bind mounts require host and container paths".into(),
+        ));
+    }
+
+    if Path::new(&mount.host_path) != Path::new(&mount.container_path) {
+        return Err(MxcTranslationError::Container(format!(
+            "MXC LXC config represents filesystem mounts by host path only; bind mount '{}' -> '{}' would require a container path alias",
+            mount.host_path, mount.container_path
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_lxc_bind_mounts(
+    launch: &ContainerLaunchOptions,
+    filesystem: &MxcFilesystem,
+) -> Result<(), MxcTranslationError> {
+    for mount in &launch.bind_mounts {
+        let covered = match mount.access {
+            ContainerMountAccess::ReadOnly => filesystem
+                .readonly_paths
+                .iter()
+                .any(|path| Path::new(path) == Path::new(&mount.host_path)),
+            ContainerMountAccess::ReadWrite => filesystem
+                .readwrite_paths
+                .iter()
+                .any(|path| Path::new(path) == Path::new(&mount.host_path)),
+        };
+
+        if !covered {
+            return Err(MxcTranslationError::Container(format!(
+                "LXC bind mount '{}' with {:?} access is not granted by the AXIS filesystem policy",
+                mount.host_path, mount.access
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn lxc_distribution_release(
+    launch: &ContainerLaunchOptions,
+) -> Result<(&str, &str), MxcTranslationError> {
+    let ContainerRootfsSource::LxcDistributionRelease {
+        distribution,
+        release,
+    } = &launch.rootfs
+    else {
+        return Err(MxcTranslationError::Container(
+            "MXC LXC requires distribution/release rootfs selection".into(),
+        ));
+    };
+
+    if distribution.trim().is_empty() || release.trim().is_empty() {
+        return Err(MxcTranslationError::Container(
+            "LXC distribution and release must not be empty".into(),
+        ));
+    }
+
+    Ok((distribution, release))
 }
 
 fn validate_current_bubblewrap_filesystem_substrate(
@@ -1890,6 +2075,20 @@ pub struct MxcFilesystem {
 pub struct MxcNetwork {
     #[serde(rename = "defaultPolicy")]
     pub default_policy: MxcNetworkDefaultPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MxcLifecycle {
+    #[serde(rename = "destroyOnExit")]
+    pub destroy_on_exit: bool,
+    #[serde(rename = "preservePolicy")]
+    pub preserve_policy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MxcLxcConfig {
+    pub distribution: String,
+    pub release: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2899,6 +3098,184 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
+    }
+
+    #[test]
+    fn lxc_container_config_maps_distribution_lifecycle_and_mount_contract() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Block),
+            workspace.path().into(),
+        );
+        let launch = lxc_launch_for_workspace(workspace.path());
+
+        let spec =
+            MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime()).unwrap();
+
+        assert_eq!(spec.version, MXC_SCHEMA_VERSION);
+        assert_eq!(spec.platform, MXC_LINUX_PLATFORM);
+        assert_eq!(spec.containment, MXC_LXC_CONTAINMENT);
+        assert_eq!(spec.process.cwd, "/workspace");
+        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Block);
+        assert!(
+            spec.filesystem
+                .readwrite_paths
+                .iter()
+                .any(|path| path == &path_string(workspace.path()))
+        );
+        assert_eq!(
+            spec.lifecycle,
+            Some(MxcLifecycle {
+                destroy_on_exit: true,
+                preserve_policy: false
+            })
+        );
+        assert_eq!(
+            spec.lxc,
+            Some(MxcLxcConfig {
+                distribution: "alpine".into(),
+                release: "3.23".into()
+            })
+        );
+
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["containment"], "lxc");
+        assert_eq!(json["lxc"]["distribution"], "alpine");
+        assert_eq!(json["lxc"]["release"], "3.23");
+        assert_eq!(json["lifecycle"]["destroyOnExit"], true);
+        assert_eq!(json["lifecycle"]["preservePolicy"], false);
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_missing_lxc_dependency_before_translation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launch = lxc_launch_for_workspace(workspace.path());
+
+        let err = MxcExecutionSpec::from_lxc_container_config(
+            &config,
+            &launch,
+            &lxc_runtime_without_lxc(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("before spawn"));
+        assert!(err.to_string().contains(host_dependency::LINUX_LXC));
+        assert!(err.to_string().contains("missing host dependency"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_proxy_until_axis_strict_proxy_adapter_exists() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Proxy),
+            workspace.path().into(),
+        );
+        let launch = lxc_launch_for_workspace(workspace.path());
+
+        let err =
+            MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_proxy_runtime())
+                .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::ProxyModeUnsupported(_)));
+        assert!(err.to_string().contains("strict proxy"));
+        assert!(err.to_string().contains("network namespace"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_bind_mount_aliases() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let mut launch = lxc_launch_for_workspace(workspace.path());
+        launch.bind_mounts[0].container_path = "/workspace".into();
+
+        let err = MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime())
+            .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("container path alias"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_ungranted_bind_mounts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = workspace.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let mut launch = lxc_launch_for_workspace(workspace.path());
+        launch.bind_mounts = vec![ContainerBindMount {
+            host_path: path_string(&outside),
+            container_path: path_string(&outside),
+            access: ContainerMountAccess::ReadWrite,
+        }];
+
+        let err = MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime())
+            .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("not granted"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_persistent_container_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let mut launch = lxc_launch_for_workspace(workspace.path());
+        launch.destroy_on_exit = false;
+
+        let err = MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime())
+            .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("container.destroy_on_exit"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_non_lxc_rootfs_source() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            lxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let mut launch = lxc_launch_for_workspace(workspace.path());
+        launch.rootfs = ContainerRootfsSource::ExistingRootfs {
+            path: path_string(workspace.path()),
+        };
+
+        let err = MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime())
+            .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("container.rootfs"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_host_root_grants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let launch = lxc_launch_for_workspace(workspace.path());
+
+        let err = MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime())
+            .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("host root grants"));
     }
 
     #[test]
@@ -5857,6 +6234,55 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             ..FilesystemPolicy::default()
         };
         policy
+    }
+
+    fn lxc_representable_policy(network_mode: NetworkMode) -> Policy {
+        let mut policy = policy(network_mode);
+        policy.filesystem = FilesystemPolicy {
+            read_write: vec!["{workspace}".into()],
+            compatibility: Compatibility::HardRequirement,
+            ..FilesystemPolicy::default()
+        };
+        policy
+    }
+
+    fn lxc_runtime() -> RuntimeProbeSnapshot {
+        RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+            .with_dependency(host_dependency::LINUX_LXC, DependencyState::Present)
+            .with_dependency(host_dependency::LINUX_CGROUP_V2, DependencyState::Present)
+    }
+
+    fn lxc_proxy_runtime() -> RuntimeProbeSnapshot {
+        lxc_runtime()
+            .with_dependency(host_dependency::LINUX_NETNS, DependencyState::Present)
+            .with_dependency(
+                host_dependency::LINUX_SECCOMP_NOTIFY,
+                DependencyState::Present,
+            )
+    }
+
+    fn lxc_runtime_without_lxc() -> RuntimeProbeSnapshot {
+        RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+            .with_dependency(host_dependency::LINUX_CGROUP_V2, DependencyState::Present)
+    }
+
+    fn lxc_launch_for_workspace(workspace: &Path) -> ContainerLaunchOptions {
+        ContainerLaunchOptions {
+            rootfs: ContainerRootfsSource::LxcDistributionRelease {
+                distribution: "alpine".into(),
+                release: "3.23".into(),
+            },
+            storage_path: None,
+            working_dir: Some("/workspace".into()),
+            bind_mounts: vec![ContainerBindMount {
+                host_path: path_string(workspace),
+                container_path: path_string(workspace),
+                access: ContainerMountAccess::ReadWrite,
+            }],
+            destroy_on_exit: true,
+        }
     }
 
     fn mxc_filesystem_policy(
