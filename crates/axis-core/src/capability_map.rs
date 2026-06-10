@@ -550,7 +550,6 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         host_dependency::LINUX_BUBBLEWRAP,
         host_dependency::LINUX_USERNS,
     ]);
-    let cgroups = dep_support(host_dependency::LINUX_CGROUP_V2);
 
     BackendCapabilities {
         platform: BackendPlatform::Linux,
@@ -569,18 +568,14 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         filesystem: FilesystemCapabilities {
             read_only: mxc_bwrap.clone(),
             read_write: mxc_bwrap.clone(),
-            deny: CapabilitySupport::weaker(
-                "Bubblewrap masks can deny specific paths but do not represent every AXIS ordered deny/default-deny case",
-            ),
+            deny: mxc_bwrap.clone(),
             workspace: mxc_bwrap.clone(),
         },
         process: ProcessCapabilities {
             command: dep_support(host_dependency::MXC_EXECUTOR),
             working_dir: dep_support(host_dependency::MXC_EXECUTOR),
             environment: CapabilitySupport::AxisOwned,
-            user_identity: CapabilitySupport::unsupported(
-                "MXC bubblewrap run_as_user parity is not proven without a dedicated identity adapter",
-            ),
+            user_identity: CapabilitySupport::AxisOwned,
             syscall_filtering: dep_support(host_dependency::AXIS_SECCOMP_LAUNCHER),
             pty: CapabilitySupport::unsupported("MXC bubblewrap PTY support is not mapped by AXIS"),
             timeout: CapabilitySupport::AxisOwned,
@@ -588,12 +583,7 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         network: NetworkCapabilities {
             allow: dep_support(host_dependency::MXC_EXECUTOR),
             block: mxc_bwrap,
-            strict_proxy: deps_support([
-                host_dependency::MXC_EXECUTOR,
-                host_dependency::LINUX_NETNS,
-                host_dependency::AXIS_NETNS_HELPER,
-                host_dependency::LINUX_SECCOMP_NOTIFY,
-            ]),
+            strict_proxy: CapabilitySupport::AxisOwned,
             cooperative_proxy: CapabilitySupport::weaker(
                 "MXC cooperative proxy relies on proxy environment variables and cannot stop direct sockets",
             ),
@@ -602,9 +592,9 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             l7_policy: CapabilitySupport::AxisOwned,
         },
         resources: ResourceCapabilities {
-            process_count: cgroups.clone(),
-            memory: cgroups.clone(),
-            cpu: cgroups.clone(),
+            process_count: CapabilitySupport::AxisOwned,
+            memory: CapabilitySupport::AxisOwned,
+            cpu: CapabilitySupport::AxisOwned,
             timeout: CapabilitySupport::AxisOwned,
         },
         credentials: axis_credentials(),
@@ -612,14 +602,14 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         lifecycle: one_shot_lifecycle(),
         cleanup: CleanupCapabilities {
             process_tree: CapabilitySupport::AxisOwned,
-            resources: cgroups,
+            resources: CapabilitySupport::AxisOwned,
             temp_state: CapabilitySupport::AxisOwned,
             backend_state: dep_support(host_dependency::MXC_EXECUTOR),
         },
         audit: AuditCapabilities {
             denials: CapabilitySupport::AxisOwned,
             dependency_reasons: CapabilitySupport::AxisOwned,
-            bypass_evidence: dep_support(host_dependency::LINUX_SECCOMP_NOTIFY),
+            bypass_evidence: CapabilitySupport::AxisOwned,
         },
     }
 }

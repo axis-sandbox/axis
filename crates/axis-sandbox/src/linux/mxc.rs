@@ -9,6 +9,10 @@
 //! mapped to weaker MXC behavior.
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
+use axis_core::capability::{
+    DependencyState, PlannerOptions, RuntimeProbeSnapshot, plan_backend_policy,
+};
+use axis_core::capability_map::{BackendCapabilityMapId, backend_capability_map, host_dependency};
 use axis_core::connect_attribution::{
     ConnectAttributionStore, policy_requires_connect_attribution,
 };
@@ -487,6 +491,12 @@ impl MxcLinuxSandbox {
         let (network_strategy, proxy_strategy) = resolve_network()?;
         let resource_strategy = resolve_resources()?;
         let notify_connect = mxc_connect_attribution_required(config, &network_strategy)?;
+        validate_mxc_linux_capability_plan(
+            config,
+            &network_strategy,
+            &resource_strategy,
+            notify_connect,
+        )?;
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
@@ -815,6 +825,84 @@ fn validate_mxc_network_strategy(
         super::strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin => Ok(()),
         super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch => Ok(()),
     }
+}
+
+fn validate_mxc_linux_capability_plan(
+    config: &SandboxConfig,
+    network: &super::strategy::NetworkStrategy,
+    resources: &super::strategy::ResourceStrategy,
+    notify_connect: bool,
+) -> Result<(), SandboxError> {
+    let backend = backend_capability_map(BackendCapabilityMapId::MxcLinuxBubblewrap);
+    let runtime = mxc_linux_runtime_snapshot(network, resources, notify_connect);
+    let plan = plan_backend_policy(&config.policy, &backend, &runtime, &PlannerOptions::new());
+
+    if plan.spawn_allowed() {
+        return Ok(());
+    }
+
+    Err(SandboxError::IsolationFailed(format!(
+        "MXC Linux capability planner rejected policy before executor invocation: {}",
+        plan.pre_spawn_error()
+            .unwrap_or_else(|| "unknown capability planning failure".into())
+    )))
+}
+
+fn mxc_linux_runtime_snapshot(
+    network: &super::strategy::NetworkStrategy,
+    resources: &super::strategy::ResourceStrategy,
+    notify_connect: bool,
+) -> RuntimeProbeSnapshot {
+    // This snapshot records dependencies already selected by AXIS strategy
+    // planning before MXC config generation. Executable availability and path
+    // safety are still enforced by the resolver and dry-run boundary below.
+    let mut snapshot = RuntimeProbeSnapshot::new()
+        .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+        .with_dependency(host_dependency::LINUX_BUBBLEWRAP, DependencyState::Present)
+        .with_dependency(host_dependency::LINUX_USERNS, DependencyState::Present)
+        .with_dependency(
+            host_dependency::AXIS_SECCOMP_LAUNCHER,
+            DependencyState::Present,
+        );
+
+    if notify_connect {
+        snapshot = snapshot.with_dependency(
+            host_dependency::LINUX_SECCOMP_NOTIFY,
+            DependencyState::Present,
+        );
+    }
+
+    if matches!(
+        network,
+        super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
+            ..
+        }
+    ) {
+        snapshot = snapshot.with_dependency(host_dependency::LINUX_NETNS, DependencyState::Present);
+    }
+
+    if matches!(
+        network,
+        super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+            ..
+        }
+    ) {
+        snapshot = snapshot
+            .with_dependency(host_dependency::LINUX_NETNS, DependencyState::Present)
+            .with_dependency(host_dependency::AXIS_NETNS_HELPER, DependencyState::Present);
+    }
+
+    if matches!(
+        resources,
+        super::strategy::ResourceStrategy::CgroupsV2 { .. }
+    ) {
+        snapshot =
+            snapshot.with_dependency(host_dependency::LINUX_CGROUP_V2, DependencyState::Present);
+    }
+
+    snapshot
 }
 
 fn mxc_connect_attribution_required(
@@ -2989,6 +3077,56 @@ mod tests {
 
         assert!(validate_mxc_network_strategy(&config, &network).is_ok());
         assert!(mxc_connect_attribution_required(&config, &network).unwrap());
+    }
+
+    #[test]
+    fn capability_preflight_accepts_planner_approved_mxc_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        let (network, _) = no_proxy_network_strategy();
+
+        validate_mxc_linux_capability_plan(
+            &config,
+            &network,
+            &no_resource_limits_strategy(),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn capability_preflight_rejects_missing_binary_attribution_before_executor() {
+        let id = SandboxId::new();
+        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
+        let mut endpoint = endpoint_policy();
+        endpoint.binaries = vec![BinaryMatch {
+            path: "/usr/bin/curl".into(),
+        }];
+        policy.network.policies.push(endpoint);
+        let (network, _) = native_mxc_proxy_strategies(id, 31_280);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.proxy_addr = Some(super::super::netns::proxy_bind_addr(id, 31_280));
+
+        let err = validate_mxc_linux_capability_plan(
+            &config,
+            &network,
+            &no_resource_limits_strategy(),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("before executor invocation"));
+        assert!(err.to_string().contains("network.binary_attribution"));
+        assert!(
+            err.to_string()
+                .contains(host_dependency::LINUX_SECCOMP_NOTIFY)
+        );
     }
 
     #[test]
