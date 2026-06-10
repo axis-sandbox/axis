@@ -24,3 +24,6 @@ axis-proxy = { workspace = true }
 axis-router = { workspace = true }
 axis-sandbox = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

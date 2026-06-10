@@ -7,6 +7,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+mod pty_bridge;
+
 #[derive(Parser)]
 #[command(name = "axis", about = "AXIS: Agent eXecution Isolation Substrate")]
 #[command(version)]
@@ -120,6 +123,15 @@ enum Commands {
         command: Vec<String>,
     },
 
+    #[command(name = "__axis-pty-bridge", hide = true)]
+    PtyBridge {
+        #[arg(long)]
+        socket: PathBuf,
+
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+
     /// Show inference server status.
     Inference {
         #[command(subcommand)]
@@ -164,8 +176,11 @@ async fn main() -> Result<()> {
     // Suppress logging when stdin is a TTY and we're running an agent
     // (the TUI agent would be confused by JSON log lines on stderr).
     let is_interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let is_run_cmd = std::env::args().nth(1).as_deref() == Some("run");
-    let quiet = is_interactive && is_run_cmd && std::env::var("AXIS_LOG").is_err();
+    let first_arg = std::env::args().nth(1);
+    let is_run_cmd = first_arg.as_deref() == Some("run");
+    let is_pty_bridge_cmd = first_arg.as_deref() == Some("__axis-pty-bridge");
+    let quiet =
+        (is_interactive && is_run_cmd && std::env::var("AXIS_LOG").is_err()) || is_pty_bridge_cmd;
 
     if quiet {
         // Minimal logging — only errors.
@@ -842,6 +857,7 @@ async fn main() -> Result<()> {
                         proxy_addr,
                         connect_attribution,
                         capture_output: false,
+                        interactive_terminal: quiet,
                         timeout_sec,
                     };
 
@@ -877,6 +893,21 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+
+        Commands::PtyBridge { socket, command } => {
+            #[cfg(unix)]
+            {
+                let code = pty_bridge::run(socket, command)?;
+                std::process::exit(code);
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                let _ = command;
+                anyhow::bail!("PTY bridge is not supported on this platform");
             }
         }
 
@@ -921,6 +952,7 @@ fn try_agent_subcommand() -> Option<i32> {
         "policy",
         "model",
         "inference",
+        "__axis-pty-bridge",
         "help",
     ];
     if builtins.contains(&subcmd.as_str()) {

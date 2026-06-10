@@ -882,6 +882,7 @@ process:
         proxy_addr: None,
         connect_attribution: None,
         capture_output: true,
+        interactive_terminal: false,
         timeout_sec: Some(10),
     };
     let mut sandbox = match Sandbox::create_for_exec(config) {

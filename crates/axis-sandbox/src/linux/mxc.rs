@@ -31,11 +31,17 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -391,6 +397,7 @@ pub(crate) struct MxcLinuxSandbox {
     exit_code: Option<i32>,
     config_file: Option<tempfile::NamedTempFile>,
     seccomp_filter_file: Option<tempfile::NamedTempFile>,
+    pty_bridge: Option<MxcPtyBridge>,
     netns_name: Option<String>,
     netns_helper_destroy_token: Option<String>,
     cgroup: Option<super::resources::CgroupHandle>,
@@ -406,12 +413,271 @@ pub(crate) struct MxcLinuxSandbox {
     tmpdir_active: bool,
 }
 
+struct MxcPtyBridge {
+    runtime_dir: PathBuf,
+    socket_path: PathBuf,
+    relay: Option<PtyRelay>,
+}
+
+struct PtyRelay {
+    stop: Arc<AtomicBool>,
+    socket_path: PathBuf,
+    handle: thread::JoinHandle<()>,
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct MxcNetnsOverride {
     name: String,
     fd: i32,
     cleanup: Result<(), String>,
+}
+
+impl MxcPtyBridge {
+    fn new(id: SandboxId, workspace: &Path) -> Result<Self, SandboxError> {
+        let runtime_dir = workspace.join(".axis-pty").join(id.to_string());
+        let socket_path = runtime_dir.join("stdio.sock");
+        validate_unix_socket_path(&socket_path)?;
+        Ok(Self {
+            runtime_dir,
+            socket_path,
+            relay: None,
+        })
+    }
+
+    fn start(&mut self) -> Result<(), SandboxError> {
+        if self.relay.is_some() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&self.runtime_dir).map_err(|err| {
+            SandboxError::IsolationFailed(format!(
+                "MXC PTY bridge runtime dir '{}': {err}",
+                self.runtime_dir.display()
+            ))
+        })?;
+        fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                SandboxError::IsolationFailed(format!(
+                    "MXC PTY bridge runtime dir '{}': {err}",
+                    self.runtime_dir.display()
+                ))
+            },
+        )?;
+        if self.socket_path.exists() {
+            fs::remove_file(&self.socket_path).map_err(|err| {
+                SandboxError::IsolationFailed(format!(
+                    "MXC PTY bridge stale socket '{}': {err}",
+                    self.socket_path.display()
+                ))
+            })?;
+        }
+        let listener = UnixListener::bind(&self.socket_path).map_err(|err| {
+            SandboxError::IsolationFailed(format!(
+                "MXC PTY bridge socket '{}': {err}",
+                self.socket_path.display()
+            ))
+        })?;
+        listener.set_nonblocking(true).map_err(|err| {
+            SandboxError::IsolationFailed(format!("MXC PTY bridge socket: {err}"))
+        })?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || relay_mxc_pty(listener, thread_stop));
+        self.relay = Some(PtyRelay {
+            stop,
+            socket_path: self.socket_path.clone(),
+            handle,
+        });
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Option<String> {
+        if let Some(relay) = self.relay.take() {
+            relay.stop();
+        }
+        let mut errors = Vec::new();
+        if self.socket_path.exists()
+            && let Err(err) = fs::remove_file(&self.socket_path)
+        {
+            errors.push(format!(
+                "remove socket '{}': {err}",
+                self.socket_path.display()
+            ));
+        }
+        if self.runtime_dir.exists()
+            && let Err(err) = fs::remove_dir(&self.runtime_dir)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            errors.push(format!(
+                "remove runtime dir '{}': {err}",
+                self.runtime_dir.display()
+            ));
+        }
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+}
+
+impl PtyRelay {
+    fn stop(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&self.socket_path);
+        let _ = self.handle.join();
+    }
+}
+
+struct RawTerminalGuard {
+    fd: i32,
+    original: libc::termios,
+    active: bool,
+}
+
+impl RawTerminalGuard {
+    fn enter(fd: i32) -> Option<Self> {
+        if unsafe { libc::isatty(fd) } != 1 {
+            return None;
+        }
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } < 0 {
+            return None;
+        }
+        let mut raw = original;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } < 0 {
+            return None;
+        }
+        Some(Self {
+            fd,
+            original,
+            active: true,
+        })
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            }
+        }
+    }
+}
+
+fn validate_unix_socket_path(path: &Path) -> Result<(), SandboxError> {
+    if path.as_os_str().as_bytes().len() >= 108 {
+        return Err(SandboxError::IsolationFailed(format!(
+            "MXC PTY bridge socket path is too long for sockaddr_un: '{}'",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn relay_mxc_pty(listener: UnixListener, stop: Arc<AtomicBool>) {
+    let stream = loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, _addr)) => break stream,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
+    };
+
+    let _raw = RawTerminalGuard::enter(libc::STDIN_FILENO);
+    let stream_fd = stream.as_raw_fd();
+    let mut buf = [0u8; 8192];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            continue;
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            match read_fd(libc::STDIN_FILENO, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if write_all_fd(stream_fd, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            match read_fd(stream_fd, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if write_all_fd(libc::STDOUT_FILENO, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            break;
+        }
+    }
+}
+
+fn read_fd(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        let ret = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if ret >= 0 {
+            return Ok(ret as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn write_all_fd(fd: i32, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let ret = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if ret >= 0 {
+            if ret == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "PTY bridge write returned zero bytes",
+                ));
+            }
+            buf = &buf[ret as usize..];
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 impl MxcLinuxSandbox {
@@ -599,14 +865,36 @@ impl MxcLinuxSandbox {
         })?;
         let mut spec = spec;
         apply_proxy_env_to_spec(&mut spec, &proxy_strategy);
-        let seccomp_filter_file =
-            prepare_mxc_seccomp_launch(config, &mut spec, resolve_seccomp_launcher).map_err(
-                |err| {
+        let mut launch_command = config.command.clone();
+        let mut launch_args = config.args.clone();
+        let pty_bridge = if config.interactive_terminal {
+            match prepare_mxc_pty_bridge_launch(config, &mut spec) {
+                Ok((bridge, command, args)) => {
+                    launch_command = command;
+                    launch_args = args;
+                    Some(bridge)
+                }
+                Err(err) => {
                     let cleanup_error =
                         cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-                    append_cleanup_failure(err, cleanup_error)
-                },
-            )?;
+                    return Err(append_cleanup_failure(err, cleanup_error));
+                }
+            }
+        } else {
+            None
+        };
+        let seccomp_filter_file = prepare_mxc_seccomp_launch(
+            &config.policy,
+            &mut spec,
+            resolve_seccomp_launcher,
+            &launch_command,
+            &launch_args,
+        )
+        .map_err(|err| {
+            let cleanup_error =
+                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+            append_cleanup_failure(err, cleanup_error)
+        })?;
         if let Some(identity) = &resolved_identity {
             prepare_seccomp_filter_for_identity(&seccomp_filter_file, identity).map_err(|err| {
                 let cleanup_error =
@@ -651,6 +939,7 @@ impl MxcLinuxSandbox {
             exit_code: None,
             config_file: None,
             seccomp_filter_file: Some(seccomp_filter_file),
+            pty_bridge,
             netns_name: None,
             netns_helper_destroy_token: None,
             cgroup: None,
@@ -677,6 +966,9 @@ impl MxcLinuxSandbox {
         }
         if let Some(error) = self.cleanup_cgroup() {
             cleanup_errors.push(format!("cgroup cleanup failed: {error}"));
+        }
+        if let Some(error) = self.cleanup_pty_bridge() {
+            cleanup_errors.push(format!("PTY bridge cleanup failed: {error}"));
         }
         if let Err(error) = self.cleanup_tmpdir() {
             cleanup_errors.push(format!("tmpdir cleanup failed: {error}"));
@@ -770,6 +1062,10 @@ impl MxcLinuxSandbox {
         None
     }
 
+    fn cleanup_pty_bridge(&mut self) -> Option<String> {
+        self.pty_bridge.as_mut().and_then(MxcPtyBridge::cleanup)
+    }
+
     fn cleanup_for_start_failure(&mut self, error: SandboxError) -> SandboxError {
         self.cleanup_for_start_failure_with_netns_fd(None, error)
     }
@@ -789,6 +1085,9 @@ impl MxcLinuxSandbox {
         }
         if let Some(error) = self.cleanup_cgroup() {
             cleanup_errors.push(format!("cgroup cleanup failed: {error}"));
+        }
+        if let Some(error) = self.cleanup_pty_bridge() {
+            cleanup_errors.push(format!("PTY bridge cleanup failed: {error}"));
         }
         if let Err(error) = self.cleanup_tmpdir() {
             cleanup_errors.push(format!("tmpdir cleanup failed: {error}"));
@@ -1284,6 +1583,13 @@ impl SandboxImpl for MxcLinuxSandbox {
             command.stderr(Stdio::from(stderr));
         }
 
+        if let Some(bridge) = self.pty_bridge.as_mut()
+            && let Err(err) = bridge.start()
+        {
+            super::close_fd(cgroup_procs_fd);
+            return Err(self.cleanup_for_start_failure_with_netns_fd(netns_fd, err));
+        }
+
         let mut child_error_pipe = match super::ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
             Err(err) => {
@@ -1707,6 +2013,17 @@ impl MxcLinuxSandbox {
             };
             command.stdout(Stdio::from(stdout));
             command.stderr(Stdio::from(stderr));
+        }
+
+        if let Some(bridge) = self.pty_bridge.as_mut()
+            && let Err(err) = bridge.start()
+        {
+            super::close_fd(Some(spec_fd));
+            super::close_fd(Some(config_fd));
+            super::close_fd(Some(sync_read_fd));
+            super::close_fd(Some(sync_write_fd));
+            super::close_fd(cgroup_procs_fd);
+            return Err(self.cleanup_for_start_failure(err));
         }
 
         super::configure_helper_launch_fds_for_spawn(
@@ -2514,6 +2831,50 @@ fn validate_mxc_filesystem_overlays(
     Ok(())
 }
 
+fn prepare_mxc_pty_bridge_launch(
+    config: &SandboxConfig,
+    spec: &mut MxcExecutionSpec,
+) -> Result<(MxcPtyBridge, String, Vec<String>), SandboxError> {
+    let bridge = MxcPtyBridge::new(config.id, &config.workspace_dir)?;
+    let helper = std::env::current_exe().map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC PTY bridge helper path: {err}"))
+    })?;
+    let helper_path = path_to_string(&helper).map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC PTY bridge helper path: {err}"))
+    })?;
+    let socket_path = path_to_string(&bridge.socket_path).map_err(|err| {
+        SandboxError::IsolationFailed(format!("MXC PTY bridge socket path: {err}"))
+    })?;
+
+    ensure_seccomp_support_path_not_denied(&spec.filesystem, "PTY bridge helper", &helper_path)?;
+    ensure_seccomp_support_path_not_denied(&spec.filesystem, "PTY bridge socket", &socket_path)?;
+    ensure_mxc_pty_helper_visible(&mut spec.filesystem, &helper_path);
+
+    let mut args = vec![
+        "__axis-pty-bridge".to_string(),
+        "--socket".to_string(),
+        socket_path,
+        "--".to_string(),
+        config.command.clone(),
+    ];
+    args.extend(config.args.clone());
+    spec.process.command_line = shell_command_line(&helper_path, &args);
+
+    Ok((bridge, helper_path, args))
+}
+
+fn ensure_mxc_pty_helper_visible(filesystem: &mut MxcFilesystem, helper_path: &str) {
+    let helper = Path::new(helper_path);
+    let already_visible = filesystem
+        .readwrite_paths
+        .iter()
+        .chain(filesystem.readonly_paths.iter())
+        .any(|path| path_contains_or_equal(Path::new(path), helper));
+    if !already_visible {
+        push_unique(&mut filesystem.readonly_paths, helper_path.to_string());
+    }
+}
+
 fn expanded_paths_grant_root_read(
     read_only: &[super::landlock::ExpandedPath],
     read_write: &[super::landlock::ExpandedPath],
@@ -2529,16 +2890,18 @@ fn path_contains_or_equal(parent: &Path, child: &Path) -> bool {
 }
 
 fn prepare_mxc_seccomp_launch<F>(
-    config: &SandboxConfig,
+    policy: &Policy,
     spec: &mut MxcExecutionSpec,
     resolve_seccomp_launcher: F,
+    command: &str,
+    args: &[String],
 ) -> Result<tempfile::NamedTempFile, SandboxError>
 where
     F: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
 {
     let filter = super::seccomp::prepare_seccomp_with_options(
-        &config.policy.process,
-        mxc_seccomp_options_for_policy(&config.policy),
+        &policy.process,
+        mxc_seccomp_options_for_policy(policy),
     )
     .map_err(SandboxError::IsolationFailed)?;
     let seccomp_launcher = resolve_seccomp_launcher()?;
@@ -2554,7 +2917,7 @@ where
     push_unique(&mut spec.filesystem.readonly_paths, launcher_path.clone());
     push_unique(&mut spec.filesystem.readonly_paths, filter_path.clone());
     spec.process.command_line =
-        seccomp_launcher_command_line(&launcher_path, &filter_path, &config.command, &config.args);
+        seccomp_launcher_command_line(&launcher_path, &filter_path, command, args);
 
     Ok(filter_file)
 }
@@ -3297,6 +3660,7 @@ mod tests {
             proxy_addr: None,
             connect_attribution: None,
             capture_output: true,
+            interactive_terminal: false,
             timeout_sec: None,
         }
     }
@@ -4843,6 +5207,60 @@ mod tests {
     }
 
     #[test]
+    fn interactive_terminal_wraps_pty_bridge_inside_seccomp_launcher() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let config_copy = root.path().join("config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 cat \"$config\" > {}\n\
+                 echo '{}'\n",
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Block),
+            workspace.path().into(),
+        );
+        config.command = "/bin/sh".into();
+        config.args = vec!["-c".into(), "test -t 0 && test -t 1".into()];
+        config.capture_output = false;
+        config.interactive_terminal = true;
+
+        let sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher.clone())
+            .expect("fake MXC dry-run should accept PTY bridge launch");
+
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        let command_line = json["process"]["commandLine"].as_str().unwrap();
+        let current_exe = std::env::current_exe().unwrap();
+        assert!(sandbox.pty_bridge.is_some());
+        assert!(command_line.starts_with(&shell_quote_path(launcher.path())));
+        assert!(command_line.contains("--filter"));
+        assert!(command_line.contains("__axis-pty-bridge --socket"));
+        assert!(command_line.contains("-- /bin/sh -c 'test -t 0 && test -t 1'"));
+        assert!(
+            command_line.contains(&shell_quote_path(&current_exe)),
+            "command line should invoke the current AXIS executable as the bridge helper: {command_line}"
+        );
+    }
+
+    #[test]
     fn invalid_seccomp_policy_fails_before_executor_resolution() {
         let workspace = tempfile::tempdir().unwrap();
         let mut policy = mxc_representable_policy(NetworkMode::Allow);
@@ -5259,6 +5677,54 @@ mod tests {
         assert!(marker.exists());
         assert!(!workspace.path().join("stdout.log").exists());
         assert!(!workspace.path().join("stderr.log").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_interactive_bridge_cleans_socket_dir_without_connection() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 0\n",
+                MXC_DRY_RUN_SUCCESS,
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.capture_output = false;
+        config.interactive_terminal = true;
+        let bridge_dir = workspace
+            .path()
+            .join(".axis-pty")
+            .join(config.id.to_string());
+
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+        SandboxImpl::start(&mut sandbox).unwrap();
+        assert!(bridge_dir.exists());
+
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert!(
+            !bridge_dir.exists(),
+            "PTY bridge runtime directory should be removed after wait"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

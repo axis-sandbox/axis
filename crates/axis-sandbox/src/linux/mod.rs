@@ -3246,6 +3246,7 @@ mod tests {
             proxy_addr: None,
             connect_attribution: None,
             capture_output: false,
+            interactive_terminal: false,
             timeout_sec: None,
         };
 
@@ -3745,6 +3746,7 @@ mod tests {
                 proxy_addr: None,
                 connect_attribution: None,
                 capture_output: false,
+                interactive_terminal: false,
                 timeout_sec: None,
             },
             plan: test_plan(id, workspace),

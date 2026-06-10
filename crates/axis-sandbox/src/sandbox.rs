@@ -46,6 +46,9 @@ pub struct SandboxConfig {
     /// Capture stdout/stderr to files in workspace (for daemon mode).
     /// When false, child inherits parent's stdio (for standalone/run mode).
     pub capture_output: bool,
+    /// Attach an interactive terminal to the sandboxed command when the
+    /// selected backend needs an explicit PTY transport.
+    pub interactive_terminal: bool,
     /// Maximum wall-clock time before auto-destroy (seconds). None = no timeout.
     pub timeout_sec: Option<u64>,
 }
@@ -738,6 +741,7 @@ mod tests {
             proxy_addr: None,
             connect_attribution: None,
             capture_output: false,
+            interactive_terminal: false,
             timeout_sec: None,
         }
     }

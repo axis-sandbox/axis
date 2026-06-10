@@ -623,6 +623,7 @@ fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbo
         proxy_addr,
         connect_attribution,
         capture_output: true,
+        interactive_terminal: false,
         timeout_sec,
     };
 
@@ -1321,6 +1322,7 @@ fn contained_exec_config_from(input: ContainedExecConfigInput<'_>) -> SandboxCon
         proxy_addr,
         connect_attribution,
         capture_output: true,
+        interactive_terminal: false,
         timeout_sec,
     }
 }

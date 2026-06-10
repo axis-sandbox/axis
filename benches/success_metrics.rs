@@ -72,6 +72,7 @@ network:
         proxy_addr: None,
         connect_attribution: None,
         capture_output: false,
+        interactive_terminal: false,
         timeout_sec: None,
     };
 
