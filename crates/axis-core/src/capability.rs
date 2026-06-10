@@ -35,6 +35,7 @@ pub enum PolicySurface {
     Filesystem,
     Process,
     Container,
+    Vm,
     Network,
     Resources,
     Credentials,
