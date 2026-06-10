@@ -6032,6 +6032,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn gated_real_mxc_timeout_cleans_tmpdir() {
+        if test_mxc_executor().is_err() {
+            eprintln!(
+                "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
+            );
+            return;
+        }
+        if test_mxc_seccomp_launcher().is_err() {
+            eprintln!(
+                "axis-seccomp-launcher unavailable; set AXIS_TEST_AXIS_SECCOMP_LAUNCHER for a test helper (test skipped)"
+            );
+            return;
+        }
+        if find_on_path("bwrap").is_none() {
+            eprintln!("bubblewrap unavailable for MXC backend (test skipped)");
+            return;
+        }
+        if fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            .map(|value| value.trim() != "1")
+            .unwrap_or(true)
+        {
+            eprintln!("unprivileged user namespaces unavailable (test skipped)");
+            return;
+        }
+
+        let Some(python) =
+            find_on_path("python3").and_then(|path| std::fs::canonicalize(path).ok())
+        else {
+            eprintln!("python3 unavailable (test skipped)");
+            return;
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Block);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let mut config = config(policy, workspace.path().into());
+        config.command = python.to_string_lossy().into_owned();
+        config.args = vec!["-c".into(), "import time; time.sleep(30)".into()];
+        config.working_dir = Some(workspace.path().into());
+        config.capture_output = true;
+        config.timeout_sec = Some(1);
+        config.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
+
+        let mut sandbox = real_mxc_sandbox_for_test(&config).unwrap();
+        assert!(tmpdir.exists(), "MXC setup should create AXIS tmpdir");
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, -1, "MXC timeout should report killed child");
+        assert!(!tmpdir.exists(), "MXC timeout should clean AXIS tmpdir");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_native_proxy_reaches_only_axis_proxy_address() {
         if std::env::var("AXIS_REAL_MXC_PROXY_TESTS").as_deref() != Ok("1") {
             eprintln!("AXIS_REAL_MXC_PROXY_TESTS=1 not set (test skipped)");
