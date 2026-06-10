@@ -15,9 +15,10 @@ use axis_core::connect_attribution::{
     ConnectAttributionStore, policy_requires_connect_attribution,
 };
 use axis_core::container_backend::{
-    ContainerBindMount, ContainerLaunchOptions, ContainerMountAccess, ContainerRootfsSource,
-    plan_container_backend_policy,
+    ContainerBackendFilesystemSpec, ContainerBindMount, ContainerLaunchOptions,
+    ContainerMountAccess, ContainerRootfsSource, build_container_backend_execution_spec,
 };
+use axis_core::mxc_config as shared_mxc;
 use axis_core::policy::{Compatibility, FilesystemPolicy, NetworkMode, Policy};
 use axis_core::process_backend::plan_process_backend_policy;
 use axis_core::types::SandboxId;
@@ -1883,23 +1884,14 @@ fn translate_lxc_container_config(
     launch: &ContainerLaunchOptions,
     runtime: &RuntimeProbeSnapshot,
 ) -> Result<MxcExecutionSpec, MxcTranslationError> {
-    let plan = plan_container_backend_policy(
+    let mut spec = build_container_backend_execution_spec(
         &config.policy,
         BackendCapabilityMapId::MxcLinuxLxc,
-        launch,
+        launch.clone(),
         runtime,
         &PlannerOptions::new(),
     )
-    .ok_or_else(|| MxcTranslationError::Container("MXC LXC is not a container backend".into()))?;
-
-    if !plan.spawn_allowed() {
-        let reason = plan
-            .pre_spawn_error()
-            .unwrap_or_else(|| "container backend plan rejected launch".into());
-        return Err(MxcTranslationError::Container(format!(
-            "container backend plan rejected launch before spawn: {reason}"
-        )));
-    }
+    .map_err(lxc_spec_error)?;
 
     validate_lxc_launch_options(launch)?;
 
@@ -1917,23 +1909,86 @@ fn translate_lxc_container_config(
     validate_lxc_filesystem_policy(&config.policy.filesystem)?;
     let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
     validate_lxc_bind_mounts(launch, &filesystem.filesystem)?;
-    let network = translate_network(&config.policy, MxcNetworkTranslationMode::Standalone)?;
-    let (distribution, release) = lxc_distribution_release(launch)?;
+    spec.filesystem = container_filesystem_spec_from_mxc(&filesystem.filesystem);
+
+    let wire = shared_mxc::build_mxc_container_config(
+        mxc_process_config_from_translated(&process),
+        &spec,
+        shared_mxc::MxcContainerConfigOptions::default(),
+    )
+    .map_err(|err| MxcTranslationError::Container(err.to_string()))?;
+    mxc_execution_spec_from_container_wire(wire)
+}
+
+fn lxc_spec_error(
+    error: axis_core::container_backend::ContainerBackendSpecError,
+) -> MxcTranslationError {
+    MxcTranslationError::Container(format!(
+        "container backend plan rejected launch before spawn: {error}"
+    ))
+}
+
+fn container_filesystem_spec_from_mxc(
+    filesystem: &MxcFilesystem,
+) -> ContainerBackendFilesystemSpec {
+    ContainerBackendFilesystemSpec {
+        read_only: filesystem.readonly_paths.clone(),
+        read_write: filesystem.readwrite_paths.clone(),
+        deny: filesystem.denied_paths.clone(),
+    }
+}
+
+fn mxc_process_config_from_translated(process: &MxcProcess) -> shared_mxc::MxcProcessConfig {
+    shared_mxc::MxcProcessConfig {
+        command_line: process.command_line.clone(),
+        cwd: Some(process.cwd.clone()),
+        env: process.env.clone(),
+        timeout: process.timeout,
+    }
+}
+
+fn mxc_execution_spec_from_container_wire(
+    wire: shared_mxc::MxcContainerWireConfig,
+) -> Result<MxcExecutionSpec, MxcTranslationError> {
+    if wire.platform != shared_mxc::MxcPlatform::Linux
+        || wire.containment != shared_mxc::MxcContainment::Lxc
+    {
+        return Err(MxcTranslationError::Container(
+            "Linux MXC adapter can only execute MXC LXC wire configs".into(),
+        ));
+    }
+    let lxc = wire.lxc.ok_or_else(|| {
+        MxcTranslationError::Container("MXC LXC wire config missing lxc section".into())
+    })?;
 
     Ok(MxcExecutionSpec {
-        version: MXC_SCHEMA_VERSION.into(),
+        version: wire.version,
         platform: MXC_LINUX_PLATFORM.into(),
         containment: MXC_LXC_CONTAINMENT.into(),
-        process,
-        filesystem: filesystem.filesystem,
-        network,
+        process: MxcProcess {
+            command_line: wire.process.command_line,
+            cwd: wire.process.cwd.unwrap_or_default(),
+            env: wire.process.env,
+            timeout: wire.process.timeout,
+        },
+        filesystem: MxcFilesystem {
+            readwrite_paths: wire.filesystem.readwrite_paths,
+            readonly_paths: wire.filesystem.readonly_paths,
+            denied_paths: wire.filesystem.denied_paths,
+        },
+        network: MxcNetwork {
+            default_policy: match wire.network.default_policy {
+                shared_mxc::MxcNetworkDefaultPolicy::Allow => MxcNetworkDefaultPolicy::Allow,
+                shared_mxc::MxcNetworkDefaultPolicy::Block => MxcNetworkDefaultPolicy::Block,
+            },
+        },
         lifecycle: Some(MxcLifecycle {
-            destroy_on_exit: true,
-            preserve_policy: false,
+            destroy_on_exit: wire.lifecycle.destroy_on_exit,
+            preserve_policy: wire.lifecycle.preserve_policy,
         }),
         lxc: Some(MxcLxcConfig {
-            distribution: distribution.into(),
-            release: release.into(),
+            distribution: lxc.distribution,
+            release: lxc.release,
         }),
     })
 }
@@ -3184,6 +3239,22 @@ mod tests {
         assert!(matches!(err, MxcTranslationError::ProxyModeUnsupported(_)));
         assert!(err.to_string().contains("strict proxy"));
         assert!(err.to_string().contains("network namespace"));
+    }
+
+    #[test]
+    fn lxc_container_config_rejects_endpoint_policies_outside_strict_proxy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = lxc_representable_policy(NetworkMode::Allow);
+        policy.network.policies.push(endpoint_policy());
+        let config = config(policy, workspace.path().into());
+        let launch = lxc_launch_for_workspace(workspace.path());
+
+        let err = MxcExecutionSpec::from_lxc_container_config(&config, &launch, &lxc_runtime())
+            .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Container(_)));
+        assert!(err.to_string().contains("endpoint policies"));
+        assert!(err.to_string().contains("strict proxy"));
     }
 
     #[test]
