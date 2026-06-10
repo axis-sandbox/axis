@@ -43,6 +43,13 @@ The harness currently runs:
 - `cargo test -p axis-core mxc_config`
 - `cargo test -p axis-sandbox mxc -- --skip gated_`
 
+Backend default evidence can be inspected without host dependencies with:
+
+```bash
+cargo run -p axis-bench --bin backend-defaults
+cargo run -p axis-bench --bin backend-evidence
+```
+
 This covers the shared capability planner, process backend planning, container
 backend planning, VM backend planning, MXC wire config generation, and the MXC
 fake executor/dry-run paths by default. The MXC command intentionally skips

@@ -12,6 +12,10 @@ path = "success_metrics.rs"
 name = "backend-defaults"
 path = "backend_defaults.rs"
 
+[[bin]]
+name = "backend-evidence"
+path = "backend_evidence.rs"
+
 [dependencies]
 axis-core = { workspace = true }
 axis-sandbox = { workspace = true }

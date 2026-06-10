@@ -13,6 +13,13 @@ The machine-readable source of truth for this matrix is
 cargo run -p axis-bench --bin backend-defaults
 ```
 
+Security coverage and unsupported-policy counts are emitted from the shared
+capability planner with:
+
+```bash
+cargo run -p axis-bench --bin backend-evidence
+```
+
 ## Current Defaults
 
 | Platform | Current process default | Decision |
