@@ -1,6 +1,6 @@
 # AXIS: Agent eXecution Isolation Substrate
 
-A high-performance OS-native agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default quickstart path uses no containers, VMs, or admin privileges; stronger Linux proxy networking may require host capabilities or the optional AXIS helper.
+A high-performance agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default installed Linux path uses the MXC Bubblewrap process backend with AXIS-owned policy layers and does not require admin privileges; stricter native Linux proxy networking may require host capabilities or the optional AXIS helper.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="AXIS Architecture" width="800">
@@ -70,14 +70,14 @@ For the cross-platform dependency and package boundary, see
 ## Quick Start
 
 ```bash
-# Run anything in a block-mode sandbox — one command, zero config
+# Run anything in a block-mode sandbox -- one command, zero config
 axis run -- python3 -c "print('Hello from AXIS sandbox')"
 ```
 
 That's it. The default `minimal` policy is intentionally quickstart-friendly on
-Linux: Landlock filesystem isolation, seccomp syscall filtering, block-mode
-network denial, and no requested cgroup/resource limits. It does not require
-sudo, a setuid helper, a container, or a VM.
+Linux: MXC Bubblewrap process isolation, AXIS seccomp syscall filtering,
+block-mode network denial, and no requested cgroup/resource limits. It does not
+require sudo, a setuid helper, or a VM when installed from packaged artifacts.
 
 ```bash
 # Run a resource-limited or proxy policy when the host can enforce it
@@ -91,11 +91,12 @@ axis destroy <sandbox-id>
 ```
 
 On Linux, policies that request CPU, memory, or process limits require writable
-cgroups v2 or a documented fallback. `network.mode: proxy` additionally needs
-native `CAP_NET_ADMIN` support or the optional AXIS netns helper. Missing
-capabilities are fatal for the requested policy rather than silently weakening
-the sandbox. See [Linux Setup](docs/linux-setup.md) for the mode matrix and
-test commands, and
+cgroups v2 or a documented fallback. `network.mode: proxy` uses MXC cooperative
+proxy configuration for policies that do not require binary attribution; stricter
+native proxy enforcement additionally needs native `CAP_NET_ADMIN` support or
+the optional AXIS netns helper. Missing capabilities are fatal for the requested
+policy rather than silently weakening the sandbox. See
+[Linux Setup](docs/linux-setup.md) for the mode matrix and test commands, and
 [Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md)
 for optional backend dependencies.
 
@@ -215,6 +216,14 @@ axis/
 | OPA eval throughput | 59K/sec | 42K/sec | >10K/sec |
 | OPA per-request | 17µs | 24µs | <5ms |
 | Memory per sandbox | 1.6MB | — | <50MB |
+
+The single synthetic OPA throughput number comes from `success-metrics`. For
+policy-specific proxy request timing, and MXC Bubblewrap proxy-mode timing when
+a safe MXC executor is available, run `cargo run -p axis-bench --bin opa-scenarios`;
+see [OPA Proxy Benchmarks](docs/opa-proxy-benchmarks.md). For side-by-side MXC
+backend and network-mode runtime checks, plus the AXIS native filesystem
+boundary comparison, run `cargo run -p axis-bench --bin mxc-isolation-matrix`;
+see [MXC Isolation Matrix](docs/mxc-isolation-matrix.md).
 
 ## Status
 

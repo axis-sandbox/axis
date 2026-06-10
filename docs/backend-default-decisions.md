@@ -20,19 +20,39 @@ capability planner with:
 cargo run -p axis-bench --bin backend-evidence
 ```
 
+Policy-specific proxy request throughput, with optional MXC Bubblewrap
+proxy-mode runs when a safe MXC executor is available, is emitted with:
+
+```bash
+cargo run -p axis-bench --bin opa-scenarios
+```
+
+See [OPA Proxy Benchmarks](opa-proxy-benchmarks.md) for the inputs and
+iteration controls.
+
+Current-host MXC backend/network-mode runtime checks, plus the AXIS native
+filesystem-boundary comparison, are emitted with:
+
+```bash
+cargo run -p axis-bench --bin mxc-isolation-matrix
+```
+
+See [MXC Isolation Matrix](mxc-isolation-matrix.md) for row definitions,
+dependency gates, and status meanings.
+
 ## Current Defaults
 
 | Platform | Current process default | Decision |
 | --- | --- | --- |
-| Linux | `axis-native-linux` | Retain native default while Landlock, seccomp, strict proxy integration, and binary attribution remain the proven low-dependency path. |
+| Linux | `mxc-linux-bubblewrap` | Use the MXC process backend by default while AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around it. |
 | macOS | `axis-native-macos-seatbelt` | Retain native default while direct Seatbelt profile generation remains the proven no-extra-runtime path. |
 | Windows | `axis-native-windows` | Retain native default while Job Object, Low Integrity, and AXIS-owned process lifecycle behavior remain the proven baseline. |
 
-MXC process backends are candidates. They can become defaults only after they
-match AXIS policy semantics and have benchmark evidence for startup, teardown,
-maximum RSS, file descriptors, process count, density, host dependency cost,
-security coverage, unsupported-policy counts, and cleanup failures.
-The current native-default smoke benchmark command is:
+Non-default MXC process backends are candidates. They can become defaults only
+after they match AXIS policy semantics and have benchmark evidence for startup,
+teardown, maximum RSS, file descriptors, process count, density, host dependency
+cost, security coverage, unsupported-policy counts, and cleanup failures.
+The current default smoke benchmark command is:
 
 ```bash
 cargo run -p axis-bench --bin success-metrics
@@ -42,7 +62,7 @@ cargo run -p axis-bench --bin success-metrics
 
 | Backend | Class | Status | Benchmark gate |
 | --- | --- | --- | --- |
-| `mxc-linux-bubblewrap` | Process | Candidate | `AXIS_BENCH_MXC_BUBBLEWRAP=1` |
+| `axis-native-linux` | Process | Retained | `cargo run -p axis-bench --bin success-metrics` |
 | `mxc-macos-seatbelt` | Process | Candidate | `AXIS_BENCH_MXC_MACOS_SEATBELT=1` |
 | `mxc-windows-processcontainer` | Process | Candidate | `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` |
 | `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |

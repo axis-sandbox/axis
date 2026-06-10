@@ -56,10 +56,12 @@ pub(crate) fn create_cgroup(
     sandbox_id: SandboxId,
     policy: &ProcessPolicy,
 ) -> Result<CgroupHandle, String> {
-    create_cgroup_at(Path::new(CGROUP_ROOT), sandbox_id, policy)
+    let root = find_writable_cgroup_v2_delegation()?;
+    create_cgroup_at(&root, sandbox_id, policy)
 }
 
 pub(crate) fn probe_cgroup_v2_delegation(root: &Path) -> Result<(), String> {
+    enable_child_controllers(root)?;
     let probe_path = root.join(format!("axis-probe-{}", SandboxId::new()));
     std::fs::create_dir(&probe_path)
         .map_err(|e| format!("create cgroup probe {}: {e}", probe_path.display()))?;
@@ -69,6 +71,107 @@ pub(crate) fn probe_cgroup_v2_delegation(root: &Path) -> Result<(), String> {
     let cleanup_result = remove_cgroup_dir(&probe_path);
     probe_result?;
     cleanup_result
+}
+
+pub(crate) fn find_writable_cgroup_v2_delegation() -> Result<PathBuf, String> {
+    let current = current_cgroup_v2_path()?;
+    let mut errors = Vec::new();
+    for candidate in candidate_cgroup_roots(&current) {
+        if !candidate.join("cgroup.controllers").exists() {
+            continue;
+        }
+        match probe_cgroup_v2_delegation(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) => errors.push(format!("{}: {err}", candidate.display())),
+        }
+    }
+
+    Err(format!(
+        "no writable cgroup v2 delegation found from current cgroup '{}': {}",
+        current.display(),
+        errors.join("; ")
+    ))
+}
+
+fn current_cgroup_v2_path() -> Result<PathBuf, String> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("read /proc/self/cgroup: {e}"))?;
+    cgroup_v2_path_from_proc_self_cgroup(&cgroup)
+}
+
+fn cgroup_v2_path_from_proc_self_cgroup(cgroup: &str) -> Result<PathBuf, String> {
+    for line in cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next().unwrap_or_default();
+        let controllers = fields.next().unwrap_or_default();
+        let path = fields.next().unwrap_or_default();
+        if hierarchy == "0" && controllers.is_empty() {
+            return cgroup_path_from_kernel_path(path);
+        }
+    }
+
+    Err("no cgroup v2 entry found in /proc/self/cgroup".into())
+}
+
+fn cgroup_path_from_kernel_path(path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "cgroup v2 path '{}' is not absolute",
+            path.display()
+        ));
+    }
+
+    let mut full = PathBuf::from(CGROUP_ROOT);
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => full.push(part),
+            _ => {
+                return Err(format!(
+                    "cgroup v2 path '{}' contains unsupported component",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(full)
+}
+
+fn candidate_cgroup_roots(current: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut next = Some(current);
+    while let Some(path) = next {
+        candidates.push(path.to_path_buf());
+        if path == Path::new(CGROUP_ROOT) {
+            break;
+        }
+        next = path.parent();
+    }
+    candidates
+}
+
+fn enable_child_controllers(root: &Path) -> Result<(), String> {
+    let controllers_path = root.join("cgroup.controllers");
+    let controllers = std::fs::read_to_string(&controllers_path)
+        .map_err(|e| format!("read {}: {e}", controllers_path.display()))?;
+    let requested = ["cpu", "memory", "pids"]
+        .into_iter()
+        .filter(|controller| {
+            controllers
+                .split_whitespace()
+                .any(|value| value == *controller)
+        })
+        .map(|controller| format!("+{controller}"))
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Err(format!(
+            "cgroup {} does not expose cpu, memory, or pids controllers",
+            root.display()
+        ));
+    }
+
+    write_file(root.join("cgroup.subtree_control"), requested.join(" "))
 }
 
 pub(crate) fn create_cgroup_at(
@@ -314,7 +417,7 @@ mod tests {
 
         let err = probe_cgroup_v2_delegation(root.path()).unwrap_err();
 
-        assert!(err.contains("controller file"));
+        assert!(err.contains("cgroup.controllers"));
         assert!(
             std::fs::read_dir(root.path()).unwrap().next().is_none(),
             "failed probe directory was not removed"
@@ -344,6 +447,34 @@ mod tests {
             std::fs::read_to_string(path.join("cpu.max")).unwrap(),
             "100000 100000"
         );
+    }
+
+    #[test]
+    fn cgroup_v2_path_parses_proc_self_cgroup_entry() {
+        let path =
+            cgroup_v2_path_from_proc_self_cgroup("0::/user.slice/user-1000.slice/session.scope\n")
+                .unwrap();
+
+        assert_eq!(
+            path,
+            Path::new(CGROUP_ROOT).join("user.slice/user-1000.slice/session.scope")
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_path_rejects_non_absolute_proc_entry() {
+        let err = cgroup_v2_path_from_proc_self_cgroup("0::relative\n").unwrap_err();
+
+        assert!(err.contains("not absolute"));
+    }
+
+    #[test]
+    fn candidate_cgroup_roots_walk_from_current_to_cgroup_root() {
+        let current = Path::new(CGROUP_ROOT).join("user.slice/user-1000.slice/session.scope");
+        let candidates = candidate_cgroup_roots(&current);
+
+        assert_eq!(candidates[0], current);
+        assert_eq!(candidates.last().unwrap(), Path::new(CGROUP_ROOT));
     }
 
     #[test]

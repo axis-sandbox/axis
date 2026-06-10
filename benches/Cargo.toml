@@ -16,11 +16,20 @@ path = "backend_defaults.rs"
 name = "backend-evidence"
 path = "backend_evidence.rs"
 
+[[bin]]
+name = "opa-scenarios"
+path = "opa_scenarios.rs"
+
+[[bin]]
+name = "mxc-isolation-matrix"
+path = "mxc_isolation_matrix.rs"
+
 [dependencies]
 axis-core = { workspace = true }
 axis-sandbox = { workspace = true }
 axis-proxy = { workspace = true }
 axis-safety = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

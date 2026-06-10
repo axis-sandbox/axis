@@ -48,13 +48,24 @@ Backend default evidence can be inspected without host dependencies with:
 ```bash
 cargo run -p axis-bench --bin backend-defaults
 cargo run -p axis-bench --bin backend-evidence
+cargo run -p axis-bench --bin opa-scenarios
+cargo run -p axis-bench --bin mxc-isolation-matrix
 ```
 
 This covers the shared capability planner, process backend planning, container
 backend planning, VM backend planning, MXC wire config generation, and the MXC
-fake executor/dry-run paths by default. The MXC command intentionally skips
-tests named with the `gated_` prefix so real-runtime and privileged proofs do
-not become hidden host-specific requirements.
+fake executor/dry-run paths by default. The OPA proxy benchmark measures
+policy-specific denied proxy requests against already-running AXIS proxy
+instances. On Linux it also measures MXC Bubblewrap proxy modes only when a
+safe MXC executor is supplied through `AXIS_TEST_MXC_EXECUTOR` or `lxc-exec` is
+on `PATH`; otherwise it reports the missing gate once and emits no MXC runtime
+rows. The MXC isolation matrix reports only current-platform MXC backends. It
+can run without an executor, in which case the MXC section reports the missing
+gate and emits no MXC rows; when an executor is supplied, unavailable backend
+dependencies and unsupported backend/mode combinations are reported as data, not
+as benchmark timings. The MXC command intentionally skips tests named with the
+`gated_` prefix so real-runtime and privileged proofs do not become hidden
+host-specific requirements.
 
 CI must run this harness as part of ordinary code testing. Full `cargo test`
 may also run, but this harness is the explicit signal that no-dependency

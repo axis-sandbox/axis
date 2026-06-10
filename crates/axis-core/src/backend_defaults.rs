@@ -23,6 +23,7 @@ pub enum BackendExecutionClass {
 #[serde(rename_all = "snake_case")]
 pub enum BackendDefaultStatus {
     CurrentDefault,
+    Retained,
     Candidate,
     ExperimentalOptIn,
 }
@@ -124,8 +125,8 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         id: BackendCapabilityMapId::AxisNativeLinux,
         platform: BackendPlatform::Linux,
         execution_class: BackendExecutionClass::Process,
-        status: BackendDefaultStatus::CurrentDefault,
-        rationale: "Native Linux remains the process default while it provides direct Landlock, seccomp, strict proxy integration, and binary attribution with no MXC runtime dependency.",
+        status: BackendDefaultStatus::Retained,
+        rationale: "Native Linux remains selectable because direct Landlock, seccomp, strict native netns proxy integration, and binary attribution are AXIS-owned capabilities that MXC Bubblewrap has not fully replaced.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: NATIVE_SECURITY_EVIDENCE,
         benchmark_gate: Some("cargo run -p axis-bench --bin success-metrics"),
@@ -134,11 +135,11 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         id: BackendCapabilityMapId::MxcLinuxBubblewrap,
         platform: BackendPlatform::Linux,
         execution_class: BackendExecutionClass::Process,
-        status: BackendDefaultStatus::Candidate,
-        rationale: "MXC Bubblewrap is a process-backend candidate, but it cannot become the default until AXIS strict proxy, seccomp, resource, cleanup, and filesystem semantics are proven with matching benchmark evidence.",
+        status: BackendDefaultStatus::CurrentDefault,
+        rationale: "MXC Bubblewrap is the Linux process default for packaged no-admin runs. AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around the MXC process backend.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("AXIS_BENCH_MXC_BUBBLEWRAP=1"),
+        benchmark_gate: Some("cargo run -p axis-bench --bin success-metrics"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcLinuxLxc,
@@ -296,11 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn current_process_defaults_remain_native_until_mxc_evidence_exists() {
-        for platform in [
-            BackendPlatform::Linux,
-            BackendPlatform::Macos,
-            BackendPlatform::Windows,
+    fn current_process_defaults_match_declared_platform_choices() {
+        for (platform, expected) in [
+            (
+                BackendPlatform::Linux,
+                BackendCapabilityMapId::MxcLinuxBubblewrap,
+            ),
+            (
+                BackendPlatform::Macos,
+                BackendCapabilityMapId::AxisNativeMacosSeatbelt,
+            ),
+            (
+                BackendPlatform::Windows,
+                BackendCapabilityMapId::AxisNativeWindows,
+            ),
         ] {
             let defaults = backend_default_records()
                 .iter()
@@ -316,14 +326,9 @@ mod tests {
                 1,
                 "{platform:?} must have one process default"
             );
-            assert!(
-                matches!(
-                    defaults[0].id,
-                    BackendCapabilityMapId::AxisNativeLinux
-                        | BackendCapabilityMapId::AxisNativeMacosSeatbelt
-                        | BackendCapabilityMapId::AxisNativeWindows
-                ),
-                "{platform:?} process default must remain native until MXC evidence exists"
+            assert_eq!(
+                defaults[0].id, expected,
+                "{platform:?} process default must match the declared backend decision"
             );
         }
     }
@@ -360,11 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn non_default_records_use_backend_specific_benchmark_gates() {
-        for record in backend_default_records()
-            .iter()
-            .filter(|record| record.status != BackendDefaultStatus::CurrentDefault)
-        {
+    fn mxc_non_default_records_use_backend_specific_benchmark_gates() {
+        for record in backend_default_records().iter().filter(|record| {
+            record.status != BackendDefaultStatus::CurrentDefault
+                && record.id.as_str().starts_with("mxc-")
+        }) {
             let gate = record.benchmark_gate.unwrap();
             assert!(
                 gate.starts_with("AXIS_BENCH_MXC_"),

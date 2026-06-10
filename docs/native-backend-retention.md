@@ -12,7 +12,7 @@ requirements are documented in
 
 | Platform | Native backend | Decision | Why it remains |
 | --- | --- | --- | --- |
-| Linux | `axis-native-linux` | Retain | Direct Landlock plus seccomp keeps the no-container quickstart path, direct syscall filtering, lightweight process startup, strict proxy integration, and seccomp-notify binary attribution available while MXC process behavior is still being proven. |
+| Linux | `axis-native-linux` | Retain | Direct Landlock plus seccomp keep strict native filesystem and network controls, lightweight process startup comparisons, strict proxy integration, and seccomp-notify binary attribution available while the MXC default path is expanded. |
 | macOS | `axis-native-macos-seatbelt` | Retain | Direct Seatbelt profile generation preserves the no-extra-runtime process sandbox and platform-native filesystem/network-deny controls while the MXC Seatbelt path is compared for equivalent profile, lifecycle, and packaging behavior. |
 | Windows | `axis-native-windows` | Retain | Job Object, Low Integrity, and process-container primitives remain the current native Windows process sandbox vocabulary, with AXIS-owned credential, lifecycle, and resource handling retained until MXC ProcessContainer proves equivalent behavior. |
 

@@ -621,7 +621,7 @@ fn detect_cgroup_v2() -> CgroupV2Support {
         return CgroupV2Support::Unavailable;
     }
 
-    if resources::probe_cgroup_v2_delegation(Path::new("/sys/fs/cgroup")).is_ok() {
+    if resources::find_writable_cgroup_v2_delegation().is_ok() {
         CgroupV2Support::Writable
     } else {
         CgroupV2Support::AvailableReadOnly

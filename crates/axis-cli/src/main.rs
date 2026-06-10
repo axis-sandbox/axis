@@ -1143,14 +1143,8 @@ fn proxy_bind_addr_for_sandbox(
     proxy_port: u16,
     policy: &axis_core::policy::Policy,
 ) -> std::net::SocketAddr {
-    #[cfg(target_os = "linux")]
-    {
-        if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
-            return axis_sandbox::linux::netns::proxy_bind_addr(id, proxy_port);
-        }
-    }
-
     let _ = id;
+    let _ = policy;
     format!("127.0.0.1:{proxy_port}").parse().unwrap()
 }
 
@@ -1256,18 +1250,11 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn standalone_proxy_mode_uses_linux_netns_bind_addr_for_ephemeral_port() {
+    fn standalone_proxy_mode_uses_loopback_bind_addr_for_default_mxc_backend() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let policy = test_policy(NetworkMode::Proxy);
         let bind_addr = proxy_bind_addr_for_sandbox(id, 0, &policy);
 
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            bind_addr,
-            axis_sandbox::linux::netns::proxy_bind_addr(id, 0)
-        );
-
-        #[cfg(not(target_os = "linux"))]
         assert_eq!(bind_addr, "127.0.0.1:0".parse().unwrap());
     }
 
@@ -1283,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_proxy_config_uses_netns_bind_addr_for_proxy_mode() {
+    fn standalone_proxy_config_uses_default_proxy_bind_addr_for_proxy_mode() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let policy = test_policy(NetworkMode::Proxy);
         let config = standalone_proxy_config_for_sandbox(id, &policy, None)

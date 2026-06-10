@@ -130,6 +130,7 @@ pub struct MxcContainerConfigOptions {
 pub struct MxcProcessConfigOptions {
     pub container_id: Option<String>,
     pub strict_proxy_enforced_by_axis: bool,
+    pub cooperative_proxy_configured_by_mxc: bool,
     pub resource_limits_enforced_by_axis: bool,
 }
 
@@ -675,12 +676,22 @@ fn validate_process_network(
     if has_endpoint_policy && spec.network.mode != ProcessBackendNetworkMode::StrictProxy {
         return Err(MxcConfigError::EndpointPolicyRequiresStrictProxy);
     }
-    if spec.network.mode == ProcessBackendNetworkMode::StrictProxy
+    if spec.network.binary_attribution_required
+        && options.cooperative_proxy_configured_by_mxc
         && !options.strict_proxy_enforced_by_axis
     {
         return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
     }
+    if spec.network.mode == ProcessBackendNetworkMode::StrictProxy
+        && !process_proxy_boundary_configured(options)
+    {
+        return Err(MxcConfigError::StrictProxyRequiresAxisLayer);
+    }
     Ok(())
+}
+
+fn process_proxy_boundary_configured(options: &MxcProcessConfigOptions) -> bool {
+    options.strict_proxy_enforced_by_axis || options.cooperative_proxy_configured_by_mxc
 }
 
 fn validate_container_network(
@@ -886,7 +897,7 @@ fn mxc_process_network_policy(
     match spec.network.mode {
         ProcessBackendNetworkMode::Allow => Ok(MxcNetworkDefaultPolicy::Allow),
         ProcessBackendNetworkMode::Block => Ok(MxcNetworkDefaultPolicy::Block),
-        ProcessBackendNetworkMode::StrictProxy if options.strict_proxy_enforced_by_axis => {
+        ProcessBackendNetworkMode::StrictProxy if process_proxy_boundary_configured(options) => {
             Ok(MxcNetworkDefaultPolicy::Allow)
         }
         ProcessBackendNetworkMode::StrictProxy => Err(MxcConfigError::StrictProxyRequiresAxisLayer),
@@ -1281,6 +1292,7 @@ mod tests {
                 container_id: Some("axis-bwrap".into()),
                 strict_proxy_enforced_by_axis: true,
                 resource_limits_enforced_by_axis: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1288,6 +1300,60 @@ mod tests {
             config.network.default_policy,
             MxcNetworkDefaultPolicy::Allow
         );
+    }
+
+    #[test]
+    fn process_strict_proxy_allows_mxc_configured_cooperative_proxy_boundary() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            NetworkMode::Proxy,
+        )
+        .unwrap();
+
+        let config = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-bwrap".into()),
+                cooperative_proxy_configured_by_mxc: true,
+                resource_limits_enforced_by_axis: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.network.default_policy,
+            MxcNetworkDefaultPolicy::Allow
+        );
+    }
+
+    #[test]
+    fn process_cooperative_proxy_rejects_binary_attributed_endpoint_policy() {
+        let mut policy = process_policy(NetworkMode::Proxy);
+        policy.network.policies.push(endpoint_policy_with_binary());
+        let spec = build_process_backend_execution_spec(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            process_launch(),
+            &present_runtime_for_backend(BackendCapabilityMapId::MxcLinuxBubblewrap),
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        let err = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-bwrap".into()),
+                cooperative_proxy_configured_by_mxc: true,
+                resource_limits_enforced_by_axis: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err, MxcConfigError::StrictProxyRequiresAxisLayer);
     }
 
     #[test]
@@ -1407,8 +1473,8 @@ mod tests {
             &spec,
             MxcProcessConfigOptions {
                 container_id: Some("axis-windows".into()),
-                strict_proxy_enforced_by_axis: false,
                 resource_limits_enforced_by_axis: false,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1420,8 +1486,8 @@ mod tests {
             &spec,
             MxcProcessConfigOptions {
                 container_id: Some("axis-windows".into()),
-                strict_proxy_enforced_by_axis: false,
                 resource_limits_enforced_by_axis: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1972,8 +2038,8 @@ mod tests {
     fn process_options(container_id: &str) -> MxcProcessConfigOptions {
         MxcProcessConfigOptions {
             container_id: Some(container_id.into()),
-            strict_proxy_enforced_by_axis: false,
             resource_limits_enforced_by_axis: true,
+            ..Default::default()
         }
     }
 

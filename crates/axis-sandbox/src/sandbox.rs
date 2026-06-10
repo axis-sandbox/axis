@@ -259,8 +259,10 @@ fn uses_mxc_managed_home_for_scoped_ssh(
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
-        matches!(backend, PlatformBackendSelection::LinuxMxc)
-            && !config.policy.ssh.allowed_keys.is_empty()
+        matches!(
+            effective_linux_backend(backend),
+            PlatformBackendSelection::LinuxMxc
+        ) && !config.policy.ssh.allowed_keys.is_empty()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -609,6 +611,8 @@ fn policy_path_string(path: &Path) -> Result<String, String> {
 pub(crate) enum PlatformBackendSelection {
     Default,
     #[cfg(target_os = "linux")]
+    LinuxNative,
+    #[cfg(target_os = "linux")]
     LinuxMxc,
 }
 
@@ -655,13 +659,14 @@ fn create_platform_sandbox_with_backend(
 ) -> Result<Box<dyn SandboxImpl>, SandboxError> {
     #[cfg(target_os = "linux")]
     {
-        match backend {
-            PlatformBackendSelection::Default => {
+        match effective_linux_backend(backend) {
+            PlatformBackendSelection::LinuxNative => {
                 Ok(Box::new(crate::linux::LinuxSandbox::new(config)?))
             }
             PlatformBackendSelection::LinuxMxc => {
                 Ok(Box::new(crate::linux::mxc::MxcLinuxSandbox::new(config)?))
             }
+            PlatformBackendSelection::Default => unreachable!("Linux default backend is resolved"),
         }
     }
 
@@ -685,6 +690,16 @@ fn create_platform_sandbox_with_backend(
             "platform '{}' is not yet supported",
             std::env::consts::OS
         )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_linux_backend(backend: PlatformBackendSelection) -> PlatformBackendSelection {
+    match backend {
+        PlatformBackendSelection::Default | PlatformBackendSelection::LinuxMxc => {
+            PlatformBackendSelection::LinuxMxc
+        }
+        PlatformBackendSelection::LinuxNative => PlatformBackendSelection::LinuxNative,
     }
 }
 
@@ -725,6 +740,16 @@ mod tests {
             capture_output: false,
             timeout_sec: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_process_backend_selection() -> PlatformBackendSelection {
+        PlatformBackendSelection::LinuxNative
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn native_process_backend_selection() -> PlatformBackendSelection {
+        PlatformBackendSelection::Default
     }
 
     #[test]
@@ -775,7 +800,7 @@ mod tests {
             let symlinks = prepare_managed_agent_workspace(
                 &mut config,
                 true,
-                PlatformBackendSelection::Default,
+                native_process_backend_selection(),
             )
             .unwrap();
             let codex_link = home.path().join(".codex");
@@ -843,7 +868,7 @@ mod tests {
             let symlinks = prepare_managed_agent_workspace(
                 &mut config,
                 true,
-                PlatformBackendSelection::Default,
+                native_process_backend_selection(),
             )
             .unwrap();
             let ssh_link = home.path().join(".ssh");
@@ -905,7 +930,7 @@ mod tests {
             let err = prepare_managed_agent_workspace(
                 &mut config,
                 true,
-                PlatformBackendSelection::Default,
+                native_process_backend_selection(),
             )
             .unwrap_err();
 
@@ -976,7 +1001,7 @@ mod tests {
             let exec_symlinks = prepare_managed_agent_workspace(
                 &mut config,
                 false,
-                PlatformBackendSelection::Default,
+                native_process_backend_selection(),
             )
             .unwrap();
 
@@ -1019,7 +1044,7 @@ mod tests {
             let exec_symlinks = prepare_managed_agent_workspace(
                 &mut config,
                 false,
-                PlatformBackendSelection::Default,
+                native_process_backend_selection(),
             )
             .unwrap();
 
@@ -2010,28 +2035,40 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn public_create_for_exec_uses_default_linux_backend() {
+    fn public_create_for_exec_uses_mxc_linux_backend_by_default() {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = test_config();
         config.workspace_dir = workspace.path().join("workspace");
+        config.policy.filesystem.compatibility = Compatibility::HardRequirement;
         disable_resource_limits(&mut config);
 
-        let sandbox = Sandbox::create_for_exec(config).unwrap();
+        let err = match Sandbox::create_for_exec(config) {
+            Ok(_) => panic!("default MXC backend should reject unsupported filesystem semantics"),
+            Err(err) => err,
+        };
 
-        assert_eq!(sandbox.status, SandboxStatus::Creating);
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("MXC Linux backend unsupported"));
+        assert!(err.to_string().contains("default-deny"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn public_create_uses_default_linux_backend() {
+    fn public_create_uses_mxc_linux_backend_by_default() {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = test_config();
         config.workspace_dir = workspace.path().join("workspace");
+        config.policy.filesystem.compatibility = Compatibility::HardRequirement;
         disable_resource_limits(&mut config);
 
-        let sandbox = Sandbox::create(config).unwrap();
+        let err = match Sandbox::create(config) {
+            Ok(_) => panic!("default MXC backend should reject unsupported filesystem semantics"),
+            Err(err) => err,
+        };
 
-        assert_eq!(sandbox.status, SandboxStatus::Creating);
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(err.to_string().contains("MXC Linux backend unsupported"));
+        assert!(err.to_string().contains("default-deny"));
     }
 
     #[cfg(target_os = "linux")]
@@ -2040,6 +2077,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = test_config();
         config.workspace_dir = workspace.path().join("workspace");
+        config.policy.filesystem.compatibility = Compatibility::HardRequirement;
         disable_resource_limits(&mut config);
 
         let err =

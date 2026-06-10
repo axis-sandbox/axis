@@ -588,7 +588,7 @@ impl MxcLinuxSandbox {
             tmpdir_active = true;
         }
 
-        let network_translation = mxc_network_translation_mode(&network_strategy);
+        let network_translation = mxc_network_translation_mode(&config.policy, &network_strategy);
         let spec = build_spec(config, network_translation).map_err(|err| {
             let cleanup_error =
                 cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
@@ -867,6 +867,17 @@ fn resolve_mxc_network_strategy(
                 super::strategy::ProxyStrategy::None,
             )
         }
+        NetworkMode::Proxy if !policy_requires_connect_attribution(&config.policy) => {
+            if config.proxy_port == 0 || config.proxy_addr.is_none() {
+                return Err(SandboxError::IsolationFailed(
+                    "MXC Linux cooperative proxy mode requires an AXIS proxy bind address".into(),
+                ));
+            }
+            (
+                super::strategy::NetworkStrategy::AllowHost,
+                super::strategy::ProxyStrategy::None,
+            )
+        }
         NetworkMode::Proxy => super::strategy::build_strict_proxy_strategy(
             &config.policy,
             config.id,
@@ -1029,7 +1040,10 @@ fn mxc_connect_attribution_required(
             "MXC Linux proxy mode: binary-restricted endpoint policies require connect-time attribution, which is not implemented for axis-netns-helper launch"
                 .into(),
         )),
-        _ => Ok(false),
+        _ => Err(SandboxError::IsolationFailed(
+            "MXC Linux proxy mode: binary-restricted endpoint policies require strict AXIS proxy networking"
+                .into(),
+        )),
     }
 }
 
@@ -1234,20 +1248,11 @@ impl SandboxImpl for MxcLinuxSandbox {
             None
         };
 
-        let config_fd = match sealed_mxc_config_fd(&config) {
-            Ok(fd) => fd,
-            Err(err) => {
-                super::close_fd(cgroup_procs_fd);
-                return Err(self.cleanup_for_start_failure_with_netns_fd(netns_fd, err));
-            }
-        };
-        let config_path = format!("/proc/self/fd/{config_fd}");
-
         let mut command = Command::new(self.executor.path());
         command
             .arg("--experimental")
             .arg("--config")
-            .arg(&config_path)
+            .arg(config.path())
             .current_dir(&self.workspace_dir)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -1258,7 +1263,6 @@ impl SandboxImpl for MxcLinuxSandbox {
             let stdout = match File::create(self.workspace_dir.join("stdout.log")) {
                 Ok(stdout) => stdout,
                 Err(err) => {
-                    super::close_fd(Some(config_fd));
                     super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure_with_netns_fd(
                         netns_fd,
@@ -1269,7 +1273,6 @@ impl SandboxImpl for MxcLinuxSandbox {
             let stderr = match File::create(self.workspace_dir.join("stderr.log")) {
                 Ok(stderr) => stderr,
                 Err(err) => {
-                    super::close_fd(Some(config_fd));
                     super::close_fd(cgroup_procs_fd);
                     return Err(self.cleanup_for_start_failure_with_netns_fd(
                         netns_fd,
@@ -1284,7 +1287,6 @@ impl SandboxImpl for MxcLinuxSandbox {
         let mut child_error_pipe = match super::ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
             Err(err) => {
-                super::close_fd(Some(config_fd));
                 super::close_fd(cgroup_procs_fd);
                 return Err(self.cleanup_for_start_failure_with_netns_fd(
                     netns_fd,
@@ -1430,13 +1432,6 @@ impl SandboxImpl for MxcLinuxSandbox {
                         errno,
                     ));
                 }
-                if let Err(errno) = super::clear_fd_cloexec(config_fd) {
-                    return Err(super::child_setup_error(
-                        child_error_write_fd,
-                        super::ChildSetupErrorKind::CloseFileDescriptors,
-                        errno,
-                    ));
-                }
 
                 Ok(())
             });
@@ -1446,7 +1441,6 @@ impl SandboxImpl for MxcLinuxSandbox {
             Ok(child) => {
                 super::close_fd(netns_fd);
                 super::close_fd(cgroup_procs_fd);
-                super::close_fd(Some(config_fd));
                 if let Some(pair) = seccomp_listener_pair.as_mut() {
                     pair.close_child_in_parent();
                 }
@@ -1454,7 +1448,6 @@ impl SandboxImpl for MxcLinuxSandbox {
                 child
             }
             Err(err) => {
-                super::close_fd(Some(config_fd));
                 super::close_fd(cgroup_procs_fd);
                 let err = match super::spawn_error(err, &mut child_error_pipe) {
                     SandboxError::IsolationFailed(message) => {
@@ -1906,6 +1899,7 @@ struct MxcTranslatedConfig {
 enum MxcNetworkTranslationMode {
     Standalone,
     StrictProxyEnforcedByAxis,
+    CooperativeProxyViaMxc,
 }
 
 struct MxcTranslatedFilesystem {
@@ -1918,7 +1912,7 @@ fn translate_sandbox_config_with_metadata(
     network_mode: MxcNetworkTranslationMode,
 ) -> Result<MxcTranslatedConfig, MxcTranslationError> {
     let process = translate_process(config)?;
-    translate_network(&config.policy, network_mode)?;
+    let network = translate_network(&config.policy, network_mode, config.proxy_addr)?;
     let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
     let mut spec = build_process_backend_execution_spec(
         &config.policy,
@@ -1937,6 +1931,8 @@ fn translate_sandbox_config_with_metadata(
         shared_mxc::MxcProcessConfigOptions {
             strict_proxy_enforced_by_axis: network_mode
                 == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis,
+            cooperative_proxy_configured_by_mxc: network_mode
+                == MxcNetworkTranslationMode::CooperativeProxyViaMxc,
             resource_limits_enforced_by_axis: true,
             ..Default::default()
         },
@@ -1944,6 +1940,7 @@ fn translate_sandbox_config_with_metadata(
     .map_err(|err| MxcTranslationError::Process(err.to_string()))?;
     let mut translated_spec = mxc_execution_spec_from_process_wire(wire)?;
     translated_spec.process.env = process.env;
+    translated_spec.network = network;
 
     Ok(MxcTranslatedConfig {
         spec: translated_spec,
@@ -2133,6 +2130,7 @@ fn mxc_execution_spec_from_process_wire(
                 shared_mxc::MxcNetworkDefaultPolicy::Allow => MxcNetworkDefaultPolicy::Allow,
                 shared_mxc::MxcNetworkDefaultPolicy::Block => MxcNetworkDefaultPolicy::Block,
             },
+            proxy: None,
         },
         lifecycle: Some(MxcLifecycle {
             destroy_on_exit: wire.lifecycle.destroy_on_exit,
@@ -2176,6 +2174,7 @@ fn mxc_execution_spec_from_container_wire(
                 shared_mxc::MxcNetworkDefaultPolicy::Allow => MxcNetworkDefaultPolicy::Allow,
                 shared_mxc::MxcNetworkDefaultPolicy::Block => MxcNetworkDefaultPolicy::Block,
             },
+            proxy: None,
         },
         lifecycle: Some(MxcLifecycle {
             destroy_on_exit: wire.lifecycle.destroy_on_exit,
@@ -2325,6 +2324,13 @@ pub struct MxcFilesystem {
 pub struct MxcNetwork {
     #[serde(rename = "defaultPolicy")]
     pub default_policy: MxcNetworkDefaultPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<MxcNetworkProxy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MxcNetworkProxy {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2382,17 +2388,24 @@ fn translate_filesystem(
     validate_mxc_filesystem_overlays(&expanded, &workspace)
         .map_err(MxcTranslationError::Filesystem)?;
     let root_read_substrate_acknowledged =
-        expanded_paths_grant_root_read(&expanded.read_only, &expanded.read_write);
+        expanded_paths_grant_root_read(&expanded.read_only, &expanded.read_write)
+            || matches!(policy.compatibility, Compatibility::BestEffort);
     let mut readwrite_paths = represented_paths(policy, &expanded.read_write)?;
     push_unique(&mut readwrite_paths, path_to_string(&workspace)?);
     let mut readonly_paths = represented_paths(policy, &expanded.read_only)?;
     readonly_paths.retain(|path| Path::new(path) != Path::new("/"));
+    let denied_paths = represented_paths(policy, &expanded.deny)?;
+    if matches!(policy.compatibility, Compatibility::HardRequirement) && !denied_paths.is_empty() {
+        return Err(MxcTranslationError::Filesystem(
+            "MXC Bubblewrap deniedPaths mask host contents with writable tmpfs and cannot enforce AXIS hard deny semantics".into(),
+        ));
+    }
 
     Ok(MxcTranslatedFilesystem {
         filesystem: MxcFilesystem {
             readwrite_paths,
             readonly_paths,
-            denied_paths: represented_paths(policy, &expanded.deny)?,
+            denied_paths,
         },
         root_read_substrate_acknowledged,
     })
@@ -2678,10 +2691,13 @@ fn seccomp_launcher_command_line(
 }
 
 fn mxc_network_translation_mode(
+    policy: &Policy,
     network: &super::strategy::NetworkStrategy,
 ) -> MxcNetworkTranslationMode {
     if matches!(network, super::strategy::NetworkStrategy::Proxy { .. }) {
         MxcNetworkTranslationMode::StrictProxyEnforcedByAxis
+    } else if matches!(policy.network.mode, NetworkMode::Proxy) {
+        MxcNetworkTranslationMode::CooperativeProxyViaMxc
     } else {
         MxcNetworkTranslationMode::Standalone
     }
@@ -2690,25 +2706,42 @@ fn mxc_network_translation_mode(
 fn translate_network(
     policy: &Policy,
     mode: MxcNetworkTranslationMode,
+    proxy_addr: Option<SocketAddr>,
 ) -> Result<MxcNetwork, MxcTranslationError> {
-    let default_policy = match policy.network.mode {
+    let (default_policy, proxy) = match policy.network.mode {
         NetworkMode::Allow => {
             reject_endpoint_policies(policy, "allow")?;
-            MxcNetworkDefaultPolicy::Allow
+            (MxcNetworkDefaultPolicy::Allow, None)
         }
         NetworkMode::Block => {
             reject_endpoint_policies(policy, "block")?;
-            MxcNetworkDefaultPolicy::Block
+            (MxcNetworkDefaultPolicy::Block, None)
         }
         NetworkMode::Proxy if mode == MxcNetworkTranslationMode::Standalone => {
             return Err(MxcTranslationError::ProxyModeUnsupported(
                 "MXC Bubblewrap proxy mode is cooperative env-var routing and does not preserve AXIS strict proxy isolation".into(),
             ));
         }
-        NetworkMode::Proxy => MxcNetworkDefaultPolicy::Allow,
+        NetworkMode::Proxy if mode == MxcNetworkTranslationMode::CooperativeProxyViaMxc => {
+            let proxy_addr = proxy_addr.ok_or_else(|| {
+                MxcTranslationError::ProxyModeUnsupported(
+                    "MXC cooperative proxy mode requires an AXIS proxy bind address".into(),
+                )
+            })?;
+            (
+                MxcNetworkDefaultPolicy::Allow,
+                Some(MxcNetworkProxy {
+                    url: format!("http://{proxy_addr}"),
+                }),
+            )
+        }
+        NetworkMode::Proxy => (MxcNetworkDefaultPolicy::Allow, None),
     };
 
-    Ok(MxcNetwork { default_policy })
+    Ok(MxcNetwork {
+        default_policy,
+        proxy,
+    })
 }
 
 fn reject_endpoint_policies(
@@ -2858,10 +2891,16 @@ fn production_executor_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf>
         }
     }
 
+    push_current_exe_dir_candidate(&mut candidates, &mut seen, MXC_EXECUTOR_NAME);
+
     candidates
 }
 
 fn production_seccomp_launcher_candidates() -> Vec<PathBuf> {
+    production_seccomp_launcher_candidates_for_path(std::env::var_os("PATH").as_deref())
+}
+
+fn production_seccomp_launcher_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
@@ -2873,26 +2912,39 @@ fn production_seccomp_launcher_candidates() -> Vec<PathBuf> {
         );
     }
 
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(dir) = current_exe.parent()
-    {
-        push_candidate(
-            &mut candidates,
-            &mut seen,
-            dir.join(AXIS_SECCOMP_LAUNCHER_NAME),
-        );
-        if dir.file_name().is_some_and(|name| name == "deps")
-            && let Some(parent) = dir.parent()
-        {
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
+            if dir.as_os_str().is_empty() || !dir.is_absolute() {
+                continue;
+            }
             push_candidate(
                 &mut candidates,
                 &mut seen,
-                parent.join(AXIS_SECCOMP_LAUNCHER_NAME),
+                dir.join(AXIS_SECCOMP_LAUNCHER_NAME),
             );
         }
     }
 
+    push_current_exe_dir_candidate(&mut candidates, &mut seen, AXIS_SECCOMP_LAUNCHER_NAME);
+
     candidates
+}
+
+fn push_current_exe_dir_candidate(
+    candidates: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    name: &str,
+) {
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        push_candidate(candidates, seen, dir.join(name));
+        if dir.file_name().is_some_and(|name| name == "deps")
+            && let Some(parent) = dir.parent()
+        {
+            push_candidate(candidates, seen, parent.join(name));
+        }
+    }
 }
 
 fn push_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, candidate: PathBuf) {
@@ -3277,14 +3329,13 @@ mod tests {
     }
 
     #[test]
-    fn full_bubblewrap_spec_fails_closed_until_filesystem_default_deny_is_supported() {
+    fn hard_requirement_bubblewrap_spec_fails_without_root_read_acknowledgement() {
         let workspace = tempfile::tempdir().unwrap();
+        let mut policy = policy(NetworkMode::Block);
+        policy.filesystem.compatibility = Compatibility::HardRequirement;
 
-        let err = MxcExecutionSpec::from_sandbox_config(&config(
-            policy(NetworkMode::Block),
-            workspace.path().into(),
-        ))
-        .unwrap_err();
+        let err = MxcExecutionSpec::from_sandbox_config(&config(policy, workspace.path().into()))
+            .unwrap_err();
 
         assert_eq!(err, MxcTranslationError::FilesystemDefaultDenyUnsupported);
         assert!(err.to_string().contains("host root read-only"));
@@ -3348,6 +3399,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
+        assert!(spec.network.proxy.is_none());
+    }
+
+    #[test]
+    fn proxy_mode_maps_to_mxc_external_proxy_when_cooperative_proxy_is_selected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Proxy),
+            workspace.path().into(),
+        );
+        config.proxy_addr = Some("127.0.0.1:31".parse().unwrap());
+
+        let spec = MxcExecutionSpec::from_sandbox_config_with_network_mode(
+            &config,
+            MxcNetworkTranslationMode::CooperativeProxyViaMxc,
+        )
+        .unwrap();
+
+        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
+        assert_eq!(
+            spec.network.proxy,
+            Some(MxcNetworkProxy {
+                url: "http://127.0.0.1:31".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn cooperative_proxy_mode_requires_axis_proxy_bind_address() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = config(
+            mxc_representable_policy(NetworkMode::Proxy),
+            workspace.path().into(),
+        );
+
+        let err = MxcExecutionSpec::from_sandbox_config_with_network_mode(
+            &config,
+            MxcNetworkTranslationMode::CooperativeProxyViaMxc,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::ProxyModeUnsupported(_)));
+        assert!(err.to_string().contains("proxy bind address"));
     }
 
     #[test]
@@ -3966,15 +4060,13 @@ mod tests {
     fn full_spec_allows_explicit_root_read_grant_for_mxc_bubblewrap() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
-        let denied = root.path().join("outside-denied");
         std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir(&denied).unwrap();
         let mut policy = policy(NetworkMode::Block);
         policy.filesystem = FilesystemPolicy {
             read_only: vec!["/".into()],
             read_write: vec!["{workspace}".into()],
-            deny: vec![denied.to_string_lossy().into_owned()],
             compatibility: Compatibility::HardRequirement,
+            ..FilesystemPolicy::default()
         };
 
         let spec =
@@ -3994,7 +4086,28 @@ mod tests {
                 .iter()
                 .any(|path| path == &path_string(&workspace))
         );
-        assert_eq!(spec.filesystem.denied_paths, vec![path_string(&denied)]);
+        assert!(spec.filesystem.denied_paths.is_empty());
+    }
+
+    #[test]
+    fn hard_requirement_denied_paths_fail_closed_for_mxc_bubblewrap_masks() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let denied = root.path().join("outside-denied");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&denied).unwrap();
+        let mut policy = policy(NetworkMode::Block);
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec!["/".into()],
+            read_write: vec!["{workspace}".into()],
+            deny: vec![denied.to_string_lossy().into_owned()],
+            compatibility: Compatibility::HardRequirement,
+        };
+
+        let err = MxcExecutionSpec::from_sandbox_config(&config(policy, workspace)).unwrap_err();
+
+        assert!(matches!(err, MxcTranslationError::Filesystem(_)));
+        assert!(err.to_string().contains("hard deny semantics"));
     }
 
     #[test]
@@ -4254,7 +4367,7 @@ mod tests {
     }
 
     #[test]
-    fn production_executor_candidates_include_package_dirs_and_path_dirs() {
+    fn production_executor_candidates_include_package_path_and_current_exe_dirs() {
         let candidates = production_executor_candidates_for_path(Some(OsStr::new(
             "/home/test/.local/bin:relative:/usr/bin:/opt/axis/bin",
         )));
@@ -4267,6 +4380,13 @@ mod tests {
         assert!(candidates.contains(&Path::new("/home/test/.local/bin").join(MXC_EXECUTOR_NAME)));
         assert!(candidates.contains(&Path::new("/opt/axis/bin").join(MXC_EXECUTOR_NAME)));
         assert!(!candidates.contains(&Path::new("relative").join(MXC_EXECUTOR_NAME)));
+        let current_exe = std::env::current_exe().unwrap();
+        let current_dir = current_exe.parent().unwrap();
+        assert!(candidates.contains(&current_dir.join(MXC_EXECUTOR_NAME)));
+        if current_dir.file_name().is_some_and(|name| name == "deps") {
+            let parent = current_dir.parent().unwrap();
+            assert!(candidates.contains(&parent.join(MXC_EXECUTOR_NAME)));
+        }
         assert_eq!(
             candidates
                 .iter()
@@ -4277,8 +4397,10 @@ mod tests {
     }
 
     #[test]
-    fn production_seccomp_launcher_candidates_include_package_dirs_and_current_exe_dir() {
-        let candidates = production_seccomp_launcher_candidates();
+    fn production_seccomp_launcher_candidates_include_package_path_and_current_exe_dirs() {
+        let candidates = production_seccomp_launcher_candidates_for_path(Some(OsStr::new(
+            "/home/test/.local/bin:relative:/usr/bin:/opt/axis/bin",
+        )));
 
         for dir in AXIS_SECCOMP_LAUNCHER_DIRS {
             assert!(
@@ -4286,6 +4408,12 @@ mod tests {
                 "missing packaged seccomp launcher dir: {dir}"
             );
         }
+        assert!(
+            candidates
+                .contains(&Path::new("/home/test/.local/bin").join(AXIS_SECCOMP_LAUNCHER_NAME))
+        );
+        assert!(candidates.contains(&Path::new("/opt/axis/bin").join(AXIS_SECCOMP_LAUNCHER_NAME)));
+        assert!(!candidates.contains(&Path::new("relative").join(AXIS_SECCOMP_LAUNCHER_NAME)));
 
         let current_exe = std::env::current_exe().unwrap();
         let current_dir = current_exe.parent().unwrap();
@@ -4748,6 +4876,7 @@ mod tests {
         write_executable(&launcher_path, "#!/bin/sh\nexit 127\n", 0o700);
         let launcher = MxcSeccompLauncher::from_injected_path(&launcher_path).unwrap();
         let mut policy = mxc_representable_policy(NetworkMode::Allow);
+        policy.filesystem.compatibility = Compatibility::BestEffort;
         policy
             .filesystem
             .deny
@@ -4952,9 +5081,12 @@ mod tests {
             "mxc-stderr\n"
         );
         let config_path = fs::read_to_string(config_path_record).unwrap();
+        let config_path = config_path.trim();
         assert!(
-            config_path.trim().starts_with("/proc/self/fd/"),
-            "runtime MXC config should be passed by inherited fd, got {config_path:?}"
+            config_path.starts_with(std::env::temp_dir().to_string_lossy().as_ref())
+                && config_path.contains("axis-mxc-")
+                && config_path.ends_with(".json"),
+            "runtime MXC config should be passed by private temp path, got {config_path:?}"
         );
         assert!(sandbox.config_file.is_none());
         let config_json = fs::read_to_string(config_copy).unwrap();
@@ -5636,9 +5768,12 @@ mod tests {
             "lxc-stderr\n"
         );
         let config_path = fs::read_to_string(config_path_record).unwrap();
+        let config_path = config_path.trim();
         assert!(
-            config_path.trim().starts_with("/proc/self/fd/"),
-            "runtime LXC config should be passed by inherited fd, got {config_path:?}"
+            config_path.starts_with(std::env::temp_dir().to_string_lossy().as_ref())
+                && config_path.contains("axis-mxc-")
+                && config_path.ends_with(".json"),
+            "runtime LXC config should be passed by private temp path, got {config_path:?}"
         );
         assert!(sandbox.config_file.is_none());
         assert!(sandbox.seccomp_filter_file.is_none());
@@ -6164,7 +6299,7 @@ mod tests {
         allow_listener.set_nonblocking(true).unwrap();
         let allow_port = allow_listener.local_addr().unwrap().port();
         let mut allow_config = config(
-            mxc_filesystem_policy(NetworkMode::Allow, &rw_dir, &denied_dir),
+            mxc_filesystem_policy(NetworkMode::Allow, &ro_dir, &rw_dir, &denied_dir),
             allow_workspace.clone(),
         );
         allow_config.command = python.to_string_lossy().into_owned();
@@ -6212,12 +6347,16 @@ mod tests {
             fs::read_to_string(allow_workspace.join("workspace.txt")).unwrap(),
             "workspace"
         );
+        assert!(
+            !denied_dir.join("new.txt").exists(),
+            "MXC deniedPath tmpfs mask must not write through to the host path"
+        );
         allow_sandbox.destroy().unwrap();
 
         let block_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let block_port = block_listener.local_addr().unwrap().port();
         let mut block_config = config(
-            mxc_filesystem_policy(NetworkMode::Block, &rw_dir, &denied_dir),
+            mxc_filesystem_policy(NetworkMode::Block, &ro_dir, &rw_dir, &denied_dir),
             block_workspace.clone(),
         );
         block_config.command = python.to_string_lossy().into_owned();
@@ -6822,10 +6961,16 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
 
     fn mxc_filesystem_policy(
         network_mode: NetworkMode,
+        ro_dir: &Path,
         rw_dir: &Path,
         denied_dir: &Path,
     ) -> Policy {
         let mut policy = mxc_representable_policy(network_mode);
+        policy.filesystem.compatibility = Compatibility::BestEffort;
+        policy
+            .filesystem
+            .read_only
+            .push(ro_dir.to_string_lossy().into_owned());
         policy
             .filesystem
             .read_write
@@ -7267,13 +7412,7 @@ except OSError:
 else:
     print("denied file was readable", file=sys.stderr)
     sys.exit(12)
-try:
-    denied_dir.joinpath("new.txt").write_text("denied-write")
-except OSError:
-    pass
-else:
-    print("denied directory was writable", file=sys.stderr)
-    sys.exit(13)
+denied_dir.joinpath("new.txt").write_text("masked-write")
 
 sock = socket.create_connection(("127.0.0.1", int(os.environ["ALLOW_PORT"])), 3)
 sock.sendall(b"allow-probe")
