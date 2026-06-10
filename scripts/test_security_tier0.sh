@@ -24,5 +24,8 @@ echo "--- Shared container backend planner ---"
 echo "--- Shared VM backend planner ---"
 "${CARGO_BIN}" test -p axis-core vm_backend
 
+echo "--- Shared MXC wire config generation ---"
+"${CARGO_BIN}" test -p axis-core mxc_config
+
 echo "--- MXC fake executor and translation paths ---"
 "${CARGO_BIN}" test -p axis-sandbox mxc -- --skip gated_
