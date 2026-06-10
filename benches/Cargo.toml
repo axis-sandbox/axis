@@ -24,6 +24,10 @@ path = "opa_scenarios.rs"
 name = "mxc-isolation-matrix"
 path = "mxc_isolation_matrix.rs"
 
+[[bin]]
+name = "runtime-metrics"
+path = "runtime_metrics.rs"
+
 [dependencies]
 axis-core = { workspace = true }
 axis-sandbox = { workspace = true }
