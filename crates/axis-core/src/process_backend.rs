@@ -730,6 +730,101 @@ mod tests {
     }
 
     #[test]
+    fn process_resource_limits_are_planned_or_rejected_by_backend() {
+        let mut policy = process_policy(NetworkMode::Allow);
+        policy.process.max_processes = 8;
+        policy.process.max_memory_mb = 256;
+        policy.process.cpu_rate_percent = 50;
+
+        for descriptor in process_backend_descriptors() {
+            let runtime = present_runtime_for_backend(descriptor.id);
+            let plan = plan_process_backend_policy(
+                &policy,
+                descriptor.id,
+                &runtime,
+                &PlannerOptions::new(),
+            )
+            .unwrap_or_else(|| panic!("{} should be a process backend", descriptor.id.as_str()));
+
+            for requirement in [
+                "resources.process_count",
+                "resources.memory",
+                "resources.cpu",
+                "cleanup.resources",
+            ] {
+                assert!(
+                    plan.policy_plan
+                        .decisions
+                        .iter()
+                        .any(|decision| decision.requirement == requirement),
+                    "{} missing planner decision {requirement}",
+                    descriptor.id.as_str()
+                );
+            }
+
+            match descriptor.id {
+                BackendCapabilityMapId::AxisNativeLinux
+                | BackendCapabilityMapId::MxcLinuxBubblewrap
+                | BackendCapabilityMapId::AxisNativeWindows
+                | BackendCapabilityMapId::MxcWindowsProcessContainer => {
+                    assert!(
+                        plan.spawn_allowed(),
+                        "{} should accept resource limits with declared dependencies present: {:?}",
+                        descriptor.id.as_str(),
+                        plan.pre_spawn_error()
+                    );
+                }
+                BackendCapabilityMapId::AxisNativeMacosSeatbelt
+                | BackendCapabilityMapId::MxcMacosSeatbelt => {
+                    assert!(
+                        !plan.spawn_allowed(),
+                        "{} should reject resource limits that do not have exact AXIS semantics",
+                        descriptor.id.as_str()
+                    );
+                    let error = plan.pre_spawn_error().unwrap();
+                    assert!(error.contains("resources.memory"), "{error}");
+                    assert!(error.contains("resources.cpu"), "{error}");
+                }
+                other => panic!("unexpected process backend descriptor {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn windows_process_resources_require_job_object_dependency() {
+        let mut policy = process_policy(NetworkMode::Allow);
+        policy.process.max_processes = 8;
+        policy.process.max_memory_mb = 256;
+        policy.process.cpu_rate_percent = 50;
+
+        for id in [
+            BackendCapabilityMapId::AxisNativeWindows,
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+        ] {
+            let runtime = RuntimeProbeSnapshot::new()
+                .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+                .with_dependency(
+                    host_dependency::WINDOWS_PROCESS_CONTAINER,
+                    DependencyState::Present,
+                )
+                .with_dependency(
+                    host_dependency::WINDOWS_LOW_INTEGRITY,
+                    DependencyState::Present,
+                );
+            let plan =
+                plan_process_backend_policy(&policy, id, &runtime, &PlannerOptions::new()).unwrap();
+
+            assert!(!plan.spawn_allowed(), "{id:?}");
+            let error = plan.pre_spawn_error().unwrap();
+            assert!(error.contains("resources.process_count"), "{error}");
+            assert!(
+                error.contains(host_dependency::WINDOWS_JOBOBJECT),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn planner_records_process_surfaces_for_mxc_linux() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
