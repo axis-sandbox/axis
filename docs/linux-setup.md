@@ -172,6 +172,8 @@ AXIS_REAL_CGROUP_TESTS=1 cargo test -p axis-sandbox gated_real_cgroup
 AXIS_REAL_NETNS_TESTS=1 cargo test -p axis-sandbox gated_real_ip_netns
 AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh
 AXIS_RUN_MXC_HYPERLIGHT_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh
+AXIS_BENCH_MXC_MICROVM=1 bash e2e/linux/bench_mxc_vm.sh
+AXIS_BENCH_MXC_HYPERLIGHT=1 bash e2e/linux/bench_mxc_vm.sh
 AXIS_RUN_PRIVILEGED_E2E=1 bash e2e/linux/test_netns_helper_launch.sh
 ```
 
