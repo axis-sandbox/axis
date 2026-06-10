@@ -89,6 +89,8 @@ visible skip into a failure.
 | `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution proofs. |
 | `AXIS_TEST_RUN_AS_USER=<user>` | 3 | Run identity/resource fallback tests for an existing non-root user. |
 | `AXIS_REAL_MXC_PROXY_TESTS=1` | 3 | Run real MXC strict proxy tests when executor, launcher, and network prerequisites are present. |
+| `AXIS_RUN_MXC_MICROVM_E2E=1` | 3 | Run Linux MXC MicroVM smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
+| `AXIS_RUN_MXC_HYPERLIGHT_E2E=1` | 3 | Run Linux MXC Hyperlight smoke tests when a safe `lxc-exec` or `AXIS_TEST_MXC_EXECUTOR`, KVM access, and runtime artifacts are present. |
 | `AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1` | 4 | Run tests against an installed privileged netns helper in a prepared runner. |
 | `AXIS_RUN_PRIVILEGED_E2E=1` | 4 | Run the disposable privileged helper e2e script. |
 | `AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E=1` | 4 | Treat missing built proxy prerequisites as failures. |
