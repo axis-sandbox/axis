@@ -11,7 +11,7 @@ use axis_core::connect_attribution::{
 };
 use axis_core::policy::Policy;
 use axis_core::types::SandboxId;
-use axis_proxy::proxy::{AxisProxy, ProxyConfig, ProxyTimingOutcome};
+use axis_proxy::proxy::{AxisProxy, ProxyConfig, ProxyTimingEvent, ProxyTimingOutcome};
 use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -148,6 +148,96 @@ async fn denied_connect_emits_phase_timing_event() {
     assert!(phases.contains(&"opa_evaluation"));
     assert!(phases.contains(&"response_write"));
     assert!(phases.contains(&"total"));
+}
+
+#[tokio::test]
+async fn host_port_only_denied_connect_skips_identity_attribution() {
+    let policy = Policy::from_yaml(TEST_POLICY).unwrap();
+    let sandbox_id = SandboxId::new();
+    let (timing_tx, mut timing_rx) = tokio::sync::mpsc::unbounded_channel();
+    let config = ProxyConfig {
+        sandbox_id,
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        policy,
+        enable_l7: false,
+        enable_leak_detection: false,
+        upstream_tls_roots_pem: Vec::new(),
+        inference_endpoint: None,
+        connect_attribution: Some(ConnectAttributionStore::new(
+            std::time::Duration::from_secs(30),
+        )),
+        timing_tx: Some(timing_tx),
+    };
+    let mut proxy = AxisProxy::new(config).unwrap();
+    let addr = proxy.bind().await.unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    let status = send_connect(addr, "blocked.example.com:443").await;
+    assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), timing_rx.recv())
+        .await
+        .unwrap()
+        .expect("proxy should emit timing for denied CONNECT");
+    proxy_task.abort();
+
+    assert_eq!(event.outcome, ProxyTimingOutcome::Denied);
+    assert_eq!(
+        timing_phase_duration(&event, "identity_attribution"),
+        Some(std::time::Duration::ZERO)
+    );
+}
+
+#[tokio::test]
+async fn host_port_only_allowed_connect_skips_identity_attribution() {
+    let policy = Policy::from_yaml(TEST_POLICY).unwrap();
+    let sandbox_id = SandboxId::new();
+    let upstream = start_mock_tcp_server().await;
+    let (timing_tx, mut timing_rx) = tokio::sync::mpsc::unbounded_channel();
+    let config = ProxyConfig {
+        sandbox_id,
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        policy,
+        enable_l7: false,
+        enable_leak_detection: false,
+        upstream_tls_roots_pem: Vec::new(),
+        inference_endpoint: Some(upstream),
+        connect_attribution: Some(ConnectAttributionStore::new(
+            std::time::Duration::from_secs(30),
+        )),
+        timing_tx: Some(timing_tx),
+    };
+    let mut proxy = AxisProxy::new(config).unwrap();
+    let addr = proxy.bind().await.unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    let status = send_connect(addr, "inference.local:443").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), timing_rx.recv())
+        .await
+        .unwrap()
+        .expect("proxy should emit timing for allowed CONNECT");
+    proxy_task.abort();
+
+    assert_eq!(event.outcome, ProxyTimingOutcome::Allowed);
+    assert_eq!(
+        timing_phase_duration(&event, "identity_attribution"),
+        Some(std::time::Duration::ZERO)
+    );
+}
+
+fn timing_phase_duration(
+    event: &ProxyTimingEvent,
+    phase_name: &'static str,
+) -> Option<std::time::Duration> {
+    event
+        .phases
+        .iter()
+        .find(|phase| phase.phase == phase_name)
+        .map(|phase| phase.duration)
 }
 
 async fn start_mock_tcp_server() -> std::net::SocketAddr {

@@ -324,25 +324,35 @@ async fn handle_connection(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut timing = ProxyConnectionTimer::start();
-    let phase_start = Instant::now();
-    let binary_identity = resolve_binary_identity(sandbox_id, peer_addr, proxy_addr, &state).await;
-    timing.record("identity_attribution", phase_start.elapsed());
-    let identity_check = {
-        let mut st = state.lock().unwrap();
-        verify_binary_identity(&mut st.tofu_store, binary_identity)
+    let requires_connect_attribution = {
+        let st = state.lock().unwrap();
+        st.requires_connect_attribution
     };
-    let (binary_path, binary_sha256) = match identity_check {
-        Ok(identity) => identity,
-        Err(e) => {
-            tracing::warn!("sandbox {sandbox_id}: binary identity check failed: {e}");
-            send_forbidden_response(
-                &mut stream,
-                "AXIS policy denied connection\r\nReason: binary identity check failed\r\n",
-            )
-            .await?;
-            timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
-            return Ok(());
+    let (binary_path, binary_sha256) = if requires_connect_attribution {
+        let phase_start = Instant::now();
+        let binary_identity =
+            resolve_binary_identity(sandbox_id, peer_addr, proxy_addr, &state).await;
+        timing.record("identity_attribution", phase_start.elapsed());
+        let identity_check = {
+            let mut st = state.lock().unwrap();
+            verify_binary_identity(&mut st.tofu_store, binary_identity)
+        };
+        match identity_check {
+            Ok(identity) => identity,
+            Err(e) => {
+                tracing::warn!("sandbox {sandbox_id}: binary identity check failed: {e}");
+                send_forbidden_response(
+                    &mut stream,
+                    "AXIS policy denied connection\r\nReason: binary identity check failed\r\n",
+                )
+                .await?;
+                timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
+                return Ok(());
+            }
         }
+    } else {
+        timing.record("identity_attribution", Duration::ZERO);
+        ("unknown".into(), "unknown".into())
     };
 
     let mut reader = BufReader::new(stream);
