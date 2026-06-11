@@ -1,8 +1,9 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compare the success-metrics subset across runtime provider selections.
+//! Compare phase-rich startup and proxy metrics across named runtime profiles.
 
+use axis_core::connect_attribution::ConnectAttributionStore;
 use axis_core::policy::Policy;
 use axis_core::types::SandboxId;
 use axis_proxy::proxy::{AxisProxy, ProxyConfig, ProxyTimingEvent, ProxyTimingOutcome};
@@ -17,19 +18,35 @@ const DEFAULT_STARTUP_SAMPLES: usize = 10;
 const DEFAULT_OPA_EVALS: u64 = 50_000;
 const DEFAULT_PROXY_BASELINE_CONNS: u32 = 50;
 const DEFAULT_PROXY_REQUESTS: u32 = 100;
-const STARTUP_POLICY_PROFILE: &str = "process_limits_disabled";
+const STRICT_PROXY_PORT: u16 = 31_280;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = BenchmarkConfig::from_env()?;
     let mut rows = Vec::new();
 
-    for provider in &config.providers {
-        rows.push(benchmark_provider(*provider, &config).await?);
+    for profile in &config.profiles {
+        if !config.providers.contains(&profile.provider()) {
+            continue;
+        }
+        rows.push(benchmark_profile(*profile, &config).await?);
     }
 
     let report = RuntimeMetricsReport {
-        startup_policy_profile: STARTUP_POLICY_PROFILE,
+        profiles: config
+            .profiles
+            .iter()
+            .map(|profile| profile.as_str())
+            .collect(),
+        providers: config
+            .providers
+            .iter()
+            .map(|provider| provider.as_str())
+            .collect(),
+        profile_definitions: RuntimeProfileCase::all()
+            .iter()
+            .map(|profile| profile.definition())
+            .collect(),
         startup_samples: config.startup_samples,
         opa_evals: config.opa_evals,
         proxy_baseline_connections: config.proxy_baseline_connections,
@@ -44,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Clone)]
 struct BenchmarkConfig {
+    profiles: Vec<RuntimeProfileCase>,
     providers: Vec<RuntimeProviderCase>,
     startup_samples: usize,
     opa_evals: u64,
@@ -53,6 +71,13 @@ struct BenchmarkConfig {
 
 impl BenchmarkConfig {
     fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let profiles = match std::env::var("AXIS_RUNTIME_METRICS_PROFILES") {
+            Ok(value) => parse_profiles(&value)?,
+            Err(_) => RuntimeProfileCase::all().to_vec(),
+        };
+        if profiles.is_empty() {
+            return Err("AXIS_RUNTIME_METRICS_PROFILES must not be empty".into());
+        }
         let providers = match std::env::var("AXIS_RUNTIME_METRICS_PROVIDERS") {
             Ok(value) => parse_providers(&value)?,
             Err(_) => RuntimeProviderCase::all().to_vec(),
@@ -62,6 +87,7 @@ impl BenchmarkConfig {
         }
 
         Ok(Self {
+            profiles,
             providers,
             startup_samples: env_usize(
                 "AXIS_RUNTIME_METRICS_STARTUP_SAMPLES",
@@ -137,6 +163,88 @@ impl RuntimeProviderCase {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfileCase {
+    MainCompat,
+    AxisNative,
+    MxcProcess,
+    BinaryAttribution,
+    Interactive,
+}
+
+impl RuntimeProfileCase {
+    fn all() -> &'static [Self] {
+        &[
+            Self::MainCompat,
+            Self::AxisNative,
+            Self::MxcProcess,
+            Self::BinaryAttribution,
+            Self::Interactive,
+        ]
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MainCompat => "main_compat",
+            Self::AxisNative => "axis_native",
+            Self::MxcProcess => "mxc_process",
+            Self::BinaryAttribution => "binary_attribution",
+            Self::Interactive => "interactive",
+        }
+    }
+
+    fn provider(self) -> RuntimeProviderCase {
+        match self {
+            Self::MainCompat | Self::AxisNative => RuntimeProviderCase::AxisNative,
+            Self::MxcProcess | Self::BinaryAttribution | Self::Interactive => {
+                RuntimeProviderCase::Mxc
+            }
+        }
+    }
+
+    fn is_apples_to_apples(self) -> bool {
+        matches!(self, Self::MainCompat)
+    }
+
+    fn policy_surface(self) -> &'static str {
+        match self {
+            Self::MainCompat => "success-metrics-compatible minimal process policy",
+            Self::AxisNative => "AXIS native Landlock/seccomp process path with limits disabled",
+            Self::MxcProcess => {
+                "MXC Bubblewrap process path with AXIS policy layers and limits disabled"
+            }
+            Self::BinaryAttribution => {
+                "strict proxy policy with binary-restricted endpoint rules and connect-time attribution"
+            }
+            Self::Interactive => "MXC process path with interactive PTY bridge enabled",
+        }
+    }
+
+    fn dependency_gate(self) -> &'static str {
+        match self {
+            Self::MainCompat | Self::AxisNative => {
+                "requires native AXIS process isolation support on this platform"
+            }
+            Self::MxcProcess => "requires a safe MXC process executor",
+            Self::BinaryAttribution => {
+                "requires strict proxy setup and connect-time attribution support"
+            }
+            Self::Interactive => "requires a safe MXC process executor and PTY bridge support",
+        }
+    }
+
+    fn definition(self) -> RuntimeProfileDefinition {
+        RuntimeProfileDefinition {
+            name: self.as_str(),
+            runtime_containment: "process",
+            runtime_provider: self.provider().as_str(),
+            apples_to_apples_with_success_metrics: self.is_apples_to_apples(),
+            policy_surface: self.policy_surface(),
+            dependency_gate: self.dependency_gate(),
+        }
+    }
+}
+
 fn parse_providers(value: &str) -> Result<Vec<RuntimeProviderCase>, Box<dyn std::error::Error>> {
     value
         .split(',')
@@ -150,9 +258,28 @@ fn parse_providers(value: &str) -> Result<Vec<RuntimeProviderCase>, Box<dyn std:
         .collect()
 }
 
+fn parse_profiles(value: &str) -> Result<Vec<RuntimeProfileCase>, Box<dyn std::error::Error>> {
+    value
+        .split(',')
+        .map(|raw| match raw.trim() {
+            "main_compat" | "main-compatible" | "main-compat" => Ok(RuntimeProfileCase::MainCompat),
+            "axis_native" | "axis-native" => Ok(RuntimeProfileCase::AxisNative),
+            "mxc_process" | "mxc-process" | "mxc" => Ok(RuntimeProfileCase::MxcProcess),
+            "binary_attribution" | "binary-attribution" => {
+                Ok(RuntimeProfileCase::BinaryAttribution)
+            }
+            "interactive" => Ok(RuntimeProfileCase::Interactive),
+            "" => Err("empty runtime profile in AXIS_RUNTIME_METRICS_PROFILES".into()),
+            other => Err(format!("unknown runtime profile '{other}'").into()),
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
 struct RuntimeMetricsReport {
-    startup_policy_profile: &'static str,
+    profiles: Vec<&'static str>,
+    providers: Vec<&'static str>,
+    profile_definitions: Vec<RuntimeProfileDefinition>,
     startup_samples: usize,
     opa_evals: u64,
     proxy_baseline_connections: u32,
@@ -161,41 +288,62 @@ struct RuntimeMetricsReport {
 }
 
 #[derive(Debug, Serialize)]
-struct RuntimeMetricsRow {
+struct RuntimeProfileDefinition {
+    name: &'static str,
     runtime_containment: &'static str,
     runtime_provider: &'static str,
+    apples_to_apples_with_success_metrics: bool,
+    policy_surface: &'static str,
+    dependency_gate: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RuntimeMetricsRow {
+    Ok {
+        profile: &'static str,
+        runtime_containment: &'static str,
+        runtime_provider: &'static str,
+        apples_to_apples_with_success_metrics: bool,
+        policy_surface: &'static str,
+        startup: StartupReport,
+        cold_proxy_deny: ColdProxyReport,
+        synthetic_opa: SyntheticOpaReport,
+    },
+    Error {
+        profile: &'static str,
+        runtime_containment: &'static str,
+        runtime_provider: &'static str,
+        apples_to_apples_with_success_metrics: bool,
+        policy_surface: &'static str,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeMetricSet {
     startup: StartupReport,
     cold_proxy_deny: ColdProxyReport,
     synthetic_opa: SyntheticOpaReport,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum StartupReport {
-    Ok {
-        median_ms: f64,
-        p99_ms: f64,
-        samples_ms: Vec<f64>,
-        phases: Vec<PhaseReport>,
-    },
-    Error {
-        sample_index: usize,
-        error: String,
-    },
+struct StartupReport {
+    median_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    samples_ms: Vec<f64>,
+    phases: Vec<PhaseReport>,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum ColdProxyReport {
-    Ok {
-        latency_ms: f64,
-        baseline_ms: f64,
-        total_ms: f64,
-        phases: Vec<PhaseReport>,
-    },
-    Error {
-        reason: String,
-    },
+struct ColdProxyReport {
+    latency_ms: f64,
+    baseline_ms: f64,
+    total_ms: f64,
+    phases: Vec<PhaseReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,7 +356,10 @@ struct SyntheticOpaReport {
 struct PhaseReport {
     phase: String,
     median_ms: f64,
+    p95_ms: f64,
     p99_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
     samples_ms: Vec<f64>,
 }
 
@@ -224,34 +375,64 @@ struct PhaseSample {
     duration: Duration,
 }
 
-async fn benchmark_provider(
-    provider: RuntimeProviderCase,
+async fn benchmark_profile(
+    profile: RuntimeProfileCase,
     config: &BenchmarkConfig,
 ) -> Result<RuntimeMetricsRow, Box<dyn std::error::Error>> {
-    Ok(RuntimeMetricsRow {
-        runtime_containment: "process",
-        runtime_provider: provider.as_str(),
-        startup: benchmark_startup(provider, config.startup_samples).await,
+    let definition = profile.definition();
+    let metrics = match benchmark_profile_metrics(profile, config).await {
+        Ok(metrics) => metrics,
+        Err(err) => {
+            return Ok(RuntimeMetricsRow::Error {
+                profile: definition.name,
+                runtime_containment: definition.runtime_containment,
+                runtime_provider: definition.runtime_provider,
+                apples_to_apples_with_success_metrics: definition
+                    .apples_to_apples_with_success_metrics,
+                policy_surface: definition.policy_surface,
+                reason: err.to_string(),
+            });
+        }
+    };
+
+    Ok(RuntimeMetricsRow::Ok {
+        profile: definition.name,
+        runtime_containment: definition.runtime_containment,
+        runtime_provider: definition.runtime_provider,
+        apples_to_apples_with_success_metrics: definition.apples_to_apples_with_success_metrics,
+        policy_surface: definition.policy_surface,
+        startup: metrics.startup,
+        cold_proxy_deny: metrics.cold_proxy_deny,
+        synthetic_opa: metrics.synthetic_opa,
+    })
+}
+
+async fn benchmark_profile_metrics(
+    profile: RuntimeProfileCase,
+    config: &BenchmarkConfig,
+) -> Result<RuntimeMetricSet, Box<dyn std::error::Error>> {
+    Ok(RuntimeMetricSet {
+        startup: benchmark_startup(profile, config.startup_samples).await?,
         cold_proxy_deny: benchmark_cold_proxy_deny(
-            provider,
+            profile,
             config.proxy_baseline_connections,
             config.proxy_requests,
         )
-        .await,
+        .await?,
         synthetic_opa: benchmark_synthetic_opa(config.opa_evals),
     })
 }
 
-async fn benchmark_startup(provider: RuntimeProviderCase, samples: usize) -> StartupReport {
+async fn benchmark_startup(
+    profile: RuntimeProfileCase,
+    samples: usize,
+) -> Result<StartupReport, String> {
     let mut startup_samples = Vec::with_capacity(samples);
     for sample_index in 0..samples {
-        match measure_sandbox_startup(provider).await {
+        match measure_sandbox_startup(profile).await {
             Ok(sample) => startup_samples.push(sample),
             Err(err) => {
-                return StartupReport::Error {
-                    sample_index,
-                    error: err,
-                };
+                return Err(format!("startup sample {sample_index}: {err}"));
             }
         }
     }
@@ -266,16 +447,20 @@ async fn benchmark_startup(provider: RuntimeProviderCase, samples: usize) -> Sta
         .iter()
         .map(|sample| sample.phases.clone())
         .collect::<Vec<_>>();
-    StartupReport::Ok {
-        median_ms: duration_ms(sorted[sorted.len() / 2]),
-        p99_ms: duration_ms(sorted[sorted.len() * 99 / 100]),
+    Ok(StartupReport {
+        median_ms: duration_ms(percentile_sorted(&sorted, 50)),
+        p95_ms: duration_ms(percentile_sorted(&sorted, 95)),
+        p99_ms: duration_ms(percentile_sorted(&sorted, 99)),
+        min_ms: duration_ms(sorted[0]),
+        max_ms: duration_ms(sorted[sorted.len() - 1]),
         samples_ms: durations.into_iter().map(duration_ms).collect(),
         phases: summarize_phase_samples(&phase_samples),
-    }
+    })
 }
 
-async fn measure_sandbox_startup(provider: RuntimeProviderCase) -> Result<StartupSample, String> {
-    let policy = startup_policy(provider).map_err(|err| err.to_string())?;
+async fn measure_sandbox_startup(profile: RuntimeProfileCase) -> Result<StartupSample, String> {
+    let sandbox_id = SandboxId::new();
+    let policy = startup_policy(profile).map_err(|err| err.to_string())?;
     let workspace = tempfile::tempdir().map_err(|err| err.to_string())?;
     let trace = StartupTrace::new();
 
@@ -290,19 +475,21 @@ async fn measure_sandbox_startup(provider: RuntimeProviderCase) -> Result<Startu
         Vec::new()
     };
 
+    let (proxy_port, proxy_addr, connect_attribution) =
+        startup_proxy_config(profile, sandbox_id, &policy);
     let config = SandboxConfig {
-        id: SandboxId::new(),
+        id: sandbox_id,
         policy,
         command,
         args,
         working_dir: None,
         workspace_dir: workspace.path().to_path_buf(),
         env: Vec::new(),
-        proxy_port: 0,
-        proxy_addr: None,
-        connect_attribution: None,
+        proxy_port,
+        proxy_addr,
+        connect_attribution,
         capture_output: false,
-        interactive_terminal: false,
+        interactive_terminal: profile == RuntimeProfileCase::Interactive,
         timeout_sec: None,
         backend_preflight: Default::default(),
         startup_trace: Some(trace.clone()),
@@ -344,9 +531,68 @@ async fn measure_sandbox_startup(provider: RuntimeProviderCase) -> Result<Startu
     })
 }
 
-fn startup_policy(provider: RuntimeProviderCase) -> Result<Policy, Box<dyn std::error::Error>> {
-    let yaml = if cfg!(target_os = "windows") {
-        format!(
+fn startup_policy(profile: RuntimeProfileCase) -> Result<Policy, Box<dyn std::error::Error>> {
+    let provider = profile.provider();
+    let yaml = match profile {
+        RuntimeProfileCase::MainCompat => format!(
+            r#"
+version: 1
+name: bench-main-compat
+runtime:
+  containment: process
+  provider: {}
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+  read_write:
+    - "{{workspace}}"
+process:
+  max_processes: 4
+  cpu_rate_percent: 50
+network:
+  mode: allow
+"#,
+            provider.as_str()
+        ),
+        RuntimeProfileCase::BinaryAttribution => format!(
+            r#"
+version: 1
+name: bench-binary-attribution
+runtime:
+  containment: process
+  provider: {}
+filesystem:
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+  read_write:
+    - "{{workspace}}"
+process:
+  max_processes: 0
+  max_memory_mb: 0
+  cpu_rate_percent: 0
+network:
+  mode: proxy
+  policies:
+    - name: attributed
+      endpoints:
+        - host: "example.com"
+          port: 443
+      binaries:
+        - path: "/bin/true"
+"#,
+            provider.as_str()
+        ),
+        _ if cfg!(target_os = "windows") => format!(
             r#"
 version: 1
 name: bench
@@ -359,9 +605,8 @@ process:
   cpu_rate_percent: 0
 "#,
             provider.as_str()
-        )
-    } else {
-        format!(
+        ),
+        _ => format!(
             r#"
 version: 1
 name: bench
@@ -386,40 +631,74 @@ network:
   mode: allow
 "#,
             provider.as_str()
-        )
+        ),
     };
     Ok(Policy::from_yaml(&yaml)?)
 }
 
-async fn benchmark_cold_proxy_deny(
-    provider: RuntimeProviderCase,
-    baseline_connections: u32,
-    proxy_requests: u32,
-) -> ColdProxyReport {
-    match benchmark_cold_proxy_deny_inner(provider, baseline_connections, proxy_requests).await {
-        Ok(report) => report,
-        Err(err) => ColdProxyReport::Error {
-            reason: err.to_string(),
-        },
+fn startup_proxy_config(
+    profile: RuntimeProfileCase,
+    sandbox_id: SandboxId,
+    _policy: &Policy,
+) -> (
+    u16,
+    Option<std::net::SocketAddr>,
+    Option<ConnectAttributionStore>,
+) {
+    if profile == RuntimeProfileCase::BinaryAttribution {
+        #[cfg(target_os = "linux")]
+        {
+            (
+                STRICT_PROXY_PORT,
+                Some(axis_sandbox::linux::netns::proxy_bind_addr(
+                    sandbox_id,
+                    STRICT_PROXY_PORT,
+                )),
+                Some(ConnectAttributionStore::default()),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = sandbox_id;
+            (
+                STRICT_PROXY_PORT,
+                None,
+                Some(ConnectAttributionStore::default()),
+            )
+        }
+    } else {
+        let _ = sandbox_id;
+        (0, None, None)
     }
 }
 
-async fn benchmark_cold_proxy_deny_inner(
-    provider: RuntimeProviderCase,
+async fn benchmark_cold_proxy_deny(
+    profile: RuntimeProfileCase,
     baseline_connections: u32,
     proxy_requests: u32,
 ) -> Result<ColdProxyReport, Box<dyn std::error::Error>> {
-    let policy = proxy_policy(provider)?;
+    benchmark_cold_proxy_deny_inner(profile, baseline_connections, proxy_requests).await
+}
+
+async fn benchmark_cold_proxy_deny_inner(
+    profile: RuntimeProfileCase,
+    baseline_connections: u32,
+    proxy_requests: u32,
+) -> Result<ColdProxyReport, Box<dyn std::error::Error>> {
+    let policy = proxy_policy(profile)?;
+    let sandbox_id = SandboxId::new();
+    let connect_attribution =
+        (profile == RuntimeProfileCase::BinaryAttribution).then(ConnectAttributionStore::default);
     let (timing_tx, mut timing_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut proxy = AxisProxy::new(ProxyConfig {
-        sandbox_id: SandboxId::new(),
+        sandbox_id,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
         enable_l7: false,
         enable_leak_detection: false,
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
-        connect_attribution: None,
+        connect_attribution: connect_attribution.clone(),
         enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
     })?;
@@ -441,7 +720,21 @@ async fn benchmark_cold_proxy_deny_inner(
     let mut proxy_phase_samples = Vec::with_capacity(proxy_requests as usize);
     for _ in 0..proxy_requests {
         let request_start = Instant::now();
-        let mut stream = TcpStream::connect(addr).await?;
+        let mut stream = if let Some(store) = &connect_attribution {
+            let (socket, peer_addr) = bound_tcp_socket()?;
+            store.insert(axis_core::connect_attribution::ConnectAttributionRecord {
+                sandbox_id,
+                peer_addr,
+                proxy_addr: addr,
+                pid: 42,
+                executable_path: "/bin/true".into(),
+                executable_sha256: "a".repeat(64),
+                source: axis_core::connect_attribution::ConnectAttributionSource::Test,
+            })?;
+            socket.connect(addr).await?
+        } else {
+            TcpStream::connect(addr).await?
+        };
         stream
             .write_all(
                 b"CONNECT denied.example.com:443 HTTP/1.1\r\nHost: denied.example.com\r\n\r\n",
@@ -481,7 +774,7 @@ async fn benchmark_cold_proxy_deny_inner(
         request_samples.as_slice(),
     ));
     phase_reports.extend(summarize_phase_samples(&proxy_phase_samples));
-    Ok(ColdProxyReport::Ok {
+    Ok(ColdProxyReport {
         latency_ms: duration_ms(latency),
         baseline_ms: duration_ms(baseline_per_conn),
         total_ms: duration_ms(total_per_req),
@@ -513,9 +806,38 @@ async fn recv_denied_timing_event(
     .map_err(Into::into)
 }
 
-fn proxy_policy(provider: RuntimeProviderCase) -> Result<Policy, Box<dyn std::error::Error>> {
-    let yaml = format!(
-        r#"
+fn bound_tcp_socket() -> Result<(tokio::net::TcpSocket, std::net::SocketAddr), std::io::Error> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind("127.0.0.1:0".parse().unwrap())?;
+    let peer_addr = socket.local_addr()?;
+    Ok((socket, peer_addr))
+}
+
+fn proxy_policy(profile: RuntimeProfileCase) -> Result<Policy, Box<dyn std::error::Error>> {
+    let provider = profile.provider();
+    let yaml = if profile == RuntimeProfileCase::BinaryAttribution {
+        format!(
+            r#"
+version: 1
+name: bench-proxy-binary-attribution
+runtime:
+  containment: process
+  provider: {}
+network:
+  mode: proxy
+  policies:
+    - name: attributed
+      endpoints:
+        - host: "example.com"
+          port: 443
+      binaries:
+        - path: "/bin/true"
+"#,
+            provider.as_str()
+        )
+    } else {
+        format!(
+            r#"
 version: 1
 name: bench-proxy
 runtime:
@@ -529,8 +851,9 @@ network:
         - host: "example.com"
           port: 443
 "#,
-        provider.as_str()
-    );
+            provider.as_str()
+        )
+    };
     Ok(Policy::from_yaml(&yaml)?)
 }
 
@@ -565,10 +888,18 @@ fn summarize_named_phase(phase: &str, samples: &[Duration]) -> PhaseReport {
     sorted.sort();
     PhaseReport {
         phase: phase.into(),
-        median_ms: duration_ms(sorted[sorted.len() / 2]),
-        p99_ms: duration_ms(sorted[sorted.len() * 99 / 100]),
+        median_ms: duration_ms(percentile_sorted(&sorted, 50)),
+        p95_ms: duration_ms(percentile_sorted(&sorted, 95)),
+        p99_ms: duration_ms(percentile_sorted(&sorted, 99)),
+        min_ms: duration_ms(sorted[0]),
+        max_ms: duration_ms(sorted[sorted.len() - 1]),
         samples_ms: samples.iter().copied().map(duration_ms).collect(),
     }
+}
+
+fn percentile_sorted(sorted: &[Duration], percentile: usize) -> Duration {
+    let index = sorted.len() * percentile / 100;
+    sorted[index.min(sorted.len() - 1)]
 }
 
 fn mean_duration(samples: &[Duration]) -> Duration {
@@ -606,6 +937,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_profile_list_accepts_aliases() {
+        assert_eq!(
+            parse_profiles("main-compatible,axis-native,mxc,binary-attribution,interactive")
+                .unwrap(),
+            vec![
+                RuntimeProfileCase::MainCompat,
+                RuntimeProfileCase::AxisNative,
+                RuntimeProfileCase::MxcProcess,
+                RuntimeProfileCase::BinaryAttribution,
+                RuntimeProfileCase::Interactive
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_profile_list_rejects_unknown() {
+        let err = parse_profiles("main_compat,microvm").unwrap_err();
+        assert!(err.to_string().contains("unknown runtime profile"));
+    }
+
+    #[test]
     fn phase_summary_sums_duplicate_phases_per_sample() {
         let reports = summarize_phase_samples(&[
             vec![
@@ -630,13 +982,22 @@ mod tests {
     }
 
     #[test]
-    fn startup_policy_profile_disables_all_resource_limits() {
-        for provider in [
-            RuntimeProviderCase::Auto,
-            RuntimeProviderCase::Mxc,
-            RuntimeProviderCase::AxisNative,
+    fn startup_policy_main_compat_matches_success_metrics_limits() {
+        let policy = startup_policy(RuntimeProfileCase::MainCompat).unwrap();
+
+        assert_eq!(policy.process.max_processes, 4);
+        assert_eq!(policy.process.cpu_rate_percent, 50);
+    }
+
+    #[test]
+    fn startup_policy_runtime_profiles_disable_all_resource_limits() {
+        for profile in [
+            RuntimeProfileCase::AxisNative,
+            RuntimeProfileCase::MxcProcess,
+            RuntimeProfileCase::BinaryAttribution,
+            RuntimeProfileCase::Interactive,
         ] {
-            let policy = startup_policy(provider).unwrap();
+            let policy = startup_policy(profile).unwrap();
             assert_eq!(policy.process.max_processes, 0);
             assert_eq!(policy.process.max_memory_mb, 0);
             assert_eq!(policy.process.cpu_rate_percent, 0);
@@ -645,32 +1006,92 @@ mod tests {
 
     #[test]
     fn failed_rows_serialize_without_timing_fields() {
-        let row = RuntimeMetricsRow {
+        let row = RuntimeMetricsRow::Error {
+            profile: "mxc_process",
             runtime_containment: "process",
             runtime_provider: "mxc",
-            startup: StartupReport::Error {
-                sample_index: 0,
-                error: "injected startup failure".into(),
+            apples_to_apples_with_success_metrics: false,
+            policy_surface: "MXC process path",
+            reason: "injected startup failure".into(),
+        };
+
+        let value = serde_json::to_value(row).unwrap();
+        assert_eq!(value.get("status").unwrap(), "error");
+        assert_eq!(value.get("profile").unwrap(), "mxc_process");
+        assert!(value.get("reason").is_some());
+        assert!(value.get("startup").is_none());
+        assert!(value.get("cold_proxy_deny").is_none());
+        assert!(value.get("synthetic_opa").is_none());
+        assert!(value.get("median_ms").is_none());
+        assert!(value.get("latency_ms").is_none());
+    }
+
+    #[test]
+    fn ok_rows_serialize_representative_metrics() {
+        let row = RuntimeMetricsRow::Ok {
+            profile: "main_compat",
+            runtime_containment: "process",
+            runtime_provider: "axis_native",
+            apples_to_apples_with_success_metrics: true,
+            policy_surface: "success-metrics-compatible minimal process policy",
+            startup: StartupReport {
+                median_ms: 1.0,
+                p95_ms: 2.0,
+                p99_ms: 3.0,
+                min_ms: 0.5,
+                max_ms: 3.0,
+                samples_ms: vec![1.0, 2.0, 3.0],
+                phases: vec![PhaseReport {
+                    phase: "startup.total".into(),
+                    median_ms: 1.0,
+                    p95_ms: 2.0,
+                    p99_ms: 3.0,
+                    min_ms: 0.5,
+                    max_ms: 3.0,
+                    samples_ms: vec![1.0, 2.0, 3.0],
+                }],
             },
-            cold_proxy_deny: ColdProxyReport::Error {
-                reason: "injected proxy failure".into(),
+            cold_proxy_deny: ColdProxyReport {
+                latency_ms: 0.1,
+                baseline_ms: 0.2,
+                total_ms: 0.3,
+                phases: Vec::new(),
             },
             synthetic_opa: SyntheticOpaReport {
-                evals_per_sec: 1.0,
-                us_per_eval: 1.0,
+                evals_per_sec: 10.0,
+                us_per_eval: 100_000.0,
             },
         };
 
         let value = serde_json::to_value(row).unwrap();
-        let startup = value.get("startup").unwrap();
-        assert_eq!(startup.get("status").unwrap(), "error");
-        assert!(startup.get("median_ms").is_none());
-        assert!(startup.get("phases").is_none());
-
-        let cold = value.get("cold_proxy_deny").unwrap();
-        assert_eq!(cold.get("status").unwrap(), "error");
-        assert!(cold.get("latency_ms").is_none());
-        assert!(cold.get("baseline_ms").is_none());
-        assert!(cold.get("phases").is_none());
+        assert_eq!(value.get("status").unwrap(), "ok");
+        assert_eq!(value.get("profile").unwrap(), "main_compat");
+        assert_eq!(
+            value
+                .get("startup")
+                .unwrap()
+                .get("phases")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            value
+                .get("cold_proxy_deny")
+                .unwrap()
+                .get("latency_ms")
+                .unwrap(),
+            0.1
+        );
+        assert_eq!(
+            value
+                .get("synthetic_opa")
+                .unwrap()
+                .get("evals_per_sec")
+                .unwrap(),
+            10.0
+        );
     }
 }
