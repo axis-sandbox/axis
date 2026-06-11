@@ -5539,6 +5539,57 @@ mod tests {
     }
 
     #[test]
+    fn non_interactive_terminal_does_not_prepare_pty_bridge() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let config_copy = root.path().join("config-copy");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 cat \"$config\" > {}\n\
+                 echo '{}'\n",
+                shell_quote_path(&config_copy),
+                MXC_DRY_RUN_SUCCESS
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Block),
+            workspace.path().into(),
+        );
+        config.command = "/bin/sh".into();
+        config.args = vec!["-c".into(), "test ! -t 0".into()];
+        config.capture_output = false;
+        config.backend_preflight = BackendPreflight::DryRun;
+
+        let sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher)
+            .expect("fake MXC dry-run should accept non-interactive launch");
+
+        assert!(sandbox.pty_bridge.is_none());
+        assert!(
+            !workspace.path().join(".axis-pty").exists(),
+            "non-interactive MXC construction must not create PTY runtime state"
+        );
+        let config_json = fs::read_to_string(config_copy).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&config_json).unwrap();
+        let command_line = json["process"]["commandLine"].as_str().unwrap();
+        assert!(!command_line.contains("__axis-pty-bridge"));
+        assert!(command_line.contains("-- /bin/sh -c 'test ! -t 0'"));
+    }
+
+    #[test]
     fn invalid_seccomp_policy_fails_before_executor_resolution() {
         let workspace = tempfile::tempdir().unwrap();
         let mut policy = mxc_representable_policy(NetworkMode::Allow);

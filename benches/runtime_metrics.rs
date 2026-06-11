@@ -355,6 +355,7 @@ runtime:
   provider: {}
 process:
   max_processes: 0
+  max_memory_mb: 0
   cpu_rate_percent: 0
 "#,
             provider.as_str()
@@ -379,6 +380,7 @@ filesystem:
     - "{{workspace}}"
 process:
   max_processes: 0
+  max_memory_mb: 0
   cpu_rate_percent: 0
 network:
   mode: allow
@@ -625,6 +627,20 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].phase, "spawn.child");
         assert_eq!(reports[0].samples_ms, vec![3.0, 5.0]);
+    }
+
+    #[test]
+    fn startup_policy_profile_disables_all_resource_limits() {
+        for provider in [
+            RuntimeProviderCase::Auto,
+            RuntimeProviderCase::Mxc,
+            RuntimeProviderCase::AxisNative,
+        ] {
+            let policy = startup_policy(provider).unwrap();
+            assert_eq!(policy.process.max_processes, 0);
+            assert_eq!(policy.process.max_memory_mb, 0);
+            assert_eq!(policy.process.cpu_rate_percent, 0);
+        }
     }
 
     #[test]

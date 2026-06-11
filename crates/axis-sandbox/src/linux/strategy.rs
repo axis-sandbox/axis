@@ -528,12 +528,6 @@ fn plan_resources(
     caps: &CapabilitySnapshot,
     fallbacks: &mut Vec<PlanFallback>,
 ) -> Result<ResourceStrategy, StrategyError> {
-    if matches!(caps.cgroup_v2, CgroupV2Support::Writable) {
-        return Ok(ResourceStrategy::CgroupsV2 {
-            support: caps.cgroup_v2,
-        });
-    }
-
     let memory_requested = policy.max_memory_mb > 0;
     let process_requested = policy.max_processes > 0;
     let cpu_requested = policy.cpu_rate_percent > 0;
@@ -543,6 +537,12 @@ fn plan_resources(
             memory_limit: false,
             process_limit: ProcessLimitFallback::NotRequested,
             cpu_limit: CpuLimitFallback::NotRequested,
+        });
+    }
+
+    if matches!(caps.cgroup_v2, CgroupV2Support::Writable) {
+        return Ok(ResourceStrategy::CgroupsV2 {
+            support: caps.cgroup_v2,
         });
     }
 
@@ -1351,6 +1351,45 @@ mod tests {
 
         assert_eq!(err.area, "resources");
         assert!(err.message.contains("CPU rate limits"));
+    }
+
+    #[test]
+    fn no_requested_resource_limits_skip_cgroups_even_when_writable() {
+        let caps = full_caps();
+        let mut policy = policy(NetworkMode::Allow);
+        policy.process.max_processes = 0;
+        policy.process.max_memory_mb = 0;
+        policy.process.cpu_rate_percent = 0;
+
+        let plan = plan(&policy, caps, 0);
+
+        assert_eq!(
+            plan.resources,
+            ResourceStrategy::RlimitFallback {
+                memory_limit: false,
+                process_limit: ProcessLimitFallback::NotRequested,
+                cpu_limit: CpuLimitFallback::NotRequested,
+            }
+        );
+        assert!(plan.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn requested_resource_limits_use_writable_cgroups() {
+        let caps = full_caps();
+        let mut policy = policy(NetworkMode::Allow);
+        policy.process.cpu_rate_percent = 0;
+        policy.process.max_processes = 32;
+        policy.process.max_memory_mb = 8192;
+
+        let plan = plan(&policy, caps, 0);
+
+        assert_eq!(
+            plan.resources,
+            ResourceStrategy::CgroupsV2 {
+                support: CgroupV2Support::Writable,
+            }
+        );
     }
 
     #[test]
