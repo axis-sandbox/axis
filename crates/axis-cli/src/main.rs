@@ -864,6 +864,7 @@ async fn main() -> Result<()> {
                         capture_output: false,
                         interactive_terminal: quiet,
                         timeout_sec,
+                        backend_preflight: Default::default(),
                         startup_trace: None,
                     };
 

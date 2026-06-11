@@ -74,6 +74,7 @@ network:
         capture_output: false,
         interactive_terminal: false,
         timeout_sec: None,
+        backend_preflight: Default::default(),
         startup_trace: None,
     };
 

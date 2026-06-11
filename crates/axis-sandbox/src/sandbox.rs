@@ -53,9 +53,24 @@ pub struct SandboxConfig {
     pub interactive_terminal: bool,
     /// Maximum wall-clock time before auto-destroy (seconds). None = no timeout.
     pub timeout_sec: Option<u64>,
+    /// Optional backend-executor validation before start(). Normal launches
+    /// rely on AXIS in-process validation and leave this as the default.
+    pub backend_preflight: BackendPreflight,
     /// Optional phase recorder for benchmark instrumentation. Normal runtime
     /// paths leave this unset so launch behavior is unchanged.
     pub startup_trace: Option<StartupTrace>,
+}
+
+/// Backend validation mode for sandbox construction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendPreflight {
+    /// Validate policies and translated launch state in AXIS without spawning
+    /// the selected backend executor.
+    #[default]
+    InProcess,
+    /// Ask the selected backend executor to validate its serialized launch
+    /// state before start(). Backends that support this may spawn a helper.
+    DryRun,
 }
 
 /// Opt-in startup phase timing recorder used by benchmarks.
@@ -831,6 +846,7 @@ mod tests {
             capture_output: false,
             interactive_terminal: false,
             timeout_sec: None,
+            backend_preflight: Default::default(),
             startup_trace: None,
         }
     }

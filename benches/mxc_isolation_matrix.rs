@@ -884,6 +884,7 @@ process:
         capture_output: true,
         interactive_terminal: false,
         timeout_sec: Some(10),
+        backend_preflight: Default::default(),
         startup_trace: None,
     };
     let mut sandbox = match Sandbox::create_for_exec(config) {

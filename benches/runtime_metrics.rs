@@ -304,6 +304,7 @@ async fn measure_sandbox_startup(provider: RuntimeProviderCase) -> Result<Startu
         capture_output: false,
         interactive_terminal: false,
         timeout_sec: None,
+        backend_preflight: Default::default(),
         startup_trace: Some(trace.clone()),
     };
 

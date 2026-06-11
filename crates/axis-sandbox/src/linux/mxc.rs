@@ -8,7 +8,7 @@
 //! selection. Unsupported AXIS guarantees fail before launch instead of being
 //! mapped to weaker MXC behavior.
 
-use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
+use crate::sandbox::{BackendPreflight, SandboxConfig, SandboxError, SandboxImpl};
 use axis_core::capability::{DependencyState, PlannerOptions, RuntimeProbeSnapshot};
 use axis_core::capability_map::{BackendCapabilityMapId, host_dependency};
 use axis_core::connect_attribution::{
@@ -990,19 +990,21 @@ impl MxcLinuxSandbox {
             append_cleanup_failure(err, cleanup_error)
         })?;
         let allowed_proxy_env = allowed_proxy_env(&proxy_strategy);
-        crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_dry_run", || {
-            executor.dry_run_with_allowed_env(&spec, Duration::from_secs(5), &allowed_proxy_env)
-        })
-        .map_err(|err| {
-            let cleanup_error =
-                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-            append_cleanup_failure(
-                SandboxError::IsolationFailed(format!(
-                    "MXC Linux dry-run validation failed: {err}"
-                )),
-                cleanup_error,
-            )
-        })?;
+        if config.backend_preflight == BackendPreflight::DryRun {
+            crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_dry_run", || {
+                executor.dry_run_with_allowed_env(&spec, Duration::from_secs(5), &allowed_proxy_env)
+            })
+            .map_err(|err| {
+                let cleanup_error =
+                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                append_cleanup_failure(
+                    SandboxError::IsolationFailed(format!(
+                        "MXC Linux dry-run validation failed: {err}"
+                    )),
+                    cleanup_error,
+                )
+            })?;
+        }
 
         Ok(Self {
             id: config.id,
@@ -3780,6 +3782,7 @@ mod tests {
             capture_output: true,
             interactive_terminal: false,
             timeout_sec: None,
+            backend_preflight: Default::default(),
             startup_trace: None,
         }
     }
@@ -5151,6 +5154,159 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_mxc_launch_skips_dry_run_preflight() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let dry_marker = root.path().join("dry-count");
+        let run_marker = root.path().join("run-count");
+        write_counting_mxc_executor(&executable, &dry_marker, &run_marker, 0o700);
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let trace = crate::sandbox::StartupTrace::new();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.startup_trace = Some(trace.clone());
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+
+        assert!(
+            !dry_marker.exists(),
+            "normal MXC construction must not spawn --dry-run"
+        );
+        assert!(
+            !run_marker.exists(),
+            "normal MXC construction must not spawn the runtime executor"
+        );
+        assert!(
+            !trace
+                .phases()
+                .iter()
+                .any(|phase| phase.phase == "backend.preflight.mxc_dry_run"),
+            "normal MXC construction must not record dry-run preflight"
+        );
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert!(
+            !dry_marker.exists(),
+            "normal MXC launch must skip --dry-run"
+        );
+        assert_eq!(fs::read_to_string(run_marker).unwrap(), "run\n");
+        assert!(
+            !trace
+                .phases()
+                .iter()
+                .any(|phase| phase.phase == "backend.preflight.mxc_dry_run"),
+            "normal MXC launch metrics must not include dry-run preflight"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_mxc_dry_run_preflight_runs_before_start() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let dry_marker = root.path().join("dry-count");
+        let run_marker = root.path().join("run-count");
+        write_counting_mxc_executor(&executable, &dry_marker, &run_marker, 0o700);
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let trace = crate::sandbox::StartupTrace::new();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.backend_preflight = BackendPreflight::DryRun;
+        config.startup_trace = Some(trace.clone());
+
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+
+        assert_eq!(fs::read_to_string(&dry_marker).unwrap(), "dry\n");
+        assert!(
+            !run_marker.exists(),
+            "dry-run preflight must not start user code"
+        );
+        assert!(
+            trace
+                .phases()
+                .iter()
+                .any(|phase| phase.phase == "backend.preflight.mxc_dry_run"),
+            "explicit dry-run preflight should be visible in startup metrics"
+        );
+
+        SandboxImpl::start(&mut sandbox).unwrap();
+        let code = SandboxImpl::wait(&mut sandbox).await.unwrap();
+
+        assert_eq!(code, 0);
+        assert_eq!(fs::read_to_string(dry_marker).unwrap(), "dry\n");
+        assert_eq!(fs::read_to_string(run_marker).unwrap(), "run\n");
+    }
+
+    #[test]
+    fn explicit_mxc_dry_run_preflight_reports_malformed_output() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let run_marker = root.path().join("run-count");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo unexpected\n\
+                   exit 0\n\
+                 fi\n\
+                 echo run >> {}\n",
+                shell_quote_path(&run_marker)
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let launcher = fake_seccomp_launcher(&root);
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Allow),
+            workspace.path().into(),
+        );
+        config.backend_preflight = BackendPreflight::DryRun;
+
+        let err = match MxcLinuxSandbox::new_with_executor(&config, executor, launcher) {
+            Ok(_) => panic!("expected malformed MXC dry-run validation to fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            SandboxError::IsolationFailed(message) => {
+                assert!(message.contains("MXC Linux dry-run validation failed"));
+                assert!(
+                    message.contains(
+                        "MXC dry-run exited successfully without reporting validation success"
+                    ),
+                    "unexpected dry-run validation error: {message}"
+                );
+                assert!(
+                    !message.contains("unexpected"),
+                    "dry-run output should not be reflected in errors: {message}"
+                );
+            }
+            other => panic!("expected dry-run validation failure, got {other:?}"),
+        }
+        assert!(
+            !run_marker.exists(),
+            "dry-run validation failure must happen before user code"
+        );
+    }
+
     #[test]
     fn proxy_mode_keeps_provider_credentials_out_of_mxc_launch_state() {
         let root = secure_tempdir();
@@ -5209,6 +5365,7 @@ mod tests {
         ];
         config.proxy_port = proxy_port;
         config.proxy_addr = Some(allocation.proxy_addr);
+        config.backend_preflight = BackendPreflight::DryRun;
 
         let _sandbox = MxcLinuxSandbox::new_with_executor_and_strategies(
             &config,
@@ -5288,6 +5445,7 @@ mod tests {
         );
         config.command = "/bin/sh".into();
         config.args = vec!["-c".into(), "echo '$PATH'".into()];
+        config.backend_preflight = BackendPreflight::DryRun;
 
         let sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher.clone())
             .expect("fake MXC dry-run should accept rewritten command");
@@ -5360,6 +5518,7 @@ mod tests {
         config.args = vec!["-c".into(), "test -t 0 && test -t 1".into()];
         config.capture_output = false;
         config.interactive_terminal = true;
+        config.backend_preflight = BackendPreflight::DryRun;
 
         let sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher.clone())
             .expect("fake MXC dry-run should accept PTY bridge launch");
@@ -7779,6 +7938,41 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             0o700,
         );
         MxcExecutor::from_injected_path(&executable).unwrap()
+    }
+
+    fn write_counting_mxc_executor(
+        executable: &Path,
+        dry_marker: &Path,
+        run_marker: &Path,
+        mode: u32,
+    ) {
+        write_executable(
+            executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 config=''\n\
+                 previous=''\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                   if [ \"$previous\" = '--config' ]; then config=\"$arg\"; fi\n\
+                   previous=\"$arg\"\n\
+                 done\n\
+                 test -n \"$config\"\n\
+                 cat \"$config\" >/dev/null\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo dry >> {}\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 echo run >> {}\n",
+                shell_quote_path(dry_marker),
+                MXC_DRY_RUN_SUCCESS,
+                shell_quote_path(run_marker)
+            ),
+            mode,
+        );
     }
 
     fn reap_child(pid: u32) {

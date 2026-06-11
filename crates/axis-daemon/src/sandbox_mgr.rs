@@ -625,6 +625,7 @@ fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbo
         capture_output: true,
         interactive_terminal: false,
         timeout_sec,
+        backend_preflight: Default::default(),
         startup_trace: None,
     };
 
@@ -1326,6 +1327,7 @@ fn contained_exec_config_from(input: ContainedExecConfigInput<'_>) -> SandboxCon
         capture_output: true,
         interactive_terminal: false,
         timeout_sec,
+        backend_preflight: Default::default(),
         startup_trace: None,
     }
 }
