@@ -45,8 +45,12 @@ const SYS_KILL: u32 = 62;
 const SYS_SETPGID: u32 = 109;
 const SYS_SETSID: u32 = 112;
 const SYS_TKILL: u32 = 200;
+const SYS_TGKILL: u32 = 234;
 const SYS_UNSHARE: u32 = 272;
 const SYS_SET_ROBUST_LIST: u32 = 273;
+const SYS_TIMERFD_CREATE: u32 = 283;
+const SYS_TIMERFD_SETTIME: u32 = 286;
+const SYS_TIMERFD_GETTIME: u32 = 287;
 const SYS_EXECVEAT: u32 = 322;
 const SYS_CLONE3: u32 = 435;
 
@@ -188,7 +192,10 @@ const WHITELIST: &[(u32, &str)] = &[
     (SYS_SET_ROBUST_LIST, "set_robust_list"),
     (280, "utimensat"),
     (281, "epoll_pwait"),
+    (SYS_TIMERFD_CREATE, "timerfd_create"),
     (284, "eventfd"),
+    (SYS_TIMERFD_SETTIME, "timerfd_settime"),
+    (SYS_TIMERFD_GETTIME, "timerfd_gettime"),
     (288, "accept4"),
     (290, "eventfd2"),
     (291, "epoll_create1"),
@@ -354,6 +361,7 @@ pub(crate) struct SeccompOptions {
     socket_domain_policy: SocketDomainPolicy,
     notify_connect: bool,
     allow_process_group_syscalls: bool,
+    allow_thread_signal_syscalls: bool,
 }
 
 impl Default for SeccompOptions {
@@ -362,6 +370,7 @@ impl Default for SeccompOptions {
             socket_domain_policy: SocketDomainPolicy::AllowAll,
             notify_connect: false,
             allow_process_group_syscalls: false,
+            allow_thread_signal_syscalls: false,
         }
     }
 }
@@ -373,6 +382,7 @@ impl SeccompOptions {
             socket_domain_policy: SocketDomainPolicy::DenyAllExcept(vec![AF_UNIX]),
             notify_connect: false,
             allow_process_group_syscalls: false,
+            allow_thread_signal_syscalls: false,
         }
     }
 
@@ -383,6 +393,11 @@ impl SeccompOptions {
 
     pub(crate) fn allow_process_group_syscalls(mut self) -> Self {
         self.allow_process_group_syscalls = true;
+        self
+    }
+
+    pub(crate) fn allow_thread_signal_syscalls(mut self) -> Self {
+        self.allow_thread_signal_syscalls = true;
         self
     }
 
@@ -398,6 +413,11 @@ impl SeccompOptions {
     #[cfg(test)]
     pub(crate) fn allows_process_group_syscalls(&self) -> bool {
         self.allow_process_group_syscalls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allows_thread_signal_syscalls(&self) -> bool {
+        self.allow_thread_signal_syscalls
     }
 }
 
@@ -417,6 +437,9 @@ impl SeccompFilterSpec {
 
         if options.allow_process_group_syscalls {
             allowed_syscalls.extend([SYS_SETPGID, SYS_SETSID]);
+        }
+        if options.allow_thread_signal_syscalls {
+            allowed_syscalls.push(SYS_TGKILL);
         }
 
         for name in &policy.blocked_syscalls {
@@ -802,6 +825,7 @@ fn syscall_number(name: &str) -> Option<u32> {
                 "setpgid" => Some(SYS_SETPGID),
                 "setsid" => Some(SYS_SETSID),
                 "tkill" => Some(SYS_TKILL),
+                "tgkill" => Some(SYS_TGKILL),
                 "unshare" => Some(272),
                 "clone3" => Some(SYS_CLONE3),
                 _ => None,
@@ -871,6 +895,10 @@ mod tests {
         assert!(
             !nrs.contains(&SYS_TKILL),
             "tkill should not be in whitelist"
+        );
+        assert!(
+            !nrs.contains(&SYS_TGKILL),
+            "tgkill should not be in whitelist"
         );
         assert!(
             !nrs.contains(&SYS_SETPGID),
@@ -988,13 +1016,53 @@ mod tests {
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
                 .unwrap();
 
-        for syscall in [SYS_KILL, SYS_TKILL] {
+        for syscall in [SYS_KILL, SYS_TKILL, SYS_TGKILL] {
             assert_eq!(
                 spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
                 FilterDecision::Errno(libc::EPERM),
                 "signal syscall {syscall} should be denied"
             );
         }
+    }
+
+    #[test]
+    fn decision_allows_thread_signal_syscalls_when_pid_boundary_allows_it() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().allow_thread_signal_syscalls(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_TGKILL, [0; 6]),
+            FilterDecision::Allow,
+            "tgkill should be allowed when the runtime PID boundary owns signal scope"
+        );
+        for syscall in [SYS_KILL, SYS_TKILL] {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "broader signal syscall {syscall} should remain denied"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_blocked_tgkill_overrides_thread_signal_option() {
+        let policy = ProcessPolicy {
+            blocked_syscalls: vec!["tgkill".into()],
+            ..Default::default()
+        };
+        let spec = SeccompFilterSpec::from_policy(
+            &policy,
+            SeccompOptions::default().allow_thread_signal_syscalls(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.decision_for(AUDIT_ARCH_X86_64, SYS_TGKILL, [0; 6]),
+            FilterDecision::Errno(libc::EPERM)
+        );
     }
 
     #[test]
@@ -1045,6 +1113,21 @@ mod tests {
             spec.decision_for(AUDIT_ARCH_X86_64, 0, [0; 6]),
             FilterDecision::Allow
         );
+    }
+
+    #[test]
+    fn decision_allows_timerfd_runtime_primitives() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [SYS_TIMERFD_CREATE, SYS_TIMERFD_SETTIME, SYS_TIMERFD_GETTIME] {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Allow,
+                "timerfd runtime syscall {syscall} should be allowed"
+            );
+        }
     }
 
     #[test]
@@ -1216,11 +1299,33 @@ mod tests {
             SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
                 .unwrap();
 
-        for syscall in [SYS_KILL, SYS_TKILL] {
+        for syscall in [SYS_KILL, SYS_TKILL, SYS_TGKILL] {
             assert_eq!(
                 bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
                 FilterDecision::Errno(libc::EPERM),
                 "signal syscall {syscall} should be denied by generated BPF"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bpf_allows_thread_signal_syscalls_when_pid_boundary_allows_it() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().allow_thread_signal_syscalls(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bpf_decision_for(&spec, AUDIT_ARCH_X86_64, SYS_TGKILL, [0; 6]),
+            FilterDecision::Allow,
+            "tgkill should be allowed by generated BPF when the runtime PID boundary owns signal scope"
+        );
+        for syscall in [SYS_KILL, SYS_TKILL] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Errno(libc::EPERM),
+                "broader signal syscall {syscall} should remain denied by generated BPF"
             );
         }
     }
@@ -1253,6 +1358,21 @@ mod tests {
                 bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
                 FilterDecision::Allow,
                 "process group syscall {syscall} should be allowed by generated BPF when the runtime lifecycle boundary owns cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bpf_allows_timerfd_runtime_primitives() {
+        let spec =
+            SeccompFilterSpec::from_policy(&ProcessPolicy::default(), SeccompOptions::default())
+                .unwrap();
+
+        for syscall in [SYS_TIMERFD_CREATE, SYS_TIMERFD_SETTIME, SYS_TIMERFD_GETTIME] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Allow,
+                "timerfd runtime syscall {syscall} should be allowed by generated BPF"
             );
         }
     }

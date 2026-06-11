@@ -3069,9 +3069,12 @@ fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOpt
         NetworkMode::Allow | NetworkMode::Proxy => super::seccomp::SeccompOptions::default(),
     };
 
-    // MXC owns the containment lifecycle outside the payload's process group,
-    // so agent CLIs may use session/process-group setup for tool execution.
-    options.allow_process_group_syscalls()
+    // MXC owns the containment lifecycle outside the payload's process group
+    // and PID namespace, so agent CLIs may use process-group setup and
+    // same-process thread signaling for tool execution/runtime support.
+    options
+        .allow_process_group_syscalls()
+        .allow_thread_signal_syscalls()
 }
 
 fn write_private_seccomp_filter(
@@ -3827,11 +3830,13 @@ mod tests {
         let allow_policy = policy(NetworkMode::Allow);
         let allow_options = mxc_seccomp_options_for_policy(&allow_policy);
         assert!(allow_options.allows_process_group_syscalls());
+        assert!(allow_options.allows_thread_signal_syscalls());
         assert!(!allow_options.denies_non_unix_socket_domains());
 
         let block_policy = policy(NetworkMode::Block);
         let block_options = mxc_seccomp_options_for_policy(&block_policy);
         assert!(block_options.allows_process_group_syscalls());
+        assert!(block_options.allows_thread_signal_syscalls());
         assert!(block_options.denies_non_unix_socket_domains());
     }
 
