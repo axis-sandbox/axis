@@ -7886,6 +7886,7 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: Some(inference_endpoint),
             connect_attribution: Some(connect_attribution),
+            enable_identity_diagnostics: false,
             timing_tx: None,
         };
         let mut proxy = axis_proxy::proxy::AxisProxy::new(config).unwrap();

@@ -1205,6 +1205,7 @@ fn standalone_proxy_config_for_sandbox(
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution,
+        enable_identity_diagnostics: false,
         timing_tx: None,
     })
 }

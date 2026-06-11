@@ -5,7 +5,7 @@
 //!
 //! Each sandbox gets its own proxy instance. On every CONNECT request:
 //! 1. Parse target host:port
-//! 2. Resolve calling binary (TOFU identity)
+//! 2. Resolve calling binary only when required by binary-restricted policy
 //! 3. Evaluate OPA network policy → allow or deny
 //! 4. If allowed, relay bytes; optionally run leak detection
 //! 5. Log decision via OCSF audit
@@ -74,6 +74,9 @@ pub struct ProxyConfig {
     /// Connect-time identity records produced by a platform-specific sandbox
     /// launcher. Policies with binary allowlists require this hard boundary.
     pub connect_attribution: Option<ConnectAttributionStore>,
+    /// Opt into best-effort identity diagnostics for policies that do not
+    /// require binary identity. Diagnostic identity never feeds OPA decisions.
+    pub enable_identity_diagnostics: bool,
     /// Optional benchmark timing channel. Normal runtime paths leave this unset.
     pub timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
 }
@@ -145,7 +148,21 @@ struct ProxyState {
     credential_injector: CredentialInjector,
     upstream_tls_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     connect_attribution: Option<ConnectAttributionStore>,
-    requires_connect_attribution: bool,
+    identity_mode: ProxyIdentityMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyIdentityMode {
+    /// Host/port-only policy evaluation. Do not spend request-path time on
+    /// identity because it cannot influence the decision.
+    None,
+    /// Binary-restricted policies require kernel-observed connect-time
+    /// attribution. Unknown, stale, ambiguous, or reconstructed identity must
+    /// fail closed before OPA can allow the request.
+    RequiredConnectAttribution,
+    /// Best-effort diagnostics for non-binary policy surfaces. This mode must
+    /// not feed OPA decisions or wait for attribution records.
+    OptionalBestEffort,
 }
 
 /// An AXIS HTTP CONNECT proxy serving a single sandbox.
@@ -182,7 +199,7 @@ impl AxisProxy {
         }
         let upstream_tls_roots = parse_upstream_tls_roots(&config.upstream_tls_roots_pem)
             .map_err(|e| ProxyError::BindFailed(format!("upstream TLS roots: {e}")))?;
-        let requires_connect_attribution = policy_requires_connect_attribution(&config.policy);
+        let identity_mode = proxy_identity_mode(&config.policy, config.enable_identity_diagnostics);
 
         let state = Arc::new(Mutex::new(ProxyState {
             policy_engine,
@@ -192,7 +209,7 @@ impl AxisProxy {
             credential_injector,
             upstream_tls_roots,
             connect_attribution: config.connect_attribution.clone(),
-            requires_connect_attribution,
+            identity_mode,
         }));
 
         Ok(Self {
@@ -248,6 +265,16 @@ impl AxisProxy {
                 }
             });
         }
+    }
+}
+
+fn proxy_identity_mode(policy: &Policy, enable_identity_diagnostics: bool) -> ProxyIdentityMode {
+    if policy_requires_connect_attribution(policy) {
+        ProxyIdentityMode::RequiredConnectAttribution
+    } else if enable_identity_diagnostics {
+        ProxyIdentityMode::OptionalBestEffort
+    } else {
+        ProxyIdentityMode::None
     }
 }
 
@@ -324,20 +351,19 @@ async fn handle_connection(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut timing = ProxyConnectionTimer::start();
-    let requires_connect_attribution = {
+    let identity_mode = {
         let st = state.lock().unwrap();
-        st.requires_connect_attribution
+        st.identity_mode
     };
-    let (binary_path, binary_sha256) = if requires_connect_attribution {
+    let (binary_path, binary_sha256) = if identity_mode == ProxyIdentityMode::None {
+        timing.record("identity_attribution", Duration::ZERO);
+        ("unknown".into(), "unknown".into())
+    } else {
         let phase_start = Instant::now();
         let binary_identity =
-            resolve_binary_identity(sandbox_id, peer_addr, proxy_addr, &state).await;
+            resolve_policy_binary_identity(sandbox_id, peer_addr, proxy_addr, &state).await;
         timing.record("identity_attribution", phase_start.elapsed());
-        let identity_check = {
-            let mut st = state.lock().unwrap();
-            verify_binary_identity(&mut st.tofu_store, binary_identity)
-        };
-        match identity_check {
+        match binary_identity {
             Ok(identity) => identity,
             Err(e) => {
                 tracing::warn!("sandbox {sandbox_id}: binary identity check failed: {e}");
@@ -350,9 +376,6 @@ async fn handle_connection(
                 return Ok(());
             }
         }
-    } else {
-        timing.record("identity_attribution", Duration::ZERO);
-        ("unknown".into(), "unknown".into())
     };
 
     let mut reader = BufReader::new(stream);
@@ -904,53 +927,84 @@ fn find_http_head_end(bytes: &[u8]) -> Option<usize> {
         })
 }
 
-/// Resolve the calling binary before any sandbox-controlled request bytes are
-/// consumed. Binary-restricted policies require a kernel-observed connect-time
-/// record. The Linux /proc resolver remains a fallback only for policies whose
-/// semantics do not depend on binary identity as a hard boundary.
-async fn resolve_binary_identity(
+/// Resolve the policy identity before any sandbox-controlled request bytes are
+/// consumed. Binary-restricted policies accept only a kernel-observed
+/// connect-time record. Best-effort diagnostics are intentionally not returned
+/// here because optional identity must not become an input to OPA decisions.
+async fn resolve_policy_binary_identity(
     sandbox_id: SandboxId,
     peer_addr: SocketAddr,
     proxy_addr: SocketAddr,
     state: &Arc<Mutex<ProxyState>>,
-) -> Result<Option<BinaryFingerprint>, IdentityError> {
-    let (connect_attribution, requires_connect_attribution) = {
+) -> Result<(String, String), IdentityError> {
+    let (connect_attribution, identity_mode) = {
         let st = state.lock().unwrap();
-        (
-            st.connect_attribution.clone(),
-            st.requires_connect_attribution,
-        )
+        (st.connect_attribution.clone(), st.identity_mode)
     };
 
-    if let Some(store) = connect_attribution {
-        match wait_for_connect_attribution(&store, sandbox_id, peer_addr, proxy_addr).await {
-            Ok(record) => return Ok(Some(record.into())),
-            Err(error) if requires_connect_attribution => {
-                return Err(connect_attribution_identity_error(error));
-            }
+    match identity_mode {
+        ProxyIdentityMode::None => Ok(("unknown".into(), "unknown".into())),
+        ProxyIdentityMode::RequiredConnectAttribution => {
+            let Some(store) = connect_attribution else {
+                return Err(IdentityError::ResolveFailed {
+                    pid: 0,
+                    reason: "connect-time attribution is required by binary-restricted policy but is not configured"
+                        .into(),
+                });
+            };
+            let record = wait_for_connect_attribution(&store, sandbox_id, peer_addr, proxy_addr)
+                .await
+                .map_err(connect_attribution_identity_error)?;
+            let mut st = state.lock().unwrap();
+            verify_binary_identity(&mut st.tofu_store, Some(record.into()))
+        }
+        ProxyIdentityMode::OptionalBestEffort => {
+            record_optional_identity_diagnostic(
+                sandbox_id,
+                peer_addr,
+                proxy_addr,
+                state,
+                connect_attribution.as_ref(),
+            )
+            .await;
+            Ok(("unknown".into(), "unknown".into()))
+        }
+    }
+}
+
+async fn record_optional_identity_diagnostic(
+    sandbox_id: SandboxId,
+    peer_addr: SocketAddr,
+    proxy_addr: SocketAddr,
+    state: &Arc<Mutex<ProxyState>>,
+    connect_attribution: Option<&ConnectAttributionStore>,
+) {
+    let identity = match connect_attribution {
+        Some(store) => match store.consume(sandbox_id, peer_addr, proxy_addr) {
+            Ok(record) => Some(record.into()),
             Err(error) => {
                 tracing::debug!(
-                    "sandbox {sandbox_id}: no connect-time attribution for {peer_addr} -> {proxy_addr}: {error}"
+                    "sandbox {sandbox_id}: optional connect-time attribution unavailable for {peer_addr} -> {proxy_addr}: {error}"
                 );
+                None
             }
+        },
+        None => None,
+    };
+    let Some(identity) = identity else {
+        return;
+    };
+    let diagnostic = {
+        let mut st = state.lock().unwrap();
+        verify_binary_identity(&mut st.tofu_store, Some(identity))
+    };
+    match diagnostic {
+        Ok((path, _)) => {
+            tracing::debug!("sandbox {sandbox_id}: optional binary identity diagnostic: {path}");
         }
-    } else if requires_connect_attribution {
-        return Err(IdentityError::ResolveFailed {
-            pid: 0,
-            reason: "connect-time attribution is required by binary-restricted policy but is not configured"
-                .into(),
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        crate::identity::resolve_peer_identity(peer_addr, proxy_addr).map(Some)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = peer_addr;
-        let _ = proxy_addr;
-        Ok(None)
+        Err(error) => {
+            tracing::debug!("sandbox {sandbox_id}: optional binary identity rejected: {error}");
+        }
     }
 }
 
@@ -991,9 +1045,9 @@ fn connect_attribution_identity_error(error: ConnectAttributionError) -> Identit
 
 fn verify_binary_identity(
     tofu_store: &mut TofuStore,
-    identity: Result<Option<BinaryFingerprint>, IdentityError>,
+    identity: Option<BinaryFingerprint>,
 ) -> Result<(String, String), IdentityError> {
-    let Some(identity) = identity? else {
+    let Some(identity) = identity else {
         return Ok(("unknown".into(), "unknown".into()));
     };
     tofu_store.verify_fingerprint(&identity)?;
@@ -1130,22 +1184,8 @@ mod tests {
     #[test]
     fn verify_binary_identity_preserves_unsupported_unknown() {
         let mut tofu_store = TofuStore::new();
-        let identity = verify_binary_identity(&mut tofu_store, Ok(None)).unwrap();
+        let identity = verify_binary_identity(&mut tofu_store, None).unwrap();
         assert_eq!(identity, ("unknown".into(), "unknown".into()));
-    }
-
-    #[test]
-    fn verify_binary_identity_propagates_resolver_error() {
-        let mut tofu_store = TofuStore::new();
-        let err = verify_binary_identity(
-            &mut tofu_store,
-            Err(IdentityError::ResolveFailed {
-                pid: 0,
-                reason: "ambiguous socket owner".into(),
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, IdentityError::ResolveFailed { .. }));
     }
 
     #[test]
@@ -1163,13 +1203,66 @@ mod tests {
 
         let err = verify_binary_identity(
             &mut tofu_store,
-            Ok(Some(BinaryFingerprint {
+            Some(BinaryFingerprint {
                 path: binary,
                 sha256: "1".repeat(64),
-            })),
+            }),
         )
         .unwrap_err();
         assert!(matches!(err, IdentityError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn proxy_identity_mode_defaults_to_none_for_host_port_policy() {
+        let policy = Policy::from_yaml(
+            r#"
+version: 1
+name: host-port-only
+network:
+  mode: proxy
+  policies:
+    - name: api
+      endpoints:
+        - host: "api.example.com"
+          port: 443
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(proxy_identity_mode(&policy, false), ProxyIdentityMode::None);
+        assert_eq!(
+            proxy_identity_mode(&policy, true),
+            ProxyIdentityMode::OptionalBestEffort
+        );
+    }
+
+    #[test]
+    fn proxy_identity_mode_requires_attribution_for_binary_policy() {
+        let policy = Policy::from_yaml(
+            r#"
+version: 1
+name: binary-restricted
+network:
+  mode: proxy
+  policies:
+    - name: api
+      endpoints:
+        - host: "api.example.com"
+          port: 443
+      binaries:
+        - path: "/usr/bin/curl"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            proxy_identity_mode(&policy, false),
+            ProxyIdentityMode::RequiredConnectAttribution
+        );
+        assert_eq!(
+            proxy_identity_mode(&policy, true),
+            ProxyIdentityMode::RequiredConnectAttribution
+        );
     }
 
     #[test]
@@ -1184,6 +1277,7 @@ mod tests {
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
+            enable_identity_diagnostics: false,
             timing_tx: None,
         };
         let proxy = AxisProxy::new(config);
@@ -1213,6 +1307,7 @@ network:
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
+            enable_identity_diagnostics: false,
             timing_tx: None,
         };
         let proxy = AxisProxy::new(config).unwrap();

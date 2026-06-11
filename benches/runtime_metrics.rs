@@ -418,6 +418,7 @@ async fn benchmark_cold_proxy_deny_inner(
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: None,
+        enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
     })?;
     let addr = proxy.bind().await?;

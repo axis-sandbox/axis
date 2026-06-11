@@ -77,6 +77,23 @@ async fn start_proxy_with_policy_roots_and_attribution(
     upstream_tls_roots_pem: Vec<String>,
     connect_attribution: Option<ConnectAttributionStore>,
 ) -> (SandboxId, std::net::SocketAddr) {
+    start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+        policy_yaml,
+        inference_ep,
+        upstream_tls_roots_pem,
+        connect_attribution,
+        false,
+    )
+    .await
+}
+
+async fn start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+    policy_yaml: &str,
+    inference_ep: Option<std::net::SocketAddr>,
+    upstream_tls_roots_pem: Vec<String>,
+    connect_attribution: Option<ConnectAttributionStore>,
+    enable_identity_diagnostics: bool,
+) -> (SandboxId, std::net::SocketAddr) {
     let policy = Policy::from_yaml(policy_yaml).unwrap();
     let sandbox_id = SandboxId::new();
     let config = ProxyConfig {
@@ -88,6 +105,7 @@ async fn start_proxy_with_policy_roots_and_attribution(
         upstream_tls_roots_pem,
         inference_endpoint: inference_ep,
         connect_attribution,
+        enable_identity_diagnostics,
         timing_tx: None,
     };
 
@@ -119,6 +137,7 @@ async fn denied_connect_emits_phase_timing_event() {
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: None,
+        enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
     };
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -166,6 +185,7 @@ async fn host_port_only_denied_connect_skips_identity_attribution() {
         connect_attribution: Some(ConnectAttributionStore::new(
             std::time::Duration::from_secs(30),
         )),
+        enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
     };
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -206,6 +226,7 @@ async fn host_port_only_allowed_connect_skips_identity_attribution() {
         connect_attribution: Some(ConnectAttributionStore::new(
             std::time::Duration::from_secs(30),
         )),
+        enable_identity_diagnostics: false,
         timing_tx: Some(timing_tx),
     };
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -226,6 +247,66 @@ async fn host_port_only_allowed_connect_skips_identity_attribution() {
     assert_eq!(
         timing_phase_duration(&event, "identity_attribution"),
         Some(std::time::Duration::ZERO)
+    );
+}
+
+#[tokio::test]
+async fn optional_identity_diagnostics_do_not_block_host_port_allow() {
+    let store = ConnectAttributionStore::new(std::time::Duration::from_millis(1));
+    let upstream = start_mock_tcp_server().await;
+    let (sandbox_id, addr) = start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+        TEST_POLICY,
+        Some(upstream),
+        Vec::new(),
+        Some(store.clone()),
+        true,
+    )
+    .await;
+
+    let (socket, peer_addr) = bound_tcp_socket();
+    store
+        .insert(connect_attribution_record(
+            sandbox_id,
+            peer_addr,
+            addr,
+            "/usr/bin/diagnostic-only",
+            &"d".repeat(64),
+        ))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let mut stream = socket.connect(addr).await.unwrap();
+
+    let response = send_connect_on_stream(&mut stream, "inference.local:443").await;
+    assert!(
+        response.contains("200"),
+        "optional stale identity diagnostics must not block host/port allow: {response}"
+    );
+}
+
+#[tokio::test]
+async fn optional_identity_diagnostics_do_not_override_host_port_deny() {
+    let store = ConnectAttributionStore::default();
+    let (sandbox_id, addr) = start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+        TEST_POLICY,
+        None,
+        Vec::new(),
+        Some(store.clone()),
+        true,
+    )
+    .await;
+
+    let response = send_connect_with_attribution(
+        &store,
+        sandbox_id,
+        addr,
+        "blocked.example.com:443",
+        "/usr/bin/diagnostic-only",
+        &"d".repeat(64),
+    )
+    .await;
+    assert!(
+        response.contains("403"),
+        "optional identity diagnostics must not override host/port deny: {response}"
     );
 }
 
@@ -624,6 +705,40 @@ network:
     assert!(
         response.contains("403"),
         "expected missing connect-time attribution to deny unknown fallback, got: {response}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn binary_policy_diagnostics_flag_still_requires_connect_time_attribution() {
+    let policy = r#"
+version: 1
+name: proxy-binary-diagnostics-still-hard-boundary-test
+
+network:
+  mode: proxy
+  policies:
+    - name: unknown-fallback
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+      binaries:
+        - path: "unknown"
+"#;
+    let (_sandbox_id, addr) = start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+        policy,
+        None,
+        Vec::new(),
+        None,
+        true,
+    )
+    .await;
+
+    let response = send_connect(addr, "inference.local:443").await;
+    assert!(
+        response.contains("403"),
+        "binary-restricted policies must not use diagnostics or unknown identity for allow: {response}"
     );
 }
 
