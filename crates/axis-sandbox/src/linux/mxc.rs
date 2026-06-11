@@ -394,6 +394,7 @@ pub(crate) struct MxcLinuxSandbox {
     connect_attribution: Option<ConnectAttributionStore>,
     connect_supervisor: Option<super::connect_attribution::ConnectAttributionSupervisor>,
     child: Option<Child>,
+    parent_death_guard: Option<super::ParentDeathGuard>,
     exit_code: Option<i32>,
     config_file: Option<tempfile::NamedTempFile>,
     seccomp_filter_file: Option<tempfile::NamedTempFile>,
@@ -1021,6 +1022,7 @@ impl MxcLinuxSandbox {
             connect_attribution: config.connect_attribution.clone(),
             connect_supervisor: None,
             child: None,
+            parent_death_guard: None,
             exit_code: None,
             config_file: None,
             seccomp_filter_file: Some(seccomp_filter_file),
@@ -1044,6 +1046,7 @@ impl MxcLinuxSandbox {
 
     fn cleanup_after_stop(&mut self) -> Result<(), SandboxError> {
         self.stop_connect_supervisor();
+        self.finish_parent_death_guard();
         self.config_file.take();
         self.seccomp_filter_file.take();
         let mut cleanup_errors = Vec::new();
@@ -1069,6 +1072,12 @@ impl MxcLinuxSandbox {
     fn stop_connect_supervisor(&mut self) {
         if let Some(mut supervisor) = self.connect_supervisor.take() {
             supervisor.stop();
+        }
+    }
+
+    fn finish_parent_death_guard(&mut self) {
+        if let Some(mut guard) = self.parent_death_guard.take() {
+            guard.finish();
         }
     }
 
@@ -1162,6 +1171,7 @@ impl MxcLinuxSandbox {
         error: SandboxError,
     ) -> SandboxError {
         self.stop_connect_supervisor();
+        self.finish_parent_death_guard();
         super::close_fd(netns_fd);
         self.config_file.take();
         self.seccomp_filter_file.take();
@@ -1697,6 +1707,19 @@ impl SandboxImpl for MxcLinuxSandbox {
             return Err(self.cleanup_for_start_failure_with_netns_fd(netns_fd, err));
         }
 
+        let parent_death_guard_pipe = match super::ParentDeathGuardPipe::new() {
+            Ok(pipe) => pipe,
+            Err(err) => {
+                super::close_fd(cgroup_procs_fd);
+                return Err(self.cleanup_for_start_failure_with_netns_fd(
+                    netns_fd,
+                    SandboxError::SpawnFailed(format!("parent-death guard pipe: {err}")),
+                ));
+            }
+        };
+        let parent_death_child_fds = parent_death_guard_pipe.child_fds();
+        let owner_pid = unsafe { libc::getpid() };
+
         let mut child_error_pipe = match super::ChildSetupErrorPipe::new() {
             Ok(pipe) => pipe,
             Err(err) => {
@@ -1711,6 +1734,15 @@ impl SandboxImpl for MxcLinuxSandbox {
         let resolved_identity = self.resolved_identity.clone();
         unsafe {
             command.pre_exec(move || {
+                if let Err(errno) = super::install_parent_death_signal(owner_pid) {
+                    return Err(super::child_setup_error(
+                        child_error_write_fd,
+                        super::ChildSetupErrorKind::ParentDeathSignal,
+                        errno,
+                    ));
+                }
+                super::close_parent_death_guard_child_fds(parent_death_child_fds);
+
                 if libc::setpgid(0, 0) < 0 {
                     return Err(super::child_setup_error(
                         child_error_write_fd,
@@ -1877,6 +1909,29 @@ impl SandboxImpl for MxcLinuxSandbox {
             }
         };
         let pid = child.id();
+        let parent_death_guard =
+            match crate::sandbox::record_startup_result(
+                &trace,
+                "post_spawn_handoff.parent_death_guard",
+                || {
+                    super::ParentDeathGuard::spawn_for_process_group(
+                        pid as i32,
+                        parent_death_guard_pipe,
+                    )
+                },
+            ) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    kill_process_group(pid as i32);
+                    let _ = wait_for_killed_child(&mut child, pid as i32);
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("parent-death guard monitor: {err}"),
+                    )));
+                }
+            };
         if let Some(mut pair) = seccomp_listener_pair.take() {
             let listener_fd = match crate::sandbox::record_startup_result(
                 &trace,
@@ -1927,6 +1982,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             }
         }
         self.config_file = Some(config);
+        self.parent_death_guard = Some(parent_death_guard);
         self.child = Some(child);
         tracing::info!(
             "sandbox {} started via MXC Linux backend, pid={pid}",
@@ -6087,6 +6143,95 @@ mod tests {
             !bridge_root.exists(),
             "PTY bridge runtime parent should be removed when empty"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_parent_death_guard_kills_interactive_executor_group_and_cleans_runtime_dirs() {
+        let root = secure_tempdir();
+        let executable = root.path().join("lxc-exec");
+        let descendant_pid = root.path().join("descendant.pid");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 mode=run\n\
+                 for arg in \"$@\"; do\n\
+                   if [ \"$arg\" = '--dry-run' ]; then mode=dry; fi\n\
+                 done\n\
+                 if [ \"$mode\" = dry ]; then\n\
+                   echo '{}'\n\
+                   exit 0\n\
+                 fi\n\
+                 sleep 30 &\n\
+                 echo $! > {}\n\
+                 wait\n",
+                MXC_DRY_RUN_SUCCESS,
+                shell_quote_path(&descendant_pid)
+            ),
+            0o700,
+        );
+        let executor = MxcExecutor::from_injected_path(&executable).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = mxc_representable_policy(NetworkMode::Allow);
+        policy.filesystem.read_write.push("{tmpdir}".into());
+        let tmpdir = crate::linux::landlock::sandbox_tmpdir(workspace.path());
+        let mut config = config(policy, workspace.path().into());
+        config.capture_output = false;
+        config.interactive_terminal = true;
+        let bridge_root = workspace.path().join(".axis-pty");
+        let bridge_dir = bridge_root.join(config.id.to_string());
+
+        let launcher = fake_seccomp_launcher(&root);
+        let mut sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher).unwrap();
+        assert!(tmpdir.exists(), "MXC setup should create AXIS tmpdir");
+        SandboxImpl::start(&mut sandbox).unwrap();
+        assert!(
+            bridge_dir.exists(),
+            "PTY bridge runtime directory should exist while sandbox runs"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !descendant_pid.exists() {
+            if Instant::now() >= deadline {
+                SandboxImpl::destroy(&mut sandbox).ok();
+                panic!("MXC executor descendant pid was not recorded");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let pid = fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+
+        sandbox
+            .parent_death_guard
+            .as_mut()
+            .expect("MXC start should install a parent-death guard")
+            .trigger_owner_death_for_test();
+        if let Some(mut child) = sandbox.child.take() {
+            let process_group = child.id() as i32;
+            sandbox.exit_code = Some(wait_for_killed_child(&mut child, process_group));
+        }
+        sandbox.cleanup_after_stop().unwrap();
+
+        let stopped_deadline = Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid) {
+            if Instant::now() >= stopped_deadline {
+                panic!("MXC executor descendant process {pid} survived parent-death guard");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !bridge_dir.exists(),
+            "PTY bridge runtime directory should be removed during cleanup"
+        );
+        assert!(
+            !bridge_root.exists(),
+            "PTY bridge runtime parent should be removed when empty"
+        );
+        assert!(!tmpdir.exists(), "MXC cleanup should remove AXIS tmpdir");
     }
 
     #[test]

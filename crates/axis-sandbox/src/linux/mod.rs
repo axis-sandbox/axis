@@ -243,13 +243,35 @@ impl ParentDeathGuard {
     }
 
     fn finish(&mut self) {
+        self.disarm();
+        self.wait_for_monitor();
+    }
+
+    fn disarm(&mut self) {
+        if self.write_fd != CLOSED_FD {
+            let disarm = [1u8];
+            unsafe {
+                let _ = libc::write(self.write_fd, disarm.as_ptr().cast(), disarm.len());
+            }
+            unsafe {
+                libc::close(self.write_fd);
+            }
+            self.write_fd = CLOSED_FD;
+        }
+    }
+
+    #[cfg(test)]
+    fn trigger_owner_death_for_test(&mut self) {
         if self.write_fd != CLOSED_FD {
             unsafe {
                 libc::close(self.write_fd);
             }
             self.write_fd = CLOSED_FD;
         }
+        self.wait_for_monitor();
+    }
 
+    fn wait_for_monitor(&mut self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         loop {
             let mut status = 0;
@@ -1472,8 +1494,13 @@ fn current_errno() -> i32 {
 
 fn run_parent_death_monitor(read_fd: i32, process_group: libc::pid_t) -> ! {
     let mut byte = 0u8;
+    let mut disarmed = false;
     loop {
         let ret = unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+        if ret > 0 {
+            disarmed = true;
+            break;
+        }
         if ret == 0 {
             break;
         }
@@ -1485,13 +1512,28 @@ fn run_parent_death_monitor(read_fd: i32, process_group: libc::pid_t) -> ! {
     unsafe {
         libc::close(read_fd);
     }
-    if process_group > 1 {
-        unsafe {
-            libc::kill(-process_group, libc::SIGKILL);
-        }
+    if !disarmed && process_group > 1 {
+        parent_death_kill_process_group(process_group);
     }
     unsafe {
         libc::_exit(0);
+    }
+}
+
+fn parent_death_kill_process_group(process_group: libc::pid_t) {
+    for _ in 0..25 {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+
+        let probe = unsafe { libc::kill(-process_group, 0) };
+        if probe < 0 && current_errno() == libc::ESRCH {
+            return;
+        }
+
+        unsafe {
+            libc::usleep(20_000);
+        }
     }
 }
 
@@ -2626,7 +2668,7 @@ mod tests {
 
         let pipe = ParentDeathGuardPipe::new().unwrap();
         let mut guard = ParentDeathGuard::spawn_for_process_group(process_group, pipe).unwrap();
-        guard.finish();
+        guard.trigger_owner_death_for_test();
         let _ = wait_for_killed_child(&mut child, process_group);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2637,6 +2679,57 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn parent_death_guard_finish_disarms_monitor_without_killing_process_group() {
+        if !Path::new("/bin/sh").exists() {
+            eprintln!("/bin/sh unavailable (test skipped)");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let pid_path = workspace.path().join("background.pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $! > \"$PID_PATH\"; wait")
+            .env("PID_PATH", &pid_path);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let process_group = child.id() as libc::pid_t;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pid_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                kill_process_group(process_group);
+                let _ = wait_for_killed_child(&mut child, process_group);
+                panic!("background pid was not recorded");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let background_pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        let pipe = ParentDeathGuardPipe::new().unwrap();
+        let mut guard = ParentDeathGuard::spawn_for_process_group(process_group, pipe).unwrap();
+        guard.finish();
+
+        assert!(
+            process_exists(background_pid),
+            "normal guard finish should disarm the owner-death monitor"
+        );
+        kill_process_group(process_group);
+        let _ = wait_for_killed_child(&mut child, process_group);
     }
 
     #[tokio::test(flavor = "multi_thread")]

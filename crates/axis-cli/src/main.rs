@@ -882,10 +882,10 @@ async fn main() -> Result<()> {
 
                     if quiet {
                         // Interactive mode: just wait for the child to exit.
-                        // Don't install tokio signal handlers — they steal the
-                        // TTY from the child process and break TUI apps like
+                        // Don't install a Ctrl+C handler, because it steals the
+                        // TTY from the child process and breaks TUI apps like
                         // Claude Code (setRawMode fails).
-                        let code = sandbox.wait().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let code = wait_for_interactive_standalone_sandbox(&mut sandbox).await?;
                         sandbox.destroy().ok();
                         std::process::exit(code);
                     } else {
@@ -927,6 +927,27 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_interactive_standalone_sandbox(
+    sandbox: &mut axis_sandbox::Sandbox,
+) -> Result<i32> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        code = sandbox.wait() => Ok(code.map_err(|e| anyhow::anyhow!("{e}"))?),
+        _ = terminate.recv() => {
+            sandbox.destroy().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(128 + libc::SIGTERM)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_interactive_standalone_sandbox(
+    sandbox: &mut axis_sandbox::Sandbox,
+) -> Result<i32> {
+    sandbox.wait().await.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Git-style subcommand extension.
