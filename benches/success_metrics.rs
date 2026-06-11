@@ -74,6 +74,7 @@ network:
         capture_output: false,
         interactive_terminal: false,
         timeout_sec: None,
+        startup_trace: None,
     };
 
     let start = Instant::now();
@@ -117,6 +118,7 @@ network:
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: None,
+        timing_tx: None,
     };
 
     let mut proxy = AxisProxy::new(config).unwrap();
@@ -304,6 +306,7 @@ async fn main() {
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
+            timing_tx: None,
         };
         let _proxy = axis_proxy::proxy::AxisProxy::new(config).unwrap();
         let rss_after = measure_memory_overhead();

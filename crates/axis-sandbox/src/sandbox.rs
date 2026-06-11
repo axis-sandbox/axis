@@ -7,6 +7,8 @@ use axis_core::connect_attribution::ConnectAttributionStore;
 use axis_core::policy::{Policy, RuntimeContainment, RuntimeProvider};
 use axis_core::types::{SandboxId, SandboxStatus};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -51,6 +53,55 @@ pub struct SandboxConfig {
     pub interactive_terminal: bool,
     /// Maximum wall-clock time before auto-destroy (seconds). None = no timeout.
     pub timeout_sec: Option<u64>,
+    /// Optional phase recorder for benchmark instrumentation. Normal runtime
+    /// paths leave this unset so launch behavior is unchanged.
+    pub startup_trace: Option<StartupTrace>,
+}
+
+/// Opt-in startup phase timing recorder used by benchmarks.
+#[derive(Debug, Clone, Default)]
+pub struct StartupTrace {
+    phases: Arc<Mutex<Vec<StartupPhaseTiming>>>,
+}
+
+/// One measured startup phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPhaseTiming {
+    pub phase: &'static str,
+    pub duration: Duration,
+}
+
+impl StartupTrace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, phase: &'static str, duration: Duration) {
+        self.phases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(StartupPhaseTiming { phase, duration });
+    }
+
+    pub fn phases(&self) -> Vec<StartupPhaseTiming> {
+        self.phases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+pub(crate) fn record_startup_result<T, E>(
+    trace: &Option<StartupTrace>,
+    phase: &'static str,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let start = Instant::now();
+    let result = f();
+    if let Some(trace) = trace {
+        trace.record(phase, start.elapsed());
+    }
+    result
 }
 
 /// Platform-independent sandbox handle.
@@ -95,15 +146,22 @@ impl Sandbox {
         manage_agent_workspace: bool,
         backend: PlatformBackendSelection,
     ) -> Result<Self, SandboxError> {
-        config
-            .policy
-            .validate()
-            .map_err(|e| SandboxError::CreationFailed(format!("invalid sandbox policy: {e}")))?;
+        let trace = config.startup_trace.clone();
+        record_startup_result(&trace, "front_door.policy_validation", || {
+            config
+                .policy
+                .validate()
+                .map_err(|e| SandboxError::CreationFailed(format!("invalid sandbox policy: {e}")))
+        })?;
 
         let agent_symlinks =
-            prepare_managed_agent_workspace(&mut config, manage_agent_workspace, backend)?;
+            record_startup_result(&trace, "support_files.agent_workspace", || {
+                prepare_managed_agent_workspace(&mut config, manage_agent_workspace, backend)
+            })?;
 
-        let inner = match create_platform_sandbox_with_backend(&config, backend) {
+        let inner = match record_startup_result(&trace, "backend.prepare", || {
+            create_platform_sandbox_with_backend(&config, backend)
+        }) {
             Ok(inner) => inner,
             Err(err) => {
                 cleanup_prepared_agent_workspace_on_setup_failure(&agent_symlinks);
@@ -773,6 +831,7 @@ mod tests {
             capture_output: false,
             interactive_terminal: false,
             timeout_sec: None,
+            startup_trace: None,
         }
     }
 

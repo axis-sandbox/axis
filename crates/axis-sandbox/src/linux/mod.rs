@@ -294,9 +294,14 @@ impl LinuxSandbox {
         let mut config = config.clone();
         axis_core::sandbox_env::retain_linux_sandbox_env(&mut config.env);
 
-        std::fs::create_dir_all(&config.workspace_dir)?;
-        let plan = strategy::build_isolation_plan(&config)
-            .map_err(|e| SandboxError::IsolationFailed(e.to_string()))?;
+        let trace = config.startup_trace.clone();
+        crate::sandbox::record_startup_result(&trace, "support_files.workspace_dir", || {
+            std::fs::create_dir_all(&config.workspace_dir)
+        })?;
+        let plan = crate::sandbox::record_startup_result(&trace, "backend.preflight", || {
+            strategy::build_isolation_plan(&config)
+                .map_err(|e| SandboxError::IsolationFailed(e.to_string()))
+        })?;
 
         Ok(Self {
             config,
@@ -1518,6 +1523,7 @@ impl SandboxImpl for LinuxSandbox {
         use std::os::unix::process::CommandExt;
         use std::process::Command;
 
+        let trace = self.config.startup_trace.clone();
         let sandbox_id = self.config.id;
         tracing::debug!(
             "sandbox {sandbox_id}: linux isolation plan: {:?}",
@@ -1537,48 +1543,55 @@ impl SandboxImpl for LinuxSandbox {
         {
             return self.start_with_netns_helper(proxy_port);
         }
-        let resolved_identity = self.resolve_identity()?;
+        let resolved_identity =
+            crate::sandbox::record_startup_result(&trace, "backend.preflight.identity", || {
+                self.resolve_identity()
+            })?;
         let tmpdir_required = landlock::policy_uses_tmpdir(&self.config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
-            identity::prepare_workspace_for_identity(&self.config.workspace_dir, identity)
-                .map_err(|e| SandboxError::IsolationFailed(format!("run_as_user: {e}")))?;
+            crate::sandbox::record_startup_result(
+                &trace,
+                "support_files.run_as_user_workspace",
+                || {
+                    identity::prepare_workspace_for_identity(&self.config.workspace_dir, identity)
+                        .map_err(|e| SandboxError::IsolationFailed(format!("run_as_user: {e}")))
+                },
+            )?;
         }
         let prepared_landlock =
-            if let (Some(identity), true) = (&resolved_identity, tmpdir_required) {
-                if let Err(e) =
-                    identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
-                {
-                    return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
-                }
-                self.tmpdir_active = true;
-                match landlock::prepare_landlock_with_tmpdir_setup(
-                    &self.config.policy.filesystem,
-                    &self.config.workspace_dir,
-                    landlock::TmpdirSetup::AlreadyPrepared,
-                ) {
-                    Ok(ruleset) => ruleset,
-                    Err(e) => {
-                        let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
-                        return Err(append_cleanup_failure(
-                            SandboxError::IsolationFailed(e),
-                            cleanup_error,
-                        ));
+            crate::sandbox::record_startup_result(&trace, "filesystem_setup.landlock", || {
+                if let (Some(identity), true) = (&resolved_identity, tmpdir_required) {
+                    if let Err(e) =
+                        identity::create_tmpdir_for_identity(&self.config.workspace_dir, identity)
+                    {
+                        return Err(SandboxError::IsolationFailed(format!("run_as_user: {e}")));
                     }
+                    self.tmpdir_active = true;
+                    landlock::prepare_landlock_with_tmpdir_setup(
+                        &self.config.policy.filesystem,
+                        &self.config.workspace_dir,
+                        landlock::TmpdirSetup::AlreadyPrepared,
+                    )
+                    .map_err(|e| {
+                        let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                        append_cleanup_failure(SandboxError::IsolationFailed(e), cleanup_error)
+                    })
+                } else {
+                    let ruleset = landlock::prepare_landlock(
+                        &self.config.policy.filesystem,
+                        &self.config.workspace_dir,
+                    )
+                    .map_err(SandboxError::IsolationFailed)?;
+                    self.tmpdir_active = tmpdir_required;
+                    Ok(ruleset)
                 }
-            } else {
-                let ruleset = landlock::prepare_landlock(
-                    &self.config.policy.filesystem,
-                    &self.config.workspace_dir,
-                )
-                .map_err(SandboxError::IsolationFailed)?;
-                self.tmpdir_active = tmpdir_required;
-                ruleset
-            };
+            })?;
         let notify_connect = self.connect_attribution_required_for_native_proxy()?;
         let seccomp_options = seccomp_options_for_network(&self.plan.network, notify_connect);
-        let prepared_seccomp = match seccomp::prepare_seccomp_with_options(
-            &self.config.policy.process,
-            seccomp_options,
+        let prepared_seccomp = match crate::sandbox::record_startup_result(
+            &trace,
+            "child_setup.seccomp_filter",
+            || seccomp::prepare_seccomp_with_options(&self.config.policy.process, seccomp_options),
         ) {
             Ok(filter) => filter,
             Err(e) => {
@@ -1625,23 +1638,28 @@ impl SandboxImpl for LinuxSandbox {
         } else {
             None
         };
-        let prepared_rlimits =
-            match prepare_rlimits_for_plan(&self.config.policy.process, &self.plan.resources) {
-                Ok(limits) => limits,
-                Err(e) => {
-                    let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
-                    return Err(append_cleanup_failure(
-                        SandboxError::IsolationFailed(format!("resource limits: {e}")),
-                        cleanup_error,
-                    ));
-                }
-            };
+        let prepared_rlimits = match crate::sandbox::record_startup_result(
+            &trace,
+            "resource_setup.rlimit_prepare",
+            || prepare_rlimits_for_plan(&self.config.policy.process, &self.plan.resources),
+        ) {
+            Ok(limits) => limits,
+            Err(e) => {
+                let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
+                return Err(append_cleanup_failure(
+                    SandboxError::IsolationFailed(format!("resource limits: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
 
         if matches!(
             self.plan.resources,
             strategy::ResourceStrategy::CgroupsV2 { .. }
         ) {
-            match resources::create_cgroup(sandbox_id, &self.config.policy.process) {
+            match crate::sandbox::record_startup_result(&trace, "resource_setup.cgroup", || {
+                resources::create_cgroup(sandbox_id, &self.config.policy.process)
+            }) {
                 Ok(cgroup) => self.cgroup = Some(cgroup),
                 Err(e) => {
                     let cleanup_error = self.cleanup_tmpdir_for_setup_failure();
@@ -1656,18 +1674,22 @@ impl SandboxImpl for LinuxSandbox {
         // ── Step 1: Create network namespace (parent side) ──
         // This creates the netns, veth pair, and iptables rules.
         // The child will enter this namespace via setns() in pre_exec.
-        let netns_fd: Option<i32> = match &self.plan.network {
+        let native_netns_proxy_port = match &self.plan.network {
             strategy::NetworkStrategy::Proxy {
                 setup: strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
                 proxy_port,
                 ..
-            } => {
-                match netns::create_netns(sandbox_id, *proxy_port) {
+            } => Some(*proxy_port),
+            _ => None,
+        };
+        let netns_fd: Option<i32> = if let Some(proxy_port) = native_netns_proxy_port {
+            crate::sandbox::record_startup_result(&trace, "network_setup.netns", || {
+                match netns::create_netns(sandbox_id, proxy_port) {
                     Ok(name) => {
                         self.netns_name = Some(name.clone());
                         // Open the netns fd for the child to setns() into.
                         match netns::enter_netns(&name) {
-                            Ok(fd) => Some(fd),
+                            Ok(fd) => Ok(Some(fd)),
                             Err(e) => {
                                 let cleanup_error =
                                     self.cleanup_parent_resources_after_setup_failure(None);
@@ -1688,8 +1710,9 @@ impl SandboxImpl for LinuxSandbox {
                         ));
                     }
                 }
-            }
-            _ => None,
+            })?
+        } else {
+            None
         };
 
         // ── Step 2: Build child process with pre_exec isolation ──
@@ -1706,7 +1729,9 @@ impl SandboxImpl for LinuxSandbox {
         if self.config.capture_output {
             cmd.stdin(std::process::Stdio::null());
             let stdout_file =
-                match std::fs::File::create(self.config.workspace_dir.join("stdout.log")) {
+                match crate::sandbox::record_startup_result(&trace, "support_files.stdio", || {
+                    std::fs::File::create(self.config.workspace_dir.join("stdout.log"))
+                }) {
                     Ok(file) => file,
                     Err(e) => {
                         let cleanup_error =
@@ -1718,7 +1743,9 @@ impl SandboxImpl for LinuxSandbox {
                     }
                 };
             let stderr_file =
-                match std::fs::File::create(self.config.workspace_dir.join("stderr.log")) {
+                match crate::sandbox::record_startup_result(&trace, "support_files.stdio", || {
+                    std::fs::File::create(self.config.workspace_dir.join("stderr.log"))
+                }) {
                     Ok(file) => file,
                     Err(e) => {
                         let cleanup_error =
@@ -1943,29 +1970,34 @@ impl SandboxImpl for LinuxSandbox {
             });
         }
 
-        let mut child = match cmd.spawn() {
-            Ok(child) => {
-                close_fd(netns_fd);
-                close_fd(cgroup_procs_fd);
-                if let Some(pair) = seccomp_listener_pair.as_mut() {
-                    pair.close_child_in_parent();
+        let mut child =
+            match crate::sandbox::record_startup_result(&trace, "spawn.child", || cmd.spawn()) {
+                Ok(child) => {
+                    close_fd(netns_fd);
+                    close_fd(cgroup_procs_fd);
+                    if let Some(pair) = seccomp_listener_pair.as_mut() {
+                        pair.close_child_in_parent();
+                    }
+                    drop(child_error_pipe);
+                    child
                 }
-                drop(child_error_pipe);
-                child
-            }
-            Err(e) => {
-                close_fd(cgroup_procs_fd);
-                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(netns_fd);
-                return Err(append_cleanup_failure(
-                    spawn_error(e, &mut child_error_pipe),
-                    cleanup_error,
-                ));
-            }
-        };
+                Err(e) => {
+                    close_fd(cgroup_procs_fd);
+                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(netns_fd);
+                    return Err(append_cleanup_failure(
+                        spawn_error(e, &mut child_error_pipe),
+                        cleanup_error,
+                    ));
+                }
+            };
 
         let pid = child.id();
         if let Some(mut pair) = seccomp_listener_pair.take() {
-            let listener_fd = match pair.recv_listener_fd() {
+            let listener_fd = match crate::sandbox::record_startup_result(
+                &trace,
+                "child_setup_handoff.connect_attribution",
+                || pair.recv_listener_fd(),
+            ) {
                 Ok(fd) => fd,
                 Err(e) => {
                     unsafe {
@@ -1985,7 +2017,11 @@ impl SandboxImpl for LinuxSandbox {
             let config = connect_supervisor_config
                 .clone()
                 .expect("connect supervisor config exists when listener pair exists");
-            match connect_attribution::ConnectAttributionSupervisor::start(listener_fd, config) {
+            match crate::sandbox::record_startup_result(
+                &trace,
+                "post_spawn_handoff.connect_supervisor",
+                || connect_attribution::ConnectAttributionSupervisor::start(listener_fd, config),
+            ) {
                 Ok(supervisor) => self.connect_supervisor = Some(supervisor),
                 Err(e) => {
                     close_fd(Some(listener_fd));
@@ -2004,22 +2040,25 @@ impl SandboxImpl for LinuxSandbox {
                 }
             }
         }
-        let parent_death_guard =
-            match ParentDeathGuard::spawn_for_process_group(pid as i32, parent_death_guard_pipe) {
-                Ok(guard) => guard,
-                Err(e) => {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                    kill_process_group(pid as i32);
-                    let _ = wait_for_killed_child(&mut child, pid as i32);
-                    let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
-                    return Err(append_cleanup_failure(
-                        SandboxError::SpawnFailed(format!("parent-death guard monitor: {e}")),
-                        cleanup_error,
-                    ));
+        let parent_death_guard = match crate::sandbox::record_startup_result(
+            &trace,
+            "post_spawn_handoff.parent_guard",
+            || ParentDeathGuard::spawn_for_process_group(pid as i32, parent_death_guard_pipe),
+        ) {
+            Ok(guard) => guard,
+            Err(e) => {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
                 }
-            };
+                kill_process_group(pid as i32);
+                let _ = wait_for_killed_child(&mut child, pid as i32);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                return Err(append_cleanup_failure(
+                    SandboxError::SpawnFailed(format!("parent-death guard monitor: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
         self.parent_death_guard = Some(parent_death_guard);
         self.child = Some(child);
 
@@ -3248,6 +3287,7 @@ mod tests {
             capture_output: false,
             interactive_terminal: false,
             timeout_sec: None,
+            startup_trace: None,
         };
 
         let sandbox = LinuxSandbox::new(&config).unwrap();
@@ -3748,6 +3788,7 @@ mod tests {
                 capture_output: false,
                 interactive_terminal: false,
                 timeout_sec: None,
+                startup_trace: None,
             },
             plan: test_plan(id, workspace),
             child,

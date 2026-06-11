@@ -864,6 +864,7 @@ async fn main() -> Result<()> {
                         capture_output: false,
                         interactive_terminal: quiet,
                         timeout_sec,
+                        startup_trace: None,
                     };
 
                     let mut sandbox = axis_sandbox::Sandbox::create(config)
@@ -1203,6 +1204,7 @@ fn standalone_proxy_config_for_sandbox(
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution,
+        timing_tx: None,
     })
 }
 

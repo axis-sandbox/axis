@@ -625,6 +625,7 @@ fn start_managed_sandbox(input: StartManagedSandboxArgs) -> Result<ManagedSandbo
         capture_output: true,
         interactive_terminal: false,
         timeout_sec,
+        startup_trace: None,
     };
 
     let mut sandbox = match Sandbox::create(config) {
@@ -1032,6 +1033,7 @@ fn proxy_config_for_sandbox(
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint,
         connect_attribution,
+        timing_tx: None,
     })
 }
 
@@ -1324,6 +1326,7 @@ fn contained_exec_config_from(input: ContainedExecConfigInput<'_>) -> SandboxCon
         capture_output: true,
         interactive_terminal: false,
         timeout_sec,
+        startup_trace: None,
     }
 }
 

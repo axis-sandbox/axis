@@ -182,6 +182,7 @@ async fn benchmark_axis_proxy_requests(
         upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: Some(connect_attribution.clone()),
+        timing_tx: None,
     })?;
     let proxy_addr = proxy.bind().await?;
     let proxy_task = tokio::spawn(async move { proxy.run().await });

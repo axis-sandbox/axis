@@ -411,6 +411,7 @@ pub(crate) struct MxcLinuxSandbox {
     capture_output: bool,
     timeout_sec: Option<u64>,
     tmpdir_active: bool,
+    startup_trace: Option<crate::sandbox::StartupTrace>,
 }
 
 struct MxcPtyBridge {
@@ -716,7 +717,10 @@ fn write_all_fd(fd: i32, mut buf: &[u8]) -> io::Result<()> {
 
 impl MxcLinuxSandbox {
     pub(crate) fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
-        std::fs::create_dir_all(&config.workspace_dir)?;
+        let trace = config.startup_trace.clone();
+        crate::sandbox::record_startup_result(&trace, "support_files.workspace_dir", || {
+            std::fs::create_dir_all(&config.workspace_dir)
+        })?;
         Self::new_with_resolvers(
             config,
             || {
@@ -860,49 +864,85 @@ impl MxcLinuxSandbox {
             MxcNetworkTranslationMode,
         ) -> Result<MxcExecutionSpec, MxcTranslationError>,
     {
-        let resolved_identity = resolve_mxc_identity(&config.policy.process)?;
-        let (network_strategy, proxy_strategy) = resolve_network()?;
-        let resource_strategy = resolve_resources()?;
-        let notify_connect = mxc_connect_attribution_required(config, &network_strategy)?;
-        validate_mxc_linux_capability_plan(
-            config,
-            &network_strategy,
-            &resource_strategy,
-            notify_connect,
+        let trace = config.startup_trace.clone();
+        let resolved_identity =
+            crate::sandbox::record_startup_result(&trace, "backend.preflight.identity", || {
+                resolve_mxc_identity(&config.policy.process)
+            })?;
+        let (network_strategy, proxy_strategy) = crate::sandbox::record_startup_result(
+            &trace,
+            "backend.preflight.network",
+            resolve_network,
         )?;
+        let resource_strategy = crate::sandbox::record_startup_result(
+            &trace,
+            "backend.preflight.resources",
+            resolve_resources,
+        )?;
+        let notify_connect = crate::sandbox::record_startup_result(
+            &trace,
+            "backend.preflight.connect_attribution",
+            || mxc_connect_attribution_required(config, &network_strategy),
+        )?;
+        crate::sandbox::record_startup_result(&trace, "backend.preflight.capability", || {
+            validate_mxc_linux_capability_plan(
+                config,
+                &network_strategy,
+                &resource_strategy,
+                notify_connect,
+            )
+        })?;
         let mut tmpdir_active = false;
         let tmpdir_required = super::landlock::policy_uses_tmpdir(&config.policy.filesystem);
         if let Some(identity) = &resolved_identity {
-            super::identity::prepare_workspace_for_identity(&config.workspace_dir, identity)
-                .map_err(|err| SandboxError::IsolationFailed(format!("MXC run_as_user: {err}")))?;
+            crate::sandbox::record_startup_result(
+                &trace,
+                "support_files.run_as_user_workspace",
+                || {
+                    super::identity::prepare_workspace_for_identity(&config.workspace_dir, identity)
+                        .map_err(|err| {
+                            SandboxError::IsolationFailed(format!("MXC run_as_user: {err}"))
+                        })
+                },
+            )?;
             if tmpdir_required {
-                super::identity::create_tmpdir_for_identity(&config.workspace_dir, identity)
-                    .map_err(|err| {
-                        SandboxError::IsolationFailed(format!("MXC run_as_user: {err}"))
-                    })?;
+                crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
+                    super::identity::create_tmpdir_for_identity(&config.workspace_dir, identity)
+                        .map_err(|err| {
+                            SandboxError::IsolationFailed(format!("MXC run_as_user: {err}"))
+                        })
+                })?;
                 tmpdir_active = true;
             }
         } else if tmpdir_required {
-            super::landlock::create_tmpdir(&config.workspace_dir)
-                .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))?;
+            crate::sandbox::record_startup_result(&trace, "support_files.tmpdir", || {
+                super::landlock::create_tmpdir(&config.workspace_dir)
+                    .map_err(|err| SandboxError::IsolationFailed(format!("MXC tmpdir: {err}")))
+            })?;
             tmpdir_active = true;
         }
 
         let network_translation = mxc_network_translation_mode(&config.policy, &network_strategy);
-        let spec = build_spec(config, network_translation).map_err(|err| {
-            let cleanup_error =
-                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-            append_cleanup_failure(
-                SandboxError::IsolationFailed(format!("MXC Linux backend unsupported: {err}")),
-                cleanup_error,
-            )
-        })?;
+        let spec =
+            crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_spec", || {
+                build_spec(config, network_translation)
+            })
+            .map_err(|err| {
+                let cleanup_error =
+                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                append_cleanup_failure(
+                    SandboxError::IsolationFailed(format!("MXC Linux backend unsupported: {err}")),
+                    cleanup_error,
+                )
+            })?;
         let mut spec = spec;
         apply_proxy_env_to_spec(&mut spec, &proxy_strategy);
         let mut launch_command = config.command.clone();
         let mut launch_args = config.args.clone();
         let pty_bridge = if config.interactive_terminal {
-            match prepare_mxc_pty_bridge_launch(config, &mut spec) {
+            match crate::sandbox::record_startup_result(&trace, "pty_setup.prepare", || {
+                prepare_mxc_pty_bridge_launch(config, &mut spec)
+            }) {
                 Ok((bridge, command, args)) => {
                     launch_command = command;
                     launch_args = args;
@@ -917,18 +957,21 @@ impl MxcLinuxSandbox {
         } else {
             None
         };
-        let seccomp_filter_file = prepare_mxc_seccomp_launch(
-            &config.policy,
-            &mut spec,
-            resolve_seccomp_launcher,
-            &launch_command,
-            &launch_args,
-        )
-        .map_err(|err| {
-            let cleanup_error =
-                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-            append_cleanup_failure(err, cleanup_error)
-        })?;
+        let seccomp_filter_file =
+            crate::sandbox::record_startup_result(&trace, "child_setup.seccomp_launcher", || {
+                prepare_mxc_seccomp_launch(
+                    &config.policy,
+                    &mut spec,
+                    resolve_seccomp_launcher,
+                    &launch_command,
+                    &launch_args,
+                )
+            })
+            .map_err(|err| {
+                let cleanup_error =
+                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                append_cleanup_failure(err, cleanup_error)
+            })?;
         if let Some(identity) = &resolved_identity {
             prepare_seccomp_filter_for_identity(&seccomp_filter_file, identity).map_err(|err| {
                 let cleanup_error =
@@ -936,24 +979,30 @@ impl MxcLinuxSandbox {
                 append_cleanup_failure(err, cleanup_error)
             })?;
         }
-        let executor = resolve_executor().map_err(|err| {
+        let executor = crate::sandbox::record_startup_result(
+            &trace,
+            "backend.preflight.executor",
+            resolve_executor,
+        )
+        .map_err(|err| {
             let cleanup_error =
                 cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
             append_cleanup_failure(err, cleanup_error)
         })?;
         let allowed_proxy_env = allowed_proxy_env(&proxy_strategy);
-        executor
-            .dry_run_with_allowed_env(&spec, Duration::from_secs(5), &allowed_proxy_env)
-            .map_err(|err| {
-                let cleanup_error =
-                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-                append_cleanup_failure(
-                    SandboxError::IsolationFailed(format!(
-                        "MXC Linux dry-run validation failed: {err}"
-                    )),
-                    cleanup_error,
-                )
-            })?;
+        crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_dry_run", || {
+            executor.dry_run_with_allowed_env(&spec, Duration::from_secs(5), &allowed_proxy_env)
+        })
+        .map_err(|err| {
+            let cleanup_error =
+                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+            append_cleanup_failure(
+                SandboxError::IsolationFailed(format!(
+                    "MXC Linux dry-run validation failed: {err}"
+                )),
+                cleanup_error,
+            )
+        })?;
 
         Ok(Self {
             id: config.id,
@@ -987,6 +1036,7 @@ impl MxcLinuxSandbox {
             capture_output: config.capture_output,
             timeout_sec: config.timeout_sec,
             tmpdir_active,
+            startup_trace: config.startup_trace.clone(),
         })
     }
 
@@ -1438,37 +1488,44 @@ impl SandboxImpl for MxcLinuxSandbox {
             ));
         }
 
+        let trace = self.startup_trace.clone();
         let allowed_proxy_env = allowed_proxy_env(&self.proxy_strategy);
-        let config = match self
-            .executor
-            .write_private_config_with_allowed_env(&self.spec, &allowed_proxy_env)
-        {
-            Ok(config) => config,
-            Err(err) => {
-                return Err(
-                    self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
-                        "MXC config: {err}"
-                    ))),
-                );
-            }
-        };
-        let prepared_rlimits =
-            match super::prepare_rlimits_for_plan(&self.process_policy, &self.resource_strategy) {
-                Ok(limits) => limits,
+        let config =
+            match crate::sandbox::record_startup_result(&trace, "support_files.mxc_config", || {
+                self.executor
+                    .write_private_config_with_allowed_env(&self.spec, &allowed_proxy_env)
+            }) {
+                Ok(config) => config,
                 Err(err) => {
                     return Err(
                         self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
-                            "MXC resource limits: {err}"
+                            "MXC config: {err}"
                         ))),
                     );
                 }
             };
+        let prepared_rlimits = match crate::sandbox::record_startup_result(
+            &trace,
+            "resource_setup.rlimit_prepare",
+            || super::prepare_rlimits_for_plan(&self.process_policy, &self.resource_strategy),
+        ) {
+            Ok(limits) => limits,
+            Err(err) => {
+                return Err(
+                    self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                        "MXC resource limits: {err}"
+                    ))),
+                );
+            }
+        };
 
         if matches!(
             self.resource_strategy,
             super::strategy::ResourceStrategy::CgroupsV2 { .. }
         ) {
-            match self.create_cgroup_for_start() {
+            match crate::sandbox::record_startup_result(&trace, "resource_setup.cgroup", || {
+                self.create_cgroup_for_start()
+            }) {
                 Ok(cgroup) => self.cgroup = Some(cgroup),
                 Err(err) => {
                     return Err(
@@ -1508,12 +1565,22 @@ impl SandboxImpl for MxcLinuxSandbox {
             );
         }
 
-        let netns_fd = match &self.network_strategy {
+        let native_netns_proxy_port = match &self.network_strategy {
             super::strategy::NetworkStrategy::Proxy {
                 setup: super::strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin,
                 proxy_port,
                 ..
-            } => match self.create_netns_for_start(*proxy_port) {
+            } => Some(*proxy_port),
+            super::strategy::NetworkStrategy::Proxy {
+                setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+                ..
+            } => unreachable!("MXC helper launch is handled before native netns setup"),
+            _ => None,
+        };
+        let netns_fd = if let Some(proxy_port) = native_netns_proxy_port {
+            match crate::sandbox::record_startup_result(&trace, "network_setup.netns", || {
+                self.create_netns_for_start(proxy_port)
+            }) {
                 Ok(fd) => Some(fd),
                 Err(err) => {
                     super::close_fd(cgroup_procs_fd);
@@ -1523,12 +1590,9 @@ impl SandboxImpl for MxcLinuxSandbox {
                         ))),
                     );
                 }
-            },
-            super::strategy::NetworkStrategy::Proxy {
-                setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
-                ..
-            } => unreachable!("MXC helper launch is handled before native netns setup"),
-            _ => None,
+            }
+        } else {
+            None
         };
 
         let prepared_connect_notify_filter = self
@@ -1593,32 +1657,39 @@ impl SandboxImpl for MxcLinuxSandbox {
 
         if self.capture_output {
             command.stdin(Stdio::null());
-            let stdout = match File::create(self.workspace_dir.join("stdout.log")) {
-                Ok(stdout) => stdout,
-                Err(err) => {
-                    super::close_fd(cgroup_procs_fd);
-                    return Err(self.cleanup_for_start_failure_with_netns_fd(
-                        netns_fd,
-                        SandboxError::SpawnFailed(format!("stdout log: {err}")),
-                    ));
-                }
-            };
-            let stderr = match File::create(self.workspace_dir.join("stderr.log")) {
-                Ok(stderr) => stderr,
-                Err(err) => {
-                    super::close_fd(cgroup_procs_fd);
-                    return Err(self.cleanup_for_start_failure_with_netns_fd(
-                        netns_fd,
-                        SandboxError::SpawnFailed(format!("stderr log: {err}")),
-                    ));
-                }
-            };
+            let stdout =
+                match crate::sandbox::record_startup_result(&trace, "support_files.stdio", || {
+                    File::create(self.workspace_dir.join("stdout.log"))
+                }) {
+                    Ok(stdout) => stdout,
+                    Err(err) => {
+                        super::close_fd(cgroup_procs_fd);
+                        return Err(self.cleanup_for_start_failure_with_netns_fd(
+                            netns_fd,
+                            SandboxError::SpawnFailed(format!("stdout log: {err}")),
+                        ));
+                    }
+                };
+            let stderr =
+                match crate::sandbox::record_startup_result(&trace, "support_files.stdio", || {
+                    File::create(self.workspace_dir.join("stderr.log"))
+                }) {
+                    Ok(stderr) => stderr,
+                    Err(err) => {
+                        super::close_fd(cgroup_procs_fd);
+                        return Err(self.cleanup_for_start_failure_with_netns_fd(
+                            netns_fd,
+                            SandboxError::SpawnFailed(format!("stderr log: {err}")),
+                        ));
+                    }
+                };
             command.stdout(Stdio::from(stdout));
             command.stderr(Stdio::from(stderr));
         }
 
         if let Some(bridge) = self.pty_bridge.as_mut()
-            && let Err(err) = bridge.start()
+            && let Err(err) =
+                crate::sandbox::record_startup_result(&trace, "pty_setup.bridge", || bridge.start())
         {
             super::close_fd(cgroup_procs_fd);
             return Err(self.cleanup_for_start_failure_with_netns_fd(netns_fd, err));
@@ -1777,7 +1848,9 @@ impl SandboxImpl for MxcLinuxSandbox {
             });
         }
 
-        let mut child = match command.spawn() {
+        let mut child = match crate::sandbox::record_startup_result(&trace, "spawn.child", || {
+            command.spawn()
+        }) {
             Ok(child) => {
                 super::close_fd(netns_fd);
                 super::close_fd(cgroup_procs_fd);
@@ -1803,7 +1876,11 @@ impl SandboxImpl for MxcLinuxSandbox {
         };
         let pid = child.id();
         if let Some(mut pair) = seccomp_listener_pair.take() {
-            let listener_fd = match pair.recv_listener_fd() {
+            let listener_fd = match crate::sandbox::record_startup_result(
+                &trace,
+                "child_setup_handoff.connect_attribution",
+                || pair.recv_listener_fd(),
+            ) {
                 Ok(fd) => fd,
                 Err(err) => {
                     unsafe {
@@ -1821,9 +1898,15 @@ impl SandboxImpl for MxcLinuxSandbox {
             let config = connect_supervisor_config
                 .clone()
                 .expect("connect supervisor config exists when listener pair exists");
-            match super::connect_attribution::ConnectAttributionSupervisor::start(
-                listener_fd,
-                config,
+            match crate::sandbox::record_startup_result(
+                &trace,
+                "post_spawn_handoff.connect_supervisor",
+                || {
+                    super::connect_attribution::ConnectAttributionSupervisor::start(
+                        listener_fd,
+                        config,
+                    )
+                },
             ) {
                 Ok(supervisor) => self.connect_supervisor = Some(supervisor),
                 Err(err) => {
@@ -3697,6 +3780,7 @@ mod tests {
             capture_output: true,
             interactive_terminal: false,
             timeout_sec: None,
+            startup_trace: None,
         }
     }
 
@@ -7643,6 +7727,7 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: Some(inference_endpoint),
             connect_attribution: Some(connect_attribution),
+            timing_tx: None,
         };
         let mut proxy = axis_proxy::proxy::AxisProxy::new(config).unwrap();
         let actual_bind_addr = proxy.bind().await.unwrap();

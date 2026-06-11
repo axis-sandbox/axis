@@ -23,10 +23,12 @@ use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::net::TcpListener;
 #[cfg(target_os = "linux")]
 use tokio::net::TcpSocket;
+use tokio::sync::mpsc;
 
 use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
 use crate::secrets::CredentialInjector;
@@ -72,6 +74,66 @@ pub struct ProxyConfig {
     /// Connect-time identity records produced by a platform-specific sandbox
     /// launcher. Policies with binary allowlists require this hard boundary.
     pub connect_attribution: Option<ConnectAttributionStore>,
+    /// Optional benchmark timing channel. Normal runtime paths leave this unset.
+    pub timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
+}
+
+/// Per-connection proxy timing emitted only when `ProxyConfig::timing_tx` is set.
+#[derive(Debug, Clone)]
+pub struct ProxyTimingEvent {
+    pub outcome: ProxyTimingOutcome,
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+    pub phases: Vec<ProxyTimingPhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyTimingOutcome {
+    Allowed,
+    Denied,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyTimingPhase {
+    pub phase: &'static str,
+    pub duration: Duration,
+}
+
+struct ProxyConnectionTimer {
+    start: Instant,
+    phases: Vec<ProxyTimingPhase>,
+}
+
+impl ProxyConnectionTimer {
+    fn start() -> Self {
+        Self {
+            start: Instant::now(),
+            phases: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, phase: &'static str, duration: Duration) {
+        self.phases.push(ProxyTimingPhase { phase, duration });
+    }
+
+    fn finish(
+        mut self,
+        outcome: ProxyTimingOutcome,
+        target_host: Option<String>,
+        target_port: Option<u16>,
+        timing_tx: &Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
+    ) {
+        self.record("total", self.start.elapsed());
+        if let Some(tx) = timing_tx {
+            let _ = tx.send(ProxyTimingEvent {
+                outcome,
+                target_host,
+                target_port,
+                phases: self.phases,
+            });
+        }
+    }
 }
 
 /// Shared state for the proxy, protected by a Mutex for thread-safe access.
@@ -167,6 +229,7 @@ impl AxisProxy {
             let state = Arc::clone(&self.state);
             let enable_l7 = self.config.enable_l7;
             let inference_endpoint = self.config.inference_endpoint;
+            let timing_tx = self.config.timing_tx.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(
@@ -177,6 +240,7 @@ impl AxisProxy {
                     state,
                     enable_l7,
                     inference_endpoint,
+                    timing_tx,
                 )
                 .await
                 {
@@ -255,10 +319,14 @@ async fn handle_connection(
     state: Arc<Mutex<ProxyState>>,
     enable_l7: bool,
     inference_endpoint: Option<SocketAddr>,
+    timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
 ) -> Result<(), ProxyError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    let mut timing = ProxyConnectionTimer::start();
+    let phase_start = Instant::now();
     let binary_identity = resolve_binary_identity(sandbox_id, peer_addr, proxy_addr, &state).await;
+    timing.record("identity_attribution", phase_start.elapsed());
     let identity_check = {
         let mut st = state.lock().unwrap();
         verify_binary_identity(&mut st.tofu_store, binary_identity)
@@ -272,6 +340,7 @@ async fn handle_connection(
                 "AXIS policy denied connection\r\nReason: binary identity check failed\r\n",
             )
             .await?;
+            timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
             return Ok(());
         }
     };
@@ -279,6 +348,7 @@ async fn handle_connection(
     let mut reader = BufReader::new(stream);
 
     // 1. Read the CONNECT request line.
+    let phase_start = Instant::now();
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
     let (host, port) = parse_connect_target(&request_line)?;
@@ -293,8 +363,10 @@ async fn handle_connection(
             break;
         }
     }
+    timing.record("request_parse", phase_start.elapsed());
 
     // 4. Evaluate OPA network policy.
+    let phase_start = Instant::now();
     let decision = {
         let mut st = state.lock().unwrap();
 
@@ -321,6 +393,7 @@ async fn handle_connection(
 
         decision
     };
+    timing.record("opa_evaluation", phase_start.elapsed());
 
     // 5. Enforce the decision.
     if !decision.allowed {
@@ -333,7 +406,15 @@ async fn handle_connection(
         let mut stream = reader.into_inner();
         let body =
             format!("AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n");
+        let phase_start = Instant::now();
         send_forbidden_response(&mut stream, &body).await?;
+        timing.record("response_write", phase_start.elapsed());
+        timing.finish(
+            ProxyTimingOutcome::Denied,
+            Some(host),
+            Some(port),
+            &timing_tx,
+        );
         return Ok(());
     }
 
@@ -364,15 +445,25 @@ async fn handle_connection(
         format!("{host}:{port}")
     };
 
+    let phase_start = Instant::now();
     let upstream = tokio::net::TcpStream::connect(&upstream_target)
         .await
         .map_err(|e| ProxyError::ConnectionError(format!("upstream {upstream_target}: {e}")))?;
+    timing.record("upstream_connect", phase_start.elapsed());
 
     // 7. Send 200 Connection Established.
     let mut stream = reader.into_inner();
+    let phase_start = Instant::now();
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
+    timing.record("response_write", phase_start.elapsed());
+    timing.finish(
+        ProxyTimingOutcome::Allowed,
+        Some(host.clone()),
+        Some(port),
+        &timing_tx,
+    );
 
     // 8. Bidirectional relay with optional L7 inspection and leak detection.
     let leak_enabled = {
@@ -1083,6 +1174,7 @@ mod tests {
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
+            timing_tx: None,
         };
         let proxy = AxisProxy::new(config);
         assert!(proxy.is_ok(), "proxy creation failed: {:?}", proxy.err());
@@ -1111,6 +1203,7 @@ network:
             upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
+            timing_tx: None,
         };
         let proxy = AxisProxy::new(config).unwrap();
         // Verify the proxy state was initialized correctly.

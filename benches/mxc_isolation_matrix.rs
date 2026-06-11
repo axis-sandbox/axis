@@ -884,6 +884,7 @@ process:
         capture_output: true,
         interactive_terminal: false,
         timeout_sec: Some(10),
+        startup_trace: None,
     };
     let mut sandbox = match Sandbox::create_for_exec(config) {
         Ok(sandbox) => sandbox,

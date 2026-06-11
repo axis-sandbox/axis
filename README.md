@@ -12,13 +12,15 @@ AXIS isolates AI agent processes using OS-native primitives:
 
 | Layer | Linux | Windows | macOS |
 |---|---|---|---|
-| Process | seccomp-BPF (142-syscall whitelist) | Restricted Token + Job Object | Seatbelt (sandbox-exec) |
-| Filesystem | Landlock LSM | NTFS ACLs + Low Integrity | Seatbelt profile (subpath rules) |
-| Network | seccomp block mode or netns + veth + iptables + HTTP proxy | AppContainer + loopback proxy | Seatbelt network deny + proxy |
-| GPU | HIP Remote (para-virtual GPU via TCP) | HIP Remote (TCP) | HIP Remote (TCP to Linux host) |
+| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | Restricted Token + Job Object | Seatbelt (sandbox-exec) |
+| Filesystem | MXC Bubblewrap mounts or native Landlock LSM | NTFS ACLs + Low Integrity | Seatbelt profile (subpath rules) |
+| Network | block mode, MXC cooperative proxy, or strict native netns proxy | AppContainer + loopback proxy | Seatbelt network deny + proxy |
+| GPU | Optional HIP Remote artifacts | Optional HIP Remote artifacts | Optional HIP Remote artifacts |
 | Inference | Local LLM via llama.cpp or vLLM | Same | Same |
 
-In proxy mode, every network request goes through a policy-evaluated proxy. The agent never touches the real GPU driver — HIP API calls are proxied to a worker process.
+In proxy mode, allowed network requests go through a policy-evaluated proxy.
+HIP Remote policies route GPU API calls to a worker process when the optional
+client and worker artifacts are present.
 
 ## Install
 
@@ -113,14 +115,18 @@ On macOS, AXIS uses Apple's [Seatbelt](https://developer.apple.com/documentation
 
 No admin or root required. Works on macOS 12+ (Monterey and later).
 
-### Linux (Landlock + seccomp + netns)
+### Linux (MXC Process + Native Controls)
 
-Linux selects the strongest strategy that satisfies the requested policy and
-fails closed when a policy cannot be enforced:
-1. Landlock ABI V3+ — filesystem allowlist enforced by the kernel
-2. seccomp default-deny — policy-aware syscall and socket-domain filtering
+Linux process policies default to the MXC Bubblewrap backend when
+`runtime.provider` is `auto`. AXIS keeps native Landlock/seccomp/netns paths
+selectable for policies that explicitly request `provider: axis_native` and
+fails closed when the selected provider cannot enforce the policy:
+
+1. MXC Bubblewrap or native Landlock — filesystem allowlist enforced by the selected backend
+2. AXIS seccomp default-deny — policy-aware syscall and socket-domain filtering
 3. block-mode networking — IP socket domains denied without proxy env injection
-4. proxy-mode networking — netns + veth + firewall rules route traffic through
+4. proxy-mode networking — MXC cooperative proxy for host/port policies, or
+   netns + veth + firewall rules for stricter native proxy policies through
    the AXIS proxy when native `CAP_NET_ADMIN` or the optional AXIS helper is
    available
 5. bubblewrap fallback — block-mode fallback when Landlock is unavailable and a
@@ -146,7 +152,9 @@ axis model pull TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.
 axis run --policy policies/gpu-agent.yaml -- python gpu_agent.py
 ```
 
-The sandbox sees the GPU via `libamdhip64.so` (538 HIP symbols) proxied over TCP to a `hip-worker` on the GPU host. Tested with AMD RX 9070 XT — full `hipMalloc`/`hipMemcpy`/`hipDeviceSynchronize` verified from a VM with zero GPU drivers.
+The sandbox sees the GPU through a HIP Remote client library proxied over TCP
+to a `hip-worker` on the GPU host. HIP Remote artifacts are optional runtime
+inputs; they are not part of the default no-admin quickstart.
 
 ## Policy
 
@@ -206,13 +214,13 @@ axis/
 ├── crates/
 │   ├── axis-core/       # Policy parser, OPA engine (regorus), OCSF audit
 │   ├── axis-safety/     # Credential leak detection (11 patterns)
-│   ├── axis-sandbox/    # Landlock, seccomp, netns (Linux) / Job Object, AppContainer (Windows)
-│   ├── axis-proxy/      # HTTP CONNECT proxy, OPA eval, L7 TLS termination, inference.local
+│   ├── axis-sandbox/    # MXC/native process isolation and platform sandbox adapters
+│   ├── axis-proxy/      # HTTP CONNECT proxy, OPA eval, inference.local routing
 │   ├── axis-router/     # Inference routing, model registry, smart routing, token budgets
 │   ├── axis-gpu/        # HIP Remote protocol, API filter, VRAM quotas, worker lifecycle
 │   ├── axis-daemon/     # Sandbox manager, IPC, policy hot-reload
 │   └── axis-cli/        # CLI: run, create, exec, destroy, list, policy, model
-├── hip-remote/          # HIP Remote client (libamdhip64.so) + worker (hip-worker)
+├── hip-remote/          # Optional HIP Remote client and worker artifacts
 ├── policies/            # Built-in policy templates
 ├── benches/             # Performance benchmarks
 └── e2e/                 # End-to-end tests
@@ -227,13 +235,18 @@ axis/
 | OPA per-request | 17µs | 24µs | <5ms |
 | Memory per sandbox | 1.6MB | — | <50MB |
 
-The single synthetic OPA throughput number comes from `success-metrics`. For
-policy-specific proxy request timing, and MXC Bubblewrap proxy-mode timing when
-a safe MXC executor is available, run `cargo run -p axis-bench --bin opa-scenarios`;
-see [OPA Proxy Benchmarks](docs/opa-proxy-benchmarks.md). For side-by-side MXC
-backend and network-mode runtime checks, plus the AXIS native filesystem
-boundary comparison, run `cargo run -p axis-bench --bin mxc-isolation-matrix`;
-see [MXC Isolation Matrix](docs/mxc-isolation-matrix.md).
+The single synthetic OPA throughput number comes from release-mode
+`success-metrics`. For policy-specific proxy request timing, and MXC Bubblewrap
+proxy-mode timing when a safe MXC executor is available, run
+`cargo run -p axis-bench --bin opa-scenarios`; see
+[OPA Proxy Benchmarks](docs/opa-proxy-benchmarks.md). For phase-level startup,
+cold proxy deny, and synthetic OPA comparisons across named runtime profiles,
+run `cargo run -p axis-bench --bin runtime-metrics`; see
+[Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md).
+For side-by-side MXC backend and network-mode runtime checks, plus the AXIS
+native filesystem boundary comparison, run
+`cargo run -p axis-bench --bin mxc-isolation-matrix`; see
+[MXC Isolation Matrix](docs/mxc-isolation-matrix.md).
 
 ## Status
 
