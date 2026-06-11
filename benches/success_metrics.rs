@@ -73,6 +73,7 @@ network:
         connect_attribution: None,
         capture_output: false,
         interactive_terminal: false,
+        pty_bridge_helper: None,
         timeout_sec: None,
         backend_preflight: Default::default(),
         startup_trace: None,

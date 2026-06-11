@@ -56,7 +56,9 @@ configures cooperative proxy routing for proxy-aware clients. MXC currently
 accepts that proxy shape for Bubblewrap on Linux and ProcessContainer on
 Windows. Host filtering is represented by `defaultPolicy`, `allowedHosts`, and
 `enforcementMode`; the `firewall` and `both` modes may require host firewall
-privileges such as `CAP_NET_ADMIN`.
+privileges such as `CAP_NET_ADMIN`. `network.enforcementMode.capabilities` is
+reported as unsupported on Linux because MXC capabilities-based host filtering
+is a Windows/AppContainer concept rather than a Linux network boundary.
 
 The AXIS native row is not an MXC backend. It launches the native process
 sandbox and verifies that a writable workspace remains writable while a

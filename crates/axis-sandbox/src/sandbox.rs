@@ -51,6 +51,9 @@ pub struct SandboxConfig {
     /// Attach an interactive terminal to the sandboxed command when the
     /// selected backend needs an explicit PTY transport.
     pub interactive_terminal: bool,
+    /// Optional executable that serves the hidden PTY bridge subcommand.
+    /// When unset, backends that need a bridge use the current executable.
+    pub pty_bridge_helper: Option<PathBuf>,
     /// Maximum wall-clock time before auto-destroy (seconds). None = no timeout.
     pub timeout_sec: Option<u64>,
     /// Optional backend-executor validation before start(). Normal launches
@@ -845,6 +848,7 @@ mod tests {
             connect_attribution: None,
             capture_output: false,
             interactive_terminal: false,
+            pty_bridge_helper: None,
             timeout_sec: None,
             backend_preflight: Default::default(),
             startup_trace: None,

@@ -2955,9 +2955,12 @@ fn prepare_mxc_pty_bridge_launch(
     spec: &mut MxcExecutionSpec,
 ) -> Result<(MxcPtyBridge, String, Vec<String>), SandboxError> {
     let bridge = MxcPtyBridge::new(config.id, &config.workspace_dir)?;
-    let helper = std::env::current_exe().map_err(|err| {
-        SandboxError::IsolationFailed(format!("MXC PTY bridge helper path: {err}"))
-    })?;
+    let helper = match &config.pty_bridge_helper {
+        Some(helper) => helper.clone(),
+        None => std::env::current_exe().map_err(|err| {
+            SandboxError::IsolationFailed(format!("MXC PTY bridge helper path: {err}"))
+        })?,
+    };
     let helper_path = path_to_string(&helper).map_err(|err| {
         SandboxError::IsolationFailed(format!("MXC PTY bridge helper path: {err}"))
     })?;
@@ -3781,6 +3784,7 @@ mod tests {
             connect_attribution: None,
             capture_output: true,
             interactive_terminal: false,
+            pty_bridge_helper: None,
             timeout_sec: None,
             backend_preflight: Default::default(),
             startup_trace: None,
@@ -5509,6 +5513,8 @@ mod tests {
         );
         let executor = MxcExecutor::from_injected_path(&executable).unwrap();
         let launcher = fake_seccomp_launcher(&root);
+        let bridge_helper = root.path().join("axis");
+        write_executable(&bridge_helper, "#!/bin/sh\nexit 127\n", 0o700);
         let workspace = tempfile::tempdir().unwrap();
         let mut config = config(
             mxc_representable_policy(NetworkMode::Block),
@@ -5518,6 +5524,7 @@ mod tests {
         config.args = vec!["-c".into(), "test -t 0 && test -t 1".into()];
         config.capture_output = false;
         config.interactive_terminal = true;
+        config.pty_bridge_helper = Some(bridge_helper.clone());
         config.backend_preflight = BackendPreflight::DryRun;
 
         let sandbox = MxcLinuxSandbox::new_with_executor(&config, executor, launcher.clone())
@@ -5526,15 +5533,14 @@ mod tests {
         let config_json = fs::read_to_string(config_copy).unwrap();
         let json: serde_json::Value = serde_json::from_str(&config_json).unwrap();
         let command_line = json["process"]["commandLine"].as_str().unwrap();
-        let current_exe = std::env::current_exe().unwrap();
         assert!(sandbox.pty_bridge.is_some());
         assert!(command_line.starts_with(&shell_quote_path(launcher.path())));
         assert!(command_line.contains("--filter"));
         assert!(command_line.contains("__axis-pty-bridge --socket"));
         assert!(command_line.contains("-- /bin/sh -c 'test -t 0 && test -t 1'"));
         assert!(
-            command_line.contains(&shell_quote_path(&current_exe)),
-            "command line should invoke the current AXIS executable as the bridge helper: {command_line}"
+            command_line.contains(&shell_quote_path(&bridge_helper)),
+            "command line should invoke the caller supplied bridge helper: {command_line}"
         );
     }
 

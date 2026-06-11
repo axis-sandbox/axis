@@ -1,7 +1,7 @@
 # OPA Proxy Benchmarks
 
-The README performance table uses `success-metrics` for the single synthetic
-OPA throughput number. For policy-specific proxy request timing, run:
+The README performance table uses release-mode `success-metrics` for the single
+synthetic OPA throughput number. For policy-specific proxy request timing, run:
 
 ```bash
 cargo run -p axis-bench --bin opa-scenarios

@@ -10,6 +10,7 @@ use axis_proxy::proxy::{AxisProxy, ProxyConfig, ProxyTimingEvent, ProxyTimingOut
 use axis_sandbox::{SandboxConfig, StartupTrace};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -477,6 +478,7 @@ async fn measure_sandbox_startup(profile: RuntimeProfileCase) -> Result<StartupS
 
     let (proxy_port, proxy_addr, connect_attribution) =
         startup_proxy_config(profile, sandbox_id, &policy);
+    let pty_bridge_helper = startup_pty_bridge_helper(profile)?;
     let config = SandboxConfig {
         id: sandbox_id,
         policy,
@@ -490,6 +492,7 @@ async fn measure_sandbox_startup(profile: RuntimeProfileCase) -> Result<StartupS
         connect_attribution,
         capture_output: false,
         interactive_terminal: profile == RuntimeProfileCase::Interactive,
+        pty_bridge_helper,
         timeout_sec: None,
         backend_preflight: Default::default(),
         startup_trace: Some(trace.clone()),
@@ -529,6 +532,30 @@ async fn measure_sandbox_startup(profile: RuntimeProfileCase) -> Result<StartupS
         total: startup_time,
         phases,
     })
+}
+
+fn startup_pty_bridge_helper(profile: RuntimeProfileCase) -> Result<Option<PathBuf>, String> {
+    if profile != RuntimeProfileCase::Interactive {
+        return Ok(None);
+    }
+    axis_cli_helper_path()
+        .map(Some)
+        .ok_or_else(|| "interactive profile requires an axis CLI binary beside runtime-metrics; run `cargo build -p axis-cli` before collecting this profile".into())
+}
+
+fn axis_cli_helper_path() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    axis_cli_helper_path_next_to(&current)
+}
+
+fn axis_cli_helper_path_next_to(current: &Path) -> Option<PathBuf> {
+    let dir = current.parent()?;
+    let candidate = dir.join(if cfg!(target_os = "windows") {
+        "axis.exe"
+    } else {
+        "axis"
+    });
+    candidate.is_file().then_some(candidate)
 }
 
 fn startup_policy(profile: RuntimeProfileCase) -> Result<Policy, Box<dyn std::error::Error>> {
@@ -1002,6 +1029,23 @@ mod tests {
             assert_eq!(policy.process.max_memory_mb, 0);
             assert_eq!(policy.process.cpu_rate_percent, 0);
         }
+    }
+
+    #[test]
+    fn axis_cli_helper_path_next_to_current_exe_requires_adjacent_axis_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("runtime-metrics");
+
+        assert!(axis_cli_helper_path_next_to(&current).is_none());
+
+        let helper = dir.path().join(if cfg!(target_os = "windows") {
+            "axis.exe"
+        } else {
+            "axis"
+        });
+        std::fs::write(&helper, "").unwrap();
+
+        assert_eq!(axis_cli_helper_path_next_to(&current), Some(helper));
     }
 
     #[test]

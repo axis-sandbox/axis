@@ -863,6 +863,7 @@ async fn main() -> Result<()> {
                         connect_attribution,
                         capture_output: false,
                         interactive_terminal: quiet,
+                        pty_bridge_helper: None,
                         timeout_sec,
                         backend_preflight: Default::default(),
                         startup_trace: None,

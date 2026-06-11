@@ -55,14 +55,14 @@ cost, security coverage, unsupported-policy counts, and cleanup failures.
 The current default smoke benchmark command is:
 
 ```bash
-cargo run -p axis-bench --bin success-metrics
+cargo run --release -p axis-bench --bin success-metrics
 ```
 
 ## Candidate And Experimental Backends
 
 | Backend | Class | Status | Benchmark gate |
 | --- | --- | --- | --- |
-| `axis-native-linux` | Process | Retained | `cargo run -p axis-bench --bin success-metrics` |
+| `axis-native-linux` | Process | Retained | `cargo run --release -p axis-bench --bin success-metrics` |
 | `mxc-macos-seatbelt` | Process | Candidate | `AXIS_BENCH_MXC_MACOS_SEATBELT=1` |
 | `mxc-windows-processcontainer` | Process | Candidate | `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` |
 | `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |

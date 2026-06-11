@@ -242,30 +242,32 @@ impl AxisProxy {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let proxy_addr = stream.local_addr()?;
-            let sandbox_id = self.config.sandbox_id;
-            let state = Arc::clone(&self.state);
-            let enable_l7 = self.config.enable_l7;
-            let inference_endpoint = self.config.inference_endpoint;
-            let timing_tx = self.config.timing_tx.clone();
+            let context = ProxyConnectionContext {
+                sandbox_id: self.config.sandbox_id,
+                proxy_addr,
+                state: Arc::clone(&self.state),
+                enable_l7: self.config.enable_l7,
+                inference_endpoint: self.config.inference_endpoint,
+                timing_tx: self.config.timing_tx.clone(),
+            };
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(
-                    sandbox_id,
-                    stream,
-                    peer_addr,
-                    proxy_addr,
-                    state,
-                    enable_l7,
-                    inference_endpoint,
-                    timing_tx,
-                )
-                .await
-                {
+                let sandbox_id = context.sandbox_id;
+                if let Err(e) = handle_connection(stream, peer_addr, context).await {
                     tracing::warn!("sandbox {sandbox_id}: connection from {peer_addr} failed: {e}");
                 }
             });
         }
     }
+}
+
+struct ProxyConnectionContext {
+    sandbox_id: SandboxId,
+    proxy_addr: SocketAddr,
+    state: Arc<Mutex<ProxyState>>,
+    enable_l7: bool,
+    inference_endpoint: Option<SocketAddr>,
+    timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
 }
 
 fn proxy_identity_mode(policy: &Policy, enable_identity_diagnostics: bool) -> ProxyIdentityMode {
@@ -339,17 +341,20 @@ fn set_ip_freebind(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 
 /// Handle a single proxy connection with full policy evaluation.
 async fn handle_connection(
-    sandbox_id: SandboxId,
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
-    state: Arc<Mutex<ProxyState>>,
-    enable_l7: bool,
-    inference_endpoint: Option<SocketAddr>,
-    timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
+    context: ProxyConnectionContext,
 ) -> Result<(), ProxyError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    let ProxyConnectionContext {
+        sandbox_id,
+        proxy_addr,
+        state,
+        enable_l7,
+        inference_endpoint,
+        timing_tx,
+    } = context;
     let mut timing = ProxyConnectionTimer::start();
     let identity_mode = {
         let st = state.lock().unwrap();

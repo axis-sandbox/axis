@@ -512,7 +512,27 @@ async fn run_mxc_case(
         stdout_excerpt: None,
         stderr_excerpt: None,
     };
+    let unsupported = |reason: String| MatrixRow {
+        backend: backend.label(),
+        containment: backend.containment(),
+        backend_class: backend.backend_class(),
+        mode: scenario.mode(),
+        category: scenario.category(),
+        status: "unsupported",
+        reason: Some(reason),
+        expected_markers: expected_markers.clone(),
+        metrics: None,
+        exit_code: None,
+        stdout_excerpt: None,
+        stderr_excerpt: None,
+    };
 
+    if matches!(scenario, NetworkScenario::HostFilterCapabilities) {
+        return unsupported(
+            "MXC capabilities host filtering is not a Linux enforcement mode; use firewall/both or proxy routing"
+                .into(),
+        );
+    }
     if matches!(backend, MxcBackend::Bubblewrap) && find_on_path("bwrap").is_none() {
         return unavailable("bwrap is not on PATH".into());
     }
@@ -883,6 +903,7 @@ process:
         connect_attribution: None,
         capture_output: true,
         interactive_terminal: false,
+        pty_bridge_helper: None,
         timeout_sec: Some(10),
         backend_preflight: Default::default(),
         startup_trace: None,
@@ -1294,6 +1315,27 @@ MXC_MATRIX_PROXY_DENY_OK
         assert_eq!(firewall["enforcementMode"], "firewall");
         assert_eq!(firewall["allowedHosts"][0], ALLOW_HOST);
         assert!(firewall.get("proxy").is_none());
+    }
+
+    #[tokio::test]
+    async fn linux_capabilities_host_filter_is_unsupported_before_launch() {
+        let row = run_mxc_case(
+            Path::new("/definitely/not/executed/lxc-exec"),
+            MxcBackend::Bubblewrap,
+            NetworkScenario::HostFilterCapabilities,
+            1,
+        )
+        .await;
+
+        assert_eq!(row.status, "unsupported");
+        assert_eq!(row.exit_code, None);
+        assert!(row.metrics.is_none());
+        assert!(
+            row.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not a Linux enforcement mode")
+        );
     }
 
     #[test]

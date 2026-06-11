@@ -1693,21 +1693,21 @@ impl SandboxImpl for LinuxSandbox {
                             Err(e) => {
                                 let cleanup_error =
                                     self.cleanup_parent_resources_after_setup_failure(None);
-                                return Err(append_cleanup_failure(
+                                Err(append_cleanup_failure(
                                     SandboxError::IsolationFailed(format!(
                                         "netns: cannot open fd for '{name}': {e}"
                                     )),
                                     cleanup_error,
-                                ));
+                                ))
                             }
                         }
                     }
                     Err(e) => {
                         let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
-                        return Err(append_cleanup_failure(
+                        Err(append_cleanup_failure(
                             SandboxError::IsolationFailed(format!("netns: creation failed: {e}")),
                             cleanup_error,
-                        ));
+                        ))
                     }
                 }
             })?
@@ -3286,6 +3286,7 @@ mod tests {
             connect_attribution: None,
             capture_output: false,
             interactive_terminal: false,
+            pty_bridge_helper: None,
             timeout_sec: None,
             backend_preflight: Default::default(),
             startup_trace: None,
@@ -3788,6 +3789,7 @@ mod tests {
                 connect_attribution: None,
                 capture_output: false,
                 interactive_terminal: false,
+                pty_bridge_helper: None,
                 timeout_sec: None,
                 backend_preflight: Default::default(),
                 startup_trace: None,
