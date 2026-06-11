@@ -3064,10 +3064,14 @@ fn ensure_seccomp_support_path_not_denied(
 }
 
 fn mxc_seccomp_options_for_policy(policy: &Policy) -> super::seccomp::SeccompOptions {
-    match policy.network.mode {
+    let options = match policy.network.mode {
         NetworkMode::Block => super::seccomp::SeccompOptions::deny_network_socket_domains(),
         NetworkMode::Allow | NetworkMode::Proxy => super::seccomp::SeccompOptions::default(),
-    }
+    };
+
+    // MXC owns the containment lifecycle outside the payload's process group,
+    // so agent CLIs may use session/process-group setup for tool execution.
+    options.allow_process_group_syscalls()
 }
 
 fn write_private_seccomp_filter(
@@ -3816,6 +3820,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Block);
+    }
+
+    #[test]
+    fn mxc_seccomp_allows_agent_process_groups_without_weakening_network_block() {
+        let allow_policy = policy(NetworkMode::Allow);
+        let allow_options = mxc_seccomp_options_for_policy(&allow_policy);
+        assert!(allow_options.allows_process_group_syscalls());
+        assert!(!allow_options.denies_non_unix_socket_domains());
+
+        let block_policy = policy(NetworkMode::Block);
+        let block_options = mxc_seccomp_options_for_policy(&block_policy);
+        assert!(block_options.allows_process_group_syscalls());
+        assert!(block_options.denies_non_unix_socket_domains());
     }
 
     #[test]

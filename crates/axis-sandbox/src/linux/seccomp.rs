@@ -353,6 +353,7 @@ pub(crate) enum SocketDomainPolicy {
 pub(crate) struct SeccompOptions {
     socket_domain_policy: SocketDomainPolicy,
     notify_connect: bool,
+    allow_process_group_syscalls: bool,
 }
 
 impl Default for SeccompOptions {
@@ -360,6 +361,7 @@ impl Default for SeccompOptions {
         Self {
             socket_domain_policy: SocketDomainPolicy::AllowAll,
             notify_connect: false,
+            allow_process_group_syscalls: false,
         }
     }
 }
@@ -370,11 +372,17 @@ impl SeccompOptions {
         Self {
             socket_domain_policy: SocketDomainPolicy::DenyAllExcept(vec![AF_UNIX]),
             notify_connect: false,
+            allow_process_group_syscalls: false,
         }
     }
 
     pub(crate) fn notify_connect(mut self) -> Self {
         self.notify_connect = true;
+        self
+    }
+
+    pub(crate) fn allow_process_group_syscalls(mut self) -> Self {
+        self.allow_process_group_syscalls = true;
         self
     }
 
@@ -385,6 +393,11 @@ impl SeccompOptions {
             SocketDomainPolicy::DenyAllExcept(allowed_domains)
                 if allowed_domains.as_slice() == [AF_UNIX]
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allows_process_group_syscalls(&self) -> bool {
+        self.allow_process_group_syscalls
     }
 }
 
@@ -401,6 +414,10 @@ impl SeccompFilterSpec {
     fn from_policy(policy: &ProcessPolicy, options: SeccompOptions) -> Result<Self, String> {
         let mut allowed_syscalls: Vec<u32> = WHITELIST.iter().map(|(nr, _)| *nr).collect();
         let mut blocked_syscalls = Vec::new();
+
+        if options.allow_process_group_syscalls {
+            allowed_syscalls.extend([SYS_SETPGID, SYS_SETSID]);
+        }
 
         for name in &policy.blocked_syscalls {
             let nr = syscall_number(name)
@@ -996,6 +1013,23 @@ mod tests {
     }
 
     #[test]
+    fn decision_allows_process_group_syscalls_when_lifecycle_boundary_allows_it() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().allow_process_group_syscalls(),
+        )
+        .unwrap();
+
+        for syscall in [SYS_SETPGID, SYS_SETSID] {
+            assert_eq!(
+                spec.decision_for(AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Allow,
+                "process group syscall {syscall} should be allowed when the runtime lifecycle boundary owns cleanup"
+            );
+        }
+    }
+
+    #[test]
     fn decision_denies_policy_blocked_syscall() {
         let policy = ProcessPolicy {
             blocked_syscalls: vec!["getpid".into()],
@@ -1202,6 +1236,23 @@ mod tests {
                 bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
                 FilterDecision::Errno(libc::EPERM),
                 "process group syscall {syscall} should be denied by generated BPF"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bpf_allows_process_group_syscalls_when_lifecycle_boundary_allows_it() {
+        let spec = SeccompFilterSpec::from_policy(
+            &ProcessPolicy::default(),
+            SeccompOptions::default().allow_process_group_syscalls(),
+        )
+        .unwrap();
+
+        for syscall in [SYS_SETPGID, SYS_SETSID] {
+            assert_eq!(
+                bpf_decision_for(&spec, AUDIT_ARCH_X86_64, syscall, [0; 6]),
+                FilterDecision::Allow,
+                "process group syscall {syscall} should be allowed by generated BPF when the runtime lifecycle boundary owns cleanup"
             );
         }
     }
