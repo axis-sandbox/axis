@@ -8,17 +8,20 @@ PASS=0; FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
-WORKER=~/axis/hip-remote/hip-worker
-CLIENT_LIB=~/axis/hip-remote/libamdhip64.so
-ROCM_LIBS=~/axis/hip-remote/rocm-libs
-AXIS=~/axis/axis
-AXSD=~/axis/axisd
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORKER="${AXIS_HIP_WORKER:-$REPO_ROOT/hip-remote/hip-worker}"
+CLIENT_LIB="${AXIS_HIP_CLIENT_LIB:-$REPO_ROOT/hip-remote/libamdhip64.so}"
+ROCM_LIBS="${AXIS_HIP_ROCM_LIBS:-$REPO_ROOT/hip-remote/rocm-libs}"
+AXIS="${AXIS_BIN:-$REPO_ROOT/target/release/axis}"
+AXSD="${AXISD_BIN:-$REPO_ROOT/target/release/axisd}"
+GPU_POLICY="${AXIS_GPU_POLICY:-$REPO_ROOT/policies/gpu-agent.yaml}"
 
 export LD_LIBRARY_PATH="$ROCM_LIBS:${LD_LIBRARY_PATH:-}"
+export AXIS_HIP_CLIENT_LIB="$CLIENT_LIB"
 
 # ── Test 1: hip-worker binary ──
 echo "--- Test 1: hip-worker binary ---"
-if $WORKER -h 2>&1 | grep -q "Listen port"; then
+if "$WORKER" -h 2>&1 | grep -q "Listen port"; then
     pass "hip-worker runs and shows help"
 else
     fail "hip-worker binary"
@@ -26,7 +29,7 @@ fi
 
 # ── Test 2: Client library symbols ──
 echo "--- Test 2: Client library symbols ---"
-NSYMS=$(nm -D $CLIENT_LIB 2>/dev/null | grep -c " T hip" || echo 0)
+NSYMS=$(nm -D "$CLIENT_LIB" 2>/dev/null | grep -c " T hip" || echo 0)
 if [ "$NSYMS" -gt 100 ]; then
     pass "libamdhip64.so exports $NSYMS HIP symbols"
 else
@@ -35,7 +38,7 @@ fi
 
 # ── Test 3: hip-worker TCP listener ──
 echo "--- Test 3: hip-worker listener ---"
-$WORKER -p 18525 &
+"$WORKER" -p 18525 &
 WORKER_PID=$!
 sleep 1
 
@@ -91,7 +94,7 @@ echo "--- Test 5: Client library loads ---"
 TF_WORKER_HOST=127.0.0.1 TF_WORKER_PORT=18525 \
 python3 -c "
 import ctypes, os
-lib = ctypes.CDLL(os.path.expanduser('~/axis/hip-remote/libamdhip64.so'))
+lib = ctypes.CDLL(os.environ['AXIS_HIP_CLIENT_LIB'])
 print('LOAD: OK (libamdhip64.so loaded)')
 # hipGetDeviceCount will try to connect to worker — may fail without GPU
 count = ctypes.c_int(0)
@@ -118,11 +121,11 @@ sleep 0.5
 echo "--- Test 6: AXIS GPU sandbox flow ---"
 SOCKET="/tmp/axis-hip-test-$$.sock"
 
-AXIS_SOCKET="$SOCKET" $AXSD &
+AXIS_SOCKET="$SOCKET" "$AXSD" &
 AXSD_PID=$!
 sleep 0.5
 
-OUTPUT=$($AXIS --socket "$SOCKET" create --policy ~/axis/policies/gpu-agent.yaml -- /bin/sleep 5 2>&1)
+OUTPUT=$("$AXIS" --socket "$SOCKET" create --policy "$GPU_POLICY" -- /bin/sleep 5 2>&1)
 if echo "$OUTPUT" | grep -q "Sandbox created"; then
     SANDBOX_ID=$(echo "$OUTPUT" | grep -oP "[0-9a-f-]{36}")
     pass "GPU sandbox created: $SANDBOX_ID"
@@ -134,7 +137,7 @@ if echo "$OUTPUT" | grep -q "Sandbox created"; then
         pass "hip-worker spawned (may exit without GPU)"
     fi
 
-    $AXIS --socket "$SOCKET" destroy "$SANDBOX_ID" 2>/dev/null
+    "$AXIS" --socket "$SOCKET" destroy "$SANDBOX_ID" 2>/dev/null
     pass "GPU sandbox destroyed"
 else
     fail "GPU sandbox creation"

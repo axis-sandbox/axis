@@ -1,7 +1,8 @@
 # AXIS Agent Installer for Windows (PowerShell)
 #
-# Installs agent runtimes into contained %LOCALAPPDATA%\axis\tools\ directory.
-# Creates wrapper scripts that run agents through AXIS sandbox.
+# Installs agent runtimes into %LOCALAPPDATA%\axis\tools\.
+# Creates wrapper scripts that route agents through AXIS when
+# %LOCALAPPDATA%\axis\bin is first on PATH.
 #
 # Usage:
 #   .\install_agents.ps1 -Agents aider,codex
@@ -9,7 +10,7 @@
 #   .\install_agents.ps1 -List
 #
 # Agents are installed to %LOCALAPPDATA%\axis\tools\<agent>\ and wrapper
-# scripts in %LOCALAPPDATA%\axis\bin\ run them through AXIS sandbox.
+# scripts in %LOCALAPPDATA%\axis\bin\ route them through AXIS.
 
 param(
     [string[]]$Agents,
@@ -249,7 +250,7 @@ function Get-AgentDefaultFlags {
     param([string]$AgentName)
     switch ($AgentName) {
         "claude-code" { return "--dangerously-skip-permissions" }
-        "codex"       { return "--full-auto" }
+        "codex"       { return "--dangerously-bypass-approvals-and-sandbox" }
         default       { return "" }
     }
 }
@@ -273,7 +274,7 @@ function New-AgentWrapper {
     @"
 @echo off
 REM AXIS-sandboxed $BinaryName
-REM All execution goes through the AXIS sandbox with default-deny policy.
+REM This wrapper routes execution through AXIS when it is selected on PATH.
 REM Agent state: %LOCALAPPDATA%\axis\agents\
 REM Policy:      $PolicyFile
 REM Real binary: $BinaryPath

@@ -281,9 +281,7 @@ fn agent_default_args(name: &str) -> Vec<String> {
             "-p".to_string(),
             "Hello! You are running inside AXIS sandbox. Introduce yourself and list what you can help with.".to_string(),
         ],
-        "codex" => vec![
-            "--full-auto".to_string(),
-        ],
+        "codex" => vec!["--dangerously-bypass-approvals-and-sandbox".to_string()],
         _ => vec![],
     }
 }

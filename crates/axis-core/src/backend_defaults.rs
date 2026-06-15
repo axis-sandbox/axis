@@ -129,7 +129,9 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "Native Linux remains selectable because direct Landlock, seccomp, strict native netns proxy integration, and binary attribution are AXIS-owned capabilities that MXC Bubblewrap has not fully replaced.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: NATIVE_SECURITY_EVIDENCE,
-        benchmark_gate: Some("cargo run -p axis-bench --bin success-metrics"),
+        benchmark_gate: Some(
+            "AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run -p axis-bench --bin runtime-metrics",
+        ),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcLinuxBubblewrap,
@@ -139,7 +141,9 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "MXC Bubblewrap is the Linux process default for packaged no-admin runs. AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around the MXC process backend.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
-        benchmark_gate: Some("cargo run -p axis-bench --bin success-metrics"),
+        benchmark_gate: Some(
+            "AXIS_RUNTIME_METRICS_PROVIDERS=mxc AXIS_RUNTIME_METRICS_PROFILES=mxc_process cargo run -p axis-bench --bin runtime-metrics",
+        ),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcLinuxLxc,

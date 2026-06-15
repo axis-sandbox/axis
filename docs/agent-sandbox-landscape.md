@@ -132,9 +132,14 @@ sandbox process.
 | gVisor | nvproxy (NVIDIA only) | No | No |
 | Kata | VFIO (full device) | No | No |
 | OpenShell | NVIDIA Container Toolkit | Limited | No |
-| **AXIS** | HIP Remote (TCP proxy, 538 HIP APIs) | **Yes** (multiple sandboxes share one GPU) | **Yes** (per-sandbox VRAM quotas, API whitelisting, compute timeouts) |
+| **AXIS** | Optional HIP Remote client and worker artifacts | Targeted | Targeted |
 
-**AXIS advantage:** HIP Remote is the only technology that provides GPU isolation without hardware partitioning or device passthrough. The sandbox has zero GPU driver access — all HIP calls are proxied over TCP to a worker process. VRAM quotas prevent one agent from exhausting GPU memory. IPC and device-reset operations are blocked by default. Tested end-to-end: a sandboxed VM with no ROCm installation ran `hipMalloc`, `hipMemcpy`, and `hipDeviceSynchronize` on an AMD RX 9070 XT.
+**AXIS direction:** HIP Remote keeps GPU driver access outside the sandbox by
+proxying HIP calls to a worker process. AXIS policy can then treat GPU access as
+a host-mediated service rather than direct `/dev/kfd` access. Quotas, API
+filtering, and compute timeout behavior remain part of the GPU isolation
+target, but HIP Remote artifacts are optional runtime inputs rather than part of
+the default quickstart.
 
 ### 4.6 Monitoring: Audit and Detection
 
@@ -185,7 +190,7 @@ The agent sandboxing landscape is converging on OS-native primitives (Landlock, 
 
 AXIS is unique in four ways:
 
-1. **GPU isolation** — no other sandbox technology provides per-agent GPU access with VRAM quotas and API whitelisting
+1. **GPU isolation direction** — HIP Remote provides a path to host-mediated GPU access with quota and API filtering controls
 2. **Credential containment** — current Linux sandboxes strip common provider secrets from the environment and proxy-boundary injection restores approved provider access without exposing raw keys to the sandbox
 3. **Default-deny seccomp** — the strictest syscall policy of any agent sandbox (142 of ~400 allowed)
 4. **Cross-platform direction** — Linux (Landlock + seccomp + optional netns proxy), Windows (AppContainer + Job Object), and macOS (Seatbelt), with a no-admin Linux block-mode quickstart and optional helper/capability requirements for stronger Linux proxy networking

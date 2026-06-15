@@ -52,17 +52,27 @@ Non-default MXC process backends are candidates. They can become defaults only
 after they match AXIS policy semantics and have benchmark evidence for startup,
 teardown, maximum RSS, file descriptors, process count, density, host dependency
 cost, security coverage, unsupported-policy counts, and cleanup failures.
-The current default smoke benchmark command is:
+The historical README smoke benchmark command is:
 
 ```bash
 cargo run --release -p axis-bench --bin success-metrics
+```
+
+Default-backend evidence should use the phase-level runtime benchmark so
+startup, cold proxy deny, and synthetic OPA numbers are tied to a named runtime
+provider and policy profile:
+
+```bash
+AXIS_RUNTIME_METRICS_PROVIDERS=mxc \
+AXIS_RUNTIME_METRICS_PROFILES=mxc_process \
+  cargo run --release -p axis-bench --bin runtime-metrics
 ```
 
 ## Candidate And Experimental Backends
 
 | Backend | Class | Status | Benchmark gate |
 | --- | --- | --- | --- |
-| `axis-native-linux` | Process | Retained | `cargo run --release -p axis-bench --bin success-metrics` |
+| `axis-native-linux` | Process | Retained | `AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run --release -p axis-bench --bin runtime-metrics` |
 | `mxc-macos-seatbelt` | Process | Candidate | `AXIS_BENCH_MXC_MACOS_SEATBELT=1` |
 | `mxc-windows-processcontainer` | Process | Candidate | `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` |
 | `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |

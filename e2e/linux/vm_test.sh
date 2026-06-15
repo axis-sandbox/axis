@@ -1,7 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-AXIS=~/axis/axis
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AXIS="${AXIS_BIN:-$REPO_ROOT/target/release/axis}"
+SUCCESS_METRICS="${AXIS_SUCCESS_METRICS_BIN:-$REPO_ROOT/target/release/success-metrics}"
+CODING_POLICY="${AXIS_CODING_POLICY:-$REPO_ROOT/policies/coding-agent.yaml}"
+MINIMAL_POLICY="${AXIS_MINIMAL_POLICY:-$REPO_ROOT/policies/minimal.yaml}"
 echo "=== AXIS E2E Test on $(hostname) ==="
 echo "Kernel: $(uname -r)"
 echo ""
@@ -22,8 +26,8 @@ else: exit(1)
 
 # ── Test 2: Policy validation ──
 echo "--- Test 2: Policy Validation ---"
-$AXIS policy validate ~/axis/policies/coding-agent.yaml >/dev/null && pass "coding-agent.yaml" || fail "coding-agent.yaml"
-$AXIS policy validate ~/axis/policies/minimal.yaml >/dev/null && pass "minimal.yaml" || fail "minimal.yaml"
+"$AXIS" policy validate "$CODING_POLICY" >/dev/null && pass "coding-agent.yaml" || fail "coding-agent.yaml"
+"$AXIS" policy validate "$MINIMAL_POLICY" >/dev/null && pass "minimal.yaml" || fail "minimal.yaml"
 
 # ── Test 3: Landlock filesystem isolation ──
 echo "--- Test 3: Landlock Filesystem Isolation ---"
@@ -145,7 +149,7 @@ PYEOF
 
 # ── Test 5: Success metrics ──
 echo "--- Test 5: Success Metrics ---"
-~/axis/success-metrics 2>/dev/null | grep -q "5/5" && pass "All 5/5 metrics pass" || fail "Metrics"
+"$SUCCESS_METRICS" 2>/dev/null | grep -q "5/5" && pass "All 5/5 metrics pass" || fail "Metrics"
 
 # ── Summary ──
 echo ""

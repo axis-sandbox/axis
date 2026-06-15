@@ -1,8 +1,9 @@
 #!/bin/bash
 # AXIS Agent Installer
 #
-# Installs agent runtimes into a contained ~/.axis/tools/ directory.
-# Each agent gets its own isolated install — no global pollution.
+# Installs agent runtimes into ~/.axis/tools/.
+# Each agent gets its own install directory, and generated wrappers route
+# invocations through AXIS when ~/.axis/bin is first on PATH.
 #
 # Usage:
 #   bash install_agents.sh [agent...]
@@ -11,7 +12,7 @@
 #   bash install_agents.sh claude-code codex aider
 #
 # Agents are installed to ~/.axis/tools/<agent>/ and wrapper scripts
-# are created in ~/.axis/bin/ that run the agent through AXIS sandbox.
+# are created in ~/.axis/bin/ that route the agent through AXIS.
 
 set -euo pipefail
 
@@ -57,7 +58,7 @@ agent_binary() {
 agent_default_flags() {
     case "$1" in
         claude-code) echo "--dangerously-skip-permissions" ;;
-        codex)       echo "--full-auto" ;;
+        codex)       echo "--dangerously-bypass-approvals-and-sandbox" ;;
         *)           echo "" ;;
     esac
 }
@@ -306,7 +307,7 @@ create_wrapper() {
 #!/bin/bash
 # AXIS-sandboxed ${binary_name}
 #
-# This wrapper ensures ${binary_name} ALWAYS runs inside an AXIS sandbox.
+# This wrapper routes ${binary_name} through AXIS when it is selected on PATH.
 # Agent state: ~/.axis/agents/
 # Policy:      ${policy_file}
 # Real binary: ${binary_path}

@@ -89,6 +89,35 @@ fi
 export AXIS_TEST_MXC_EXECUTOR="$EXECUTOR"
 export AXIS_TEST_AXIS_SECCOMP_LAUNCHER="$LAUNCHER"
 
-"$CARGO_BIN" test -p axis-sandbox gated_real_mxc_allow_and_block_runtime_parity -- --nocapture
-"$CARGO_BIN" test -p axis-sandbox gated_real_mxc_payload_cannot_read_axis_config_fd -- --nocapture
-"$CARGO_BIN" test -p axis-sandbox gated_real_mxc_timeout_cleans_tmpdir -- --nocapture
+run_test() {
+    "$CARGO_BIN" test -p axis-sandbox "$1" -- --nocapture
+}
+
+run_test gated_real_mxc_allow_and_block_runtime_parity
+run_test gated_real_mxc_payload_cannot_read_axis_config_fd
+run_test gated_real_mxc_timeout_cleans_tmpdir
+
+if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ]; then
+    run_test gated_real_mxc_native_proxy_reaches_only_axis_proxy_address
+else
+    echo "  SKIP: set AXIS_REAL_MXC_PROXY_TESTS=1 for real MXC strict proxy reachability proof"
+fi
+
+if [ "${AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION:-}" = "1" ]; then
+    run_test gated_mxc_outer_connect_attribution_records_connecting_executable_before_exec
+else
+    echo "  SKIP: set AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 for connect-attribution proof"
+fi
+
+if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ] &&
+   [ "${AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION:-}" = "1" ]; then
+    run_test gated_real_mxc_binary_restricted_proxy_authorizes_connect_attribution
+else
+    echo "  SKIP: set AXIS_REAL_MXC_PROXY_TESTS=1 and AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1 for binary-restricted proxy proof"
+fi
+
+if [ "${AXIS_TEST_MXC_NETNS_HELPER_LAUNCH:-}" = "1" ]; then
+    run_test gated_mxc_helper_launch_reaches_proxy_and_denies_direct_bypass
+else
+    echo "  SKIP: set AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 for installed netns-helper MXC proof"
+fi

@@ -113,7 +113,7 @@
   <text x="793" y="373" text-anchor="middle" font-size="9" fill="#7E22CE">API Whitelist</text>
 
   <rect x="610" y="385" width="240" height="18" rx="4" fill="#A855F7"/>
-  <text x="730" y="398" text-anchor="middle" font-size="9" font-weight="600" fill="white">538 HIP APIs · No /dev/kfd access</text>
+  <text x="730" y="398" text-anchor="middle" font-size="9" font-weight="600" fill="white">HIP Remote APIs - No /dev/kfd access</text>
 
   <!-- Arrow: sandbox → GPU -->
   <line x1="260" y1="195" x2="260" y2="405" stroke="#A855F7" stroke-width="1" stroke-dasharray="5,3"/>

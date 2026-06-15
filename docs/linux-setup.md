@@ -20,7 +20,9 @@ Linux release archives and packages include the MXC `lxc-exec` executor and
 the AXIS `axis-seccomp-launcher` helper. Source-tree builds produce the AXIS
 helper; real MXC runtime validation from a checkout also needs `lxc-exec`
 built from the pinned MXC revision and available on `PATH` from a safe,
-non-writable executable directory.
+non-writable executable directory. Set `runtime.provider: axis_native` in a
+policy to use the retained native Landlock/seccomp path instead of the default
+MXC process provider.
 
 Run the default block-mode sandbox:
 
@@ -28,25 +30,28 @@ Run the default block-mode sandbox:
 ./target/release/axis run -- python3 -c 'print("hello from axis")'
 ```
 
-The built-in `minimal` policy is the no-admin path. It requests:
+The built-in `minimal` policy is the no-admin process path. On Linux with the
+default `runtime.provider: auto`, AXIS runs it through the MXC Bubblewrap
+process executor and still applies AXIS-owned syscall, environment, lifecycle,
+and policy checks around that backend. It requests:
 
-- Landlock filesystem confinement,
-- seccomp syscall filtering,
+- filesystem confinement through the selected process backend,
+- AXIS seccomp syscall filtering,
 - `network.mode: block`,
 - no process, memory, or CPU resource limits.
 
 It does not require a setuid helper, local sudo setup, a writable cgroup
 delegation, Docker, or a VM. If a required kernel feature such as Landlock or
-seccomp is unavailable and no supported fallback can preserve the policy, AXIS
-fails before running the command.
+seccomp is unavailable for the selected provider, or the MXC process executor
+is unavailable for the default provider, AXIS fails before running the command.
 
 ## Policy Modes
 
 | Policy choice | Linux behavior | Extra requirements |
 | --- | --- | --- |
-| `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. | Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. |
+| `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. |
 | `network.mode: allow` | Uses host networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. | No endpoint policies may be configured. Requested resource limits still need enforcement support. |
-| `network.mode: proxy` | Starts an AXIS CONNECT proxy, places the sandbox in a network namespace, allows traffic only to the proxy, and rejects direct egress. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
+| `network.mode: proxy` | Starts an AXIS CONNECT proxy. Host/port-only policies can use the MXC cooperative proxy path. Binary-restricted or strict direct-egress policies use the native netns proxy path and reject direct egress. | Default host/port policy: safe MXC Bubblewrap executor and AXIS proxy. Strict native proxy: `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
@@ -128,8 +133,8 @@ setup binary. Granting capabilities to `axis` and `axisd` broadens the privilege
 held by the main runtime and should be used only on hosts where that tradeoff is
 acceptable.
 
-For source-tree validation, do not install a manual host helper and then
-treat that as test coverage. The repo-owned privileged proof is:
+For source-tree validation, do not install a manual host helper and then treat
+that as test coverage. The repo-owned privileged proof is:
 
 ```bash
 AXIS_RUN_PRIVILEGED_E2E=1 bash e2e/linux/test_netns_helper_launch.sh

@@ -50,35 +50,14 @@ Linux behavior, and setup requirements, see
 | Memory per sandbox | 1.6MB | — | — | <50MB |
 | Proxy cold-conn | 8.5ms | — | 0.09ms | <50ms |
 
-### HIP Remote GPU Verification (2026-04-07)
+### HIP Remote GPU Verification
 
-Tested with real hardware: AXIS sandbox running in a Linux VM (no GPU, no ROCm) connecting to a `hip-worker` on the host with an AMD RX 9070 XT (gfx1201).
-
-```
-Linux VM (sandboxed)                    Host (192-core Ryzen + GPU)
-┌─────────────────────────┐   TCP:18515  ┌─────────────────────────┐
-│ Landlock v7 (4ro, 3rw)  │ ──────────> │ hip-worker              │
-│ seccomp (142 whitelist)  │             │   ↓                     │
-│ Proxy (OPA policy)      │             │ Real HIP Runtime        │
-│ Python test program     │             │   ↓                     │
-│   ↓                     │             │ AMD RX 9070 XT          │
-│ libamdhip64.so (remote) │             │ "AMD Radeon AI PRO      │
-│ 538 HIP symbols         │             │  R9700"                 │
-└─────────────────────────┘             └─────────────────────────┘
-```
-
-| HIP API Call | Result |
-|---|---|
-| `hipGetDeviceCount` | **1 device** |
-| `hipSetDevice(0)` | **success** |
-| `hipGetDeviceProperties` | **"AMD Radeon AI PRO R9700"** |
-| `hipMalloc(1MB)` | **ptr=0x7f0000000000** |
-| `hipMemcpy H2D (256 bytes)` | **success** |
-| `hipMemcpy D2H (256 bytes)` | **data verified byte-for-byte** |
-| `hipFree` | **success** |
-| `hipDeviceSynchronize` | **success** |
-
-The VM has **zero GPU drivers and zero ROCm installation** — only the 188KB drop-in `libamdhip64.so` client library. All GPU operations are proxied transparently over TCP to the host's real GPU.
+HIP Remote verification requires a host with ROCm, a `hip-worker`, and a
+sandboxed client environment that can load the remote `libamdhip64.so` client
+without direct GPU device access. Public test evidence should record the HIP
+runtime version, GPU class, transport, policy, and API calls exercised without
+depending on private host names, one-off hardware notes, or manually installed
+artifacts.
 
 ---
 
@@ -1180,7 +1159,8 @@ Network namespace creation (`ip netns add`) requires `CAP_NET_ADMIN`, which stan
 
 4. **Bubblewrap block fallback.** If proxy mode cannot be satisfied, `bwrap --unshare-net` may still provide all-or-nothing network denial for block mode. It must not be treated as a proxy-mode fallback unless proxy reachability is also implemented.
 
-Testing for the helper path must not rely on a a manually installed local setuid helper.
+Testing for the helper path must not rely on a manually installed local setuid
+helper.
 The source tree owns the test plan: ordinary cargo tests cover parser,
 authorization, command-planning, fd, and cleanup invariants; capability-gated
 kernel tests skip with explicit reasons when local privileges are absent; and
@@ -1315,52 +1295,23 @@ All targets validated via automated benchmark (`success-metrics` binary). Tested
 - Windows proxy cold-connection latency (0.4ms) is faster than Linux (8.5ms) due to Windows TCP loopback optimization. Both are well under 50ms.
 - seccomp default-deny mode (142-syscall whitelist) is now the default. Dangerous syscalls (ptrace, mount, bpf, io_uring, memfd_create, reboot, kexec, chroot, pivot_root, etc.) are blocked by omission from the whitelist.
 
-### 12.3 HIP Remote GPU Test Results (2026-04-07)
+### 12.3 HIP Remote GPU Test Requirements
 
-End-to-end GPU isolation verified with real hardware:
+End-to-end HIP Remote evidence should be collected by a repeatable script that
+declares the required ROCm host, worker binary, client library, transport, and
+AXIS policy inputs. A valid proof should cover:
 
-**Setup:**
-- **Sandbox:** Linux VM (Ubuntu 24.04, 16 vCPUs, no GPU, no ROCm drivers)
-- **GPU Host:** Bare metal (192-core Ryzen, AMD RX 9070 XT / gfx1201)
-- **Transport:** TCP port 18515 over libvirt bridge network
-- **Isolation:** Landlock v7 (4 ro, 3 rw paths), seccomp default-deny (142 syscalls), OPA proxy
+- worker startup and listener readiness;
+- client library loading from inside the sandbox;
+- basic protocol handshake behavior;
+- sandbox lifecycle creation and cleanup;
+- representative HIP API calls such as device discovery, allocation, copy,
+  free, and synchronization when a compatible GPU host is available;
+- negative evidence that the sandbox cannot reach GPU device nodes directly.
 
-**Client library (`libamdhip64.so`):**
-- 538 exported HIP symbols, 188KB, pure C11
-- Built from `users/jam/hip-remote` branch of rocm-systems
-- Drop-in replacement — applications link against `-lamdhip64` without code changes
-
-**Worker binary (`hip-worker`):**
-- Links real HIP runtime + optional AMD SMI
-- Built from same branch, runs on GPU host
-- Systemd service template included
-
-**HIP Remote protocol test (8/8 PASS on Linux VM):**
-
-| Test | Result |
-|---|---|
-| hip-worker binary runs | PASS |
-| libamdhip64.so exports 538 symbols | PASS |
-| hip-worker listens on TCP | PASS |
-| Protocol connection + PING | PASS (reset without GPU — expected) |
-| Client library loads via ctypes | PASS |
-| GPU sandbox created (AXIS daemon) | PASS |
-| hip-worker spawned in sandbox lifecycle | PASS |
-| GPU sandbox destroyed cleanly | PASS |
-
-**Real GPU API test (7/7 PASS from sandboxed VM):**
-
-| HIP API Call | Result |
-|---|---|
-| `hipGetDeviceCount` | 1 device |
-| `hipSetDevice(0)` | success |
-| `hipGetDeviceProperties` | "AMD Radeon AI PRO R9700" |
-| `hipMalloc(1MB)` | ptr=0x7f0000000000 |
-| `hipMemcpy H2D + D2H (256 bytes)` | data verified byte-for-byte |
-| `hipFree` | success |
-| `hipDeviceSynchronize` | success |
-
-This validates the core HIP Remote value proposition: **a sandboxed agent with zero GPU drivers can allocate GPU memory, transfer data, and synchronize with a real AMD GPU purely through the TCP proxy.** The sandbox's Landlock + seccomp isolation is enforced throughout — the agent never touches `/dev/kfd` or any GPU kernel interface.
+The proof should be reproducible on any prepared runner with the documented
+inputs and must not depend on private machine names, ad hoc host installs, or
+unrecorded hardware state.
 
 ---
 
