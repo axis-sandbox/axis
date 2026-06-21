@@ -3,6 +3,8 @@
 This document defines the dependency and packaging boundary for AXIS runtime
 installs, optional backend support, and security testing. It applies to
 AXIS-native and MXC-backed paths on Windows, Linux, and macOS.
+Concrete build commands, package boundaries, cgroup setup, KVM setup, and
+feature-level verification commands are in [Setup And Install](setup-and-install.md).
 
 ## Default Install Contract
 
@@ -25,10 +27,10 @@ administrator-controlled package steps, or disposable CI/e2e scripts.
 | Runtime path | Runtime dependencies | Privilege boundary |
 | --- | --- | --- |
 | AXIS-native process sandbox | Platform OS sandbox support: Landlock and seccomp on Linux, AppContainer/Job Object support on Windows, and Seatbelt support on macOS. | Default user install where native remains the selected process default; retained native alternatives reject before spawn if a requested policy cannot be enforced by available OS features. |
-| MXC process sandbox | Packaged MXC executor for the selected platform backend. Bubblewrap is the default Linux process backend dependency. | Default user install for packaged non-privileged executors. Optional tools are discovered safely and are not installed as part of normal tests. |
+| MXC process sandbox | Packaged MXC executor for the selected platform backend. Bubblewrap, unprivileged user namespaces, and AXIS seccomp launcher support are the Linux process-backend dependencies. | Default user install for packaged non-privileged executors. Optional tools are discovered safely and are not installed as part of normal tests. |
 | MXC container sandbox | LXC for Linux container launches or WSL2 for Windows container launches, plus configured rootfs/image inputs. | Host runtime setup is explicit and backend-specific. Unsupported or unavailable runtime state must reject before spawn rather than falling back silently. |
-| MXC VM-style sandbox | KVM, WHP, Windows Sandbox, Hyperlight runtime artifacts, microVM images, snapshots, or guest-agent assets depending on the selected backend. | VM and host-feature enablement is explicit setup. VM-style backends remain gated until AXIS can prove command, filesystem, network, lifecycle, and cleanup semantics for the requested policy. |
-| AXIS proxy networking | The AXIS proxy plus platform network controls. Linux strict proxy mode needs `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional `axis-netns-helper`. | The default quickstart does not require proxy-mode privileges. Privileged helper install and file capability setup are explicit choices. |
+| MXC VM-style sandbox | KVM on Linux, WHP on Windows, Windows Sandbox, Hyperlight runtime artifacts, microVM images, snapshots, or guest-agent assets depending on the selected backend. | VM and host-feature enablement is explicit setup. VM-style backends remain gated until AXIS can prove command, filesystem, network, lifecycle, and cleanup semantics for the requested policy. |
+| AXIS proxy networking | The AXIS proxy plus platform network controls. Linux strict native proxy mode needs `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional `axis-netns-helper`; binary-restricted Linux proxy policies additionally need connect-time attribution from the native seccomp-notify path. | The default quickstart does not require proxy-mode privileges. Privileged helper install and file capability setup are explicit choices. |
 | Source builds | Rust toolchain and platform build tools. Xcode Command Line Tools may be needed to build or test macOS binaries from source. | Build tools are developer dependencies, not runtime prerequisites for installing release artifacts. |
 
 ## Optional Backend Dependencies

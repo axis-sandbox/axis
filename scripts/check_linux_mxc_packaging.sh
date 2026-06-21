@@ -65,6 +65,7 @@ MISSING_SECCOMP_ARCHIVE="$TMP_ROOT/pkg-linux-x86_64-missing-seccomp.tar.gz"
 INSTALL_HOME="$TMP_ROOT/home"
 INSTALL_PREFIX="$INSTALL_HOME/.local/bin"
 INSTALL_DEPS_DOC="$REPO_ROOT/docs/install-and-runtime-dependencies.md"
+SETUP_DOC="$REPO_ROOT/docs/setup-and-install.md"
 
 mkdir -p "$INSTALL_HOME"
 make_archive "$FULL_ARCHIVE" axis axisd axis-seccomp-launcher lxc-exec axis-netns-helper
@@ -146,8 +147,11 @@ assert_contains "$REPO_ROOT/.github/workflows/release.yml" "axis-netns-helper mu
 assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];'
 assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'dir.join(AXIS_SECCOMP_LAUNCHER_NAME)'
 
+assert_contains "$REPO_ROOT/rust-toolchain.toml" 'channel = "1.95.0"'
+assert_contains "$REPO_ROOT/README.md" "docs/setup-and-install.md"
 assert_contains "$REPO_ROOT/README.md" "docs/install-and-runtime-dependencies.md"
 assert_contains "$REPO_ROOT/docs/linux-setup.md" "install-and-runtime-dependencies.md"
+assert_contains "$REPO_ROOT/docs/linux-setup.md" "setup-and-install.md"
 assert_contains "$INSTALL_DEPS_DOC" "Default Install Contract"
 assert_contains "$INSTALL_DEPS_DOC" "Runtime Dependency Matrix"
 assert_contains "$INSTALL_DEPS_DOC" "Test Dependency Classes"
@@ -161,5 +165,13 @@ assert_contains "$INSTALL_DEPS_DOC" "KVM"
 assert_contains "$INSTALL_DEPS_DOC" "Hyperlight"
 assert_contains "$INSTALL_DEPS_DOC" "Xcode Command Line Tools"
 assert_contains "$INSTALL_DEPS_DOC" "must not require root-installing a locally built AXIS artifact"
+assert_contains "$SETUP_DOC" "cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins"
+assert_contains "$SETUP_DOC" "MXC_REF=1736b48398c3fe4d1315b2311c0951cc893eb3ae"
+assert_contains "$SETUP_DOC" "bubblewrap"
+assert_contains "$SETUP_DOC" "cgroups v2"
+assert_contains "$SETUP_DOC" "/dev/kvm"
+assert_contains "$SETUP_DOC" "AXIS_RUN_MXC_MICROVM_E2E=1"
+assert_contains "$SETUP_DOC" "AXIS_RUN_MXC_HYPERLIGHT_E2E=1"
+assert_contains "$SETUP_DOC" "AXIS_RUN_PRIVILEGED_E2E=1"
 
 echo "Linux MXC packaging checks passed"

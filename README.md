@@ -42,13 +42,12 @@ irm 'https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1' | iex
 curl -sSf .../install.sh | sh -s -- --nightly    # Linux/macOS
 
 # Build from source
-cargo install --path crates/axis-cli
-cargo install --path crates/axis-daemon
-cargo install --path crates/axis-sandbox --bin axis-seccomp-launcher
+rustup toolchain install 1.95.0 --profile minimal
+cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 
 # Linux packages
-sudo dpkg -i axis_0.1.0_amd64.deb    # Debian/Ubuntu
-sudo rpm -i axis-0.1.0-1.x86_64.rpm  # Fedora/RHEL
+sudo dpkg -i axis_0.3.5_amd64.deb    # Debian/Ubuntu
+sudo rpm -i axis-0.3.5-1.x86_64.rpm  # Fedora/RHEL
 ```
 
 Linux release archives and packages include the MXC `lxc-exec` executor and
@@ -60,13 +59,19 @@ Linux users may choose
 `--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
 narrower privileged path.
 
+The Linux default MXC process backend also needs the host `bubblewrap` runtime
+and unprivileged user namespaces enabled. Those are host runtime prerequisites,
+not AXIS privileged install steps.
+
 When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins`
 builds the AXIS binaries and Linux helper binaries. Source-tree tests that
 exercise the real MXC runtime also need an `lxc-exec` binary built from the
 pinned MXC revision and placed on `PATH` from a safe, non-writable executable
 directory.
 
-For the cross-platform dependency and package boundary, see
+For source-build commands, optional runtime setup, and feature-by-feature
+dependency checks, see [Setup And Install](docs/setup-and-install.md). For the
+cross-platform dependency and package boundary, see
 [Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md).
 
 ## Quick Start
@@ -98,9 +103,10 @@ proxy configuration for policies that do not require binary attribution; stricte
 native proxy enforcement additionally needs native `CAP_NET_ADMIN` support or
 the optional AXIS netns helper. Missing capabilities are fatal for the requested
 policy rather than silently weakening the sandbox. See
-[Linux Setup](docs/linux-setup.md) for the mode matrix and test commands, and
+[Setup And Install](docs/setup-and-install.md) for setup commands,
+[Linux Setup](docs/linux-setup.md) for the mode matrix, and
 [Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md)
-for optional backend dependencies.
+for the package boundary.
 
 ## Platform Details
 

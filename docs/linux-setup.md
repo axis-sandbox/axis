@@ -7,6 +7,9 @@ direct process execution, not Docker or a VM.
 The cross-platform install, optional dependency, and package boundary is
 documented in
 [Install And Runtime Dependencies](install-and-runtime-dependencies.md).
+For concrete fresh-machine commands, including source builds, cgroup
+delegation, KVM checks, and optional MXC backend smoke tests, see
+[Setup And Install](setup-and-install.md).
 
 ## Quickstart
 
@@ -17,12 +20,13 @@ cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 ```
 
 Linux release archives and packages include the MXC `lxc-exec` executor and
-the AXIS `axis-seccomp-launcher` helper. Source-tree builds produce the AXIS
-helper; real MXC runtime validation from a checkout also needs `lxc-exec`
-built from the pinned MXC revision and available on `PATH` from a safe,
-non-writable executable directory. Set `runtime.provider: axis_native` in a
-policy to use the retained native Landlock/seccomp path instead of the default
-MXC process provider.
+the AXIS `axis-seccomp-launcher` helper. The Linux MXC Bubblewrap process
+backend also needs a host `bwrap` runtime and unprivileged user namespaces.
+Source-tree builds produce the AXIS helper; real MXC runtime validation from a
+checkout also needs `lxc-exec` built from the pinned MXC revision and available
+from a safe, non-writable executable path. Set `runtime.provider: axis_native`
+in a policy to use the retained native Landlock/seccomp path instead of the
+default MXC process provider.
 
 Run the default block-mode sandbox:
 
