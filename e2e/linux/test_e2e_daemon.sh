@@ -50,7 +50,9 @@ capability_skip_output() {
         grep -Fq "resources: cgroups v2 is unavailable" <<<"$1" ||
         grep -Fq "resources: cgroups v2 is read-only" <<<"$1" ||
         grep -Fq "seccomp: seccomp is unavailable" <<<"$1" ||
-        grep -Fq "filesystem: Landlock unavailable" <<<"$1"
+        grep -Fq "filesystem: Landlock unavailable" <<<"$1" ||
+        grep -Fq "bwrap: setting up uid map: Permission denied" <<<"$1" ||
+        grep -Fq "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" <<<"$1"
 }
 
 require_binaries() {
@@ -86,7 +88,12 @@ write_policy() {
 version: 1
 name: daemon-e2e-${mode}
 
+runtime:
+  containment: process
+  provider: axis_native
+
 filesystem:
+  compatibility: hard_requirement
   read_only:
 EOF
     append_read_only_path /bin

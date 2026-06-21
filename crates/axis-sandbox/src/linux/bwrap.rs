@@ -59,6 +59,13 @@ pub(crate) fn executable_path() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn build_plan(input: BubblewrapPlanInput<'_>) -> Result<BubblewrapPlan, String> {
+    build_plan_inner(input, executable_path)
+}
+
+fn build_plan_inner(
+    input: BubblewrapPlanInput<'_>,
+    program_resolver: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<BubblewrapPlan, String> {
     if input.command.is_empty() {
         return Err("bubblewrap command must not be empty".into());
     }
@@ -67,7 +74,7 @@ pub(crate) fn build_plan(input: BubblewrapPlanInput<'_>) -> Result<BubblewrapPla
 
     let expanded =
         super::landlock::expand_and_validate_filesystem_policy(input.filesystem, input.workspace)?;
-    let program = executable_path()?;
+    let program = program_resolver()?;
     let mut args = vec![
         "--die-with-parent".into(),
         "--new-session".into(),
@@ -432,10 +439,16 @@ fn safe_root_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_BWRAP_PROGRAM: &str = "/usr/bin/bwrap";
+
+    fn build_test_plan(input: BubblewrapPlanInput<'_>) -> Result<BubblewrapPlan, String> {
+        build_plan_inner(input, || Ok(PathBuf::from(TEST_BWRAP_PROGRAM)))
+    }
+
     #[test]
     fn minimal_block_plan_uses_pid_proc_dev_net_seccomp_and_workspace_bind() {
         let workspace = tempfile::tempdir().unwrap();
-        let plan = build_plan(BubblewrapPlanInput {
+        let plan = build_test_plan(BubblewrapPlanInput {
             filesystem: &FilesystemPolicy::default(),
             workspace: workspace.path(),
             working_dir: None,
@@ -447,7 +460,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(plan.program, executable_path().unwrap());
+        assert_eq!(plan.program, PathBuf::from(TEST_BWRAP_PROGRAM));
         assert_arg(&plan.args, "--unshare-pid");
         assert_arg(&plan.args, "--proc");
         assert_arg(&plan.args, "--dev");
@@ -478,7 +491,7 @@ mod tests {
             workspace.path().to_string_lossy().into_owned(),
         )];
 
-        let plan = build_plan(BubblewrapPlanInput {
+        let plan = build_test_plan(BubblewrapPlanInput {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: Some(workspace.path()),
@@ -519,7 +532,7 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = build_plan(BubblewrapPlanInput {
+        let plan = build_test_plan(BubblewrapPlanInput {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
@@ -547,7 +560,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_target).unwrap();
         std::os::unix::fs::symlink(&workspace_target, &workspace_alias).unwrap();
 
-        let plan = build_plan(BubblewrapPlanInput {
+        let plan = build_test_plan(BubblewrapPlanInput {
             filesystem: &FilesystemPolicy::default(),
             workspace: &workspace_alias,
             working_dir: None,
@@ -566,7 +579,7 @@ mod tests {
 
     #[test]
     fn relative_workspace_fails_closed() {
-        let err = build_plan(BubblewrapPlanInput {
+        let err = build_test_plan(BubblewrapPlanInput {
             filesystem: &FilesystemPolicy::default(),
             workspace: Path::new("relative-workspace"),
             working_dir: None,
@@ -590,7 +603,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let noisy_workspace = intermediate.join("..").join("workspace");
 
-        let plan = build_plan(BubblewrapPlanInput {
+        let plan = build_test_plan(BubblewrapPlanInput {
             filesystem: &FilesystemPolicy::default(),
             workspace: &noisy_workspace,
             working_dir: None,
@@ -618,7 +631,7 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = build_plan(BubblewrapPlanInput {
+        let plan = build_test_plan(BubblewrapPlanInput {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
@@ -649,7 +662,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = build_plan(BubblewrapPlanInput {
+        let err = build_test_plan(BubblewrapPlanInput {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
@@ -676,7 +689,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = build_plan(BubblewrapPlanInput {
+        let err = build_test_plan(BubblewrapPlanInput {
             filesystem: &policy,
             workspace: workspace.path(),
             working_dir: None,
@@ -696,7 +709,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let env = vec![("BAD=KEY".into(), "value".into())];
 
-        let err = build_plan(BubblewrapPlanInput {
+        let err = build_test_plan(BubblewrapPlanInput {
             filesystem: &FilesystemPolicy::default(),
             workspace: workspace.path(),
             working_dir: None,

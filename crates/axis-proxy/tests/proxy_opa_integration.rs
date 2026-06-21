@@ -13,7 +13,7 @@ use axis_core::policy::Policy;
 use axis_core::types::SandboxId;
 use axis_proxy::proxy::{AxisProxy, ProxyConfig, ProxyTimingEvent, ProxyTimingOutcome};
 use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 const TEST_POLICY: &str = r#"
@@ -516,11 +516,22 @@ async fn send_connect(proxy_addr: std::net::SocketAddr, target: &str) -> String 
 }
 
 async fn send_connect_on_stream(stream: &mut TcpStream, target: &str) -> String {
-    use tokio::io::AsyncReadExt;
-
     let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
 
+    read_response_line(stream).await
+}
+
+async fn read_pre_request_response(stream: &mut TcpStream) -> String {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        read_response_line(stream),
+    )
+    .await
+    .unwrap_or_default()
+}
+
+async fn read_response_line(stream: &mut TcpStream) -> String {
     let mut response = Vec::new();
     let mut buf = [0u8; 1];
     while stream.read(&mut buf).await.unwrap_or(0) == 1 {
@@ -822,7 +833,7 @@ network:
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let mut stream = socket.connect(addr).await.unwrap();
 
-    let response = send_connect_on_stream(&mut stream, "inference.local:443").await;
+    let response = read_pre_request_response(&mut stream).await;
     assert!(
         response.contains("403"),
         "expected stale connect-time record to deny, got: {response}"
@@ -876,7 +887,7 @@ network:
         .unwrap();
     let mut stream = socket.connect(addr).await.unwrap();
 
-    let response = send_connect_on_stream(&mut stream, "inference.local:443").await;
+    let response = read_pre_request_response(&mut stream).await;
     assert!(
         response.contains("403"),
         "expected ambiguous connect-time records to deny, got: {response}"

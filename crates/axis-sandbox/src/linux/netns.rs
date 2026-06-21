@@ -340,10 +340,6 @@ fn create_command_plan_with_paths(
         ),
         ip_with_paths(
             paths,
-            ["netns", "exec", ns, &paths.iptables, "-P", "OUTPUT", "DROP"],
-        ),
-        ip_with_paths(
-            paths,
             [
                 "netns",
                 "exec",
@@ -2174,7 +2170,7 @@ fn fixed_system_command(binary: &str) -> Result<String, String> {
 
     for dir in FIXED_COMMAND_DIRS {
         let candidate = std::path::Path::new(dir).join(binary);
-        if safe_root_executable(&candidate) {
+        if safe_root_executable_or_trusted_symlink(&candidate) {
             return Ok(candidate.to_string_lossy().into_owned());
         }
     }
@@ -2208,6 +2204,47 @@ fn safe_root_executable(path: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+fn safe_root_executable_or_trusted_symlink(path: &std::path::Path) -> bool {
+    if safe_root_executable(path) {
+        return true;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    safe_root_executable(&resolved) && safe_root_path_or_symlink_chain(path)
+}
+
+fn safe_root_path_or_symlink_chain(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            if metadata.uid() != 0 {
+                return false;
+            }
+            continue;
+        }
+
+        let kind = if current == path {
+            SafePathKind::ExecutableFile
+        } else {
+            SafePathKind::AncestorDirectory
+        };
+        if !safe_root_metadata(&metadata, kind) {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2945,7 +2982,13 @@ mod tests {
             .iter()
             .any(|cmd| cmd.contains("netns exec axis-00000000-0000-4000-8000-000000000001 /usr/sbin/sysctl -w net.ipv6.conf.all.disable_ipv6=1")));
         assert!(rendered.iter().any(|cmd| cmd.contains(
-            "netns exec axis-00000000-0000-4000-8000-000000000001 /usr/sbin/iptables -P OUTPUT DROP"
+            "netns exec axis-00000000-0000-4000-8000-000000000001 /usr/sbin/iptables -A OUTPUT -d"
+        )));
+        assert!(rendered.iter().any(|cmd| cmd.contains(
+            "netns exec axis-00000000-0000-4000-8000-000000000001 /usr/sbin/iptables -A OUTPUT -j LOG"
+        )));
+        assert!(rendered.iter().any(|cmd| cmd.contains(
+            "netns exec axis-00000000-0000-4000-8000-000000000001 /usr/sbin/iptables -A OUTPUT -j REJECT"
         )));
     }
 
@@ -3009,6 +3052,44 @@ mod tests {
         std::fs::set_permissions(&candidate, permissions).unwrap();
 
         assert!(!safe_root_executable(&candidate));
+    }
+
+    #[test]
+    fn safe_root_executable_or_trusted_symlink_rejects_user_owned_symlink_chain() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("iptables");
+        symlink("/bin/sh", &candidate).unwrap();
+
+        assert!(!safe_root_executable_or_trusted_symlink(&candidate));
+    }
+
+    #[test]
+    fn safe_root_executable_or_trusted_symlink_accepts_distro_symlink_when_present() {
+        for candidate in [
+            "/usr/sbin/ip",
+            "/sbin/ip",
+            "/usr/sbin/iptables",
+            "/sbin/iptables",
+        ] {
+            let path = std::path::Path::new(candidate);
+            let Ok(metadata) = std::fs::symlink_metadata(path) else {
+                continue;
+            };
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(resolved) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            if safe_root_executable(&resolved) {
+                assert!(safe_root_executable_or_trusted_symlink(path));
+                return;
+            }
+        }
+
+        eprintln!("no trusted distro symlinked network command found (test skipped)");
     }
 
     #[test]
@@ -3096,11 +3177,6 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("net.ipv6.conf.default.disable_ipv6=1"))
         );
-        assert!(
-            rendered
-                .iter()
-                .any(|cmd| cmd.contains("iptables -P OUTPUT DROP"))
-        );
         assert!(rendered.iter().any(|cmd| {
             cmd.contains(&format!(
                 "iptables -A OUTPUT -d {} -p tcp --dport 3128 -j ACCEPT",
@@ -3134,14 +3210,23 @@ mod tests {
             .iter()
             .position(|cmd| cmd.contains("ip route add default"))
             .unwrap();
-        let output_policy = rendered
+        let proxy_accept = rendered
             .iter()
-            .position(|cmd| cmd.contains("iptables -P OUTPUT DROP"))
+            .position(|cmd| cmd.contains("iptables -A OUTPUT -d"))
+            .unwrap();
+        let bypass_log = rendered
+            .iter()
+            .position(|cmd| cmd.contains("iptables -A OUTPUT -j LOG"))
+            .unwrap();
+        let final_reject = rendered
+            .iter()
+            .position(|cmd| cmd.contains("iptables -A OUTPUT -j REJECT"))
             .unwrap();
         assert!(disable_ipv6_all < default_route);
         assert!(disable_ipv6_default < default_route);
-        assert!(disable_ipv6_all < output_policy);
-        assert!(disable_ipv6_default < output_policy);
+        assert!(default_route < proxy_accept);
+        assert!(proxy_accept < bypass_log);
+        assert!(bypass_log < final_reject);
         assert!(!rendered.iter().any(|cmd| cmd.contains("MASQUERADE")));
         assert!(!rendered.iter().any(|cmd| cmd.contains("ip_forward")));
     }

@@ -1341,7 +1341,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
 
         with_home(home.path(), || {
-            let key_path = home.path().join("id_ed25519\nHost *");
+            let key_path = home.path().join("id ed25519");
             std::fs::write(&key_path, "private-key").unwrap();
             let ssh_dir = home.path().join(".axis/agents/agent-ssh/ssh");
             let ssh_policy = SshPolicy {

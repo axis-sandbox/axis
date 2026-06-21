@@ -272,7 +272,9 @@ impl ParentDeathGuard {
     }
 
     fn wait_for_monitor(&mut self) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        // The owner-death path may spend up to about 500 ms repeatedly killing
+        // the sandbox process group before the monitor exits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let mut status = 0;
             let ret = unsafe { libc::waitpid(self.monitor_pid, &mut status, libc::WNOHANG) };

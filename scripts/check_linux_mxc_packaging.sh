@@ -66,6 +66,7 @@ INSTALL_HOME="$TMP_ROOT/home"
 INSTALL_PREFIX="$INSTALL_HOME/.local/bin"
 INSTALL_DEPS_DOC="$REPO_ROOT/docs/install-and-runtime-dependencies.md"
 SETUP_DOC="$REPO_ROOT/docs/setup-and-install.md"
+CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 
 mkdir -p "$INSTALL_HOME"
 make_archive "$FULL_ARCHIVE" axis axisd axis-seccomp-launcher lxc-exec axis-netns-helper
@@ -131,6 +132,14 @@ for workflow in "$REPO_ROOT/.github/workflows/release.yml" "$REPO_ROOT/.github/w
     assert_contains "$workflow" 'grep -F "axis-${{ matrix.platform }}/lxc-exec"'
     assert_contains "$workflow" 'grep -F "axis-${{ matrix.platform }}/axis-seccomp-launcher"'
 done
+
+assert_contains "$CI_WORKFLOW" "RUST_TOOLCHAIN: 1.95.0"
+assert_contains "$CI_WORKFLOW" "timeout-minutes: 30"
+assert_contains "$CI_WORKFLOW" "Acquire::Retries=3"
+assert_contains "$CI_WORKFLOW" "Build MXC Linux executor"
+assert_contains "$CI_WORKFLOW" "cargo build --release --manifest-path \"\$mxc_dir/src/Cargo.toml\" -p lxc --no-default-features --locked"
+assert_contains "$CI_WORKFLOW" "cp \"\$mxc_dir/src/target/release/lxc-exec\" target/release/lxc-exec"
+assert_contains "$REPO_ROOT/e2e/linux/test_netns_helper_launch.sh" "cargo build --release -p axis-cli -p axis-sandbox --bins"
 
 assert_contains "$REPO_ROOT/.github/workflows/release.yml" "CARGO_DEB_VERSION: 3.6.4"
 assert_contains "$REPO_ROOT/.github/workflows/release.yml" "CARGO_GENERATE_RPM_VERSION: 0.21.0"

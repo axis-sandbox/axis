@@ -20,14 +20,21 @@ fn measure_sandbox_startup() -> Duration {
         r#"
 version: 1
 name: bench
+runtime:
+  containment: process
+  provider: axis_native
 process:
-  max_processes: 4
-  cpu_rate_percent: 50
+  max_processes: 0
+  max_memory_mb: 0
+  cpu_rate_percent: 0
 "#
     } else {
         r#"
 version: 1
 name: bench
+runtime:
+  containment: process
+  provider: axis_native
 filesystem:
   read_only:
     - /usr
@@ -39,8 +46,9 @@ filesystem:
   read_write:
     - "{workspace}"
 process:
-  max_processes: 4
-  cpu_rate_percent: 50
+  max_processes: 0
+  max_memory_mb: 0
+  cpu_rate_percent: 0
 network:
   mode: allow
 "#

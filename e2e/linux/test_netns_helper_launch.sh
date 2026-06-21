@@ -101,6 +101,11 @@ capability_skip_output() {
         grep -Fq "filesystem: Landlock unavailable" <<<"$1"
 }
 
+helper_launch_capability_skip_output() {
+    grep -Fq "netns helper setup failed:" <<<"$1" &&
+        grep -Fq "/iptables -A OUTPUT" <<<"$1"
+}
+
 skip_or_require() {
     local require_var="$1"
     local message="$2"
@@ -215,18 +220,63 @@ if [ "$owner" != "0:0 4755" ]; then
     exit 1
 fi
 
-AXIS_TEST_NETNS_HELPER_LAUNCH=1 \
-    cargo test -p axis-sandbox \
+set +e
+helper_check_output="$("$HELPER_INSTALL" check 2>&1)"
+helper_check_status=$?
+set -e
+if [ "$helper_check_status" -ne 0 ]; then
+    echo "ERROR: installed helper failed availability check"
+    echo "$helper_check_output"
+    exit "$helper_check_status"
+fi
+
+PREFLIGHT_NS="axis-helper-preflight-$$"
+set +e
+preflight_output="$(
+    sudo ip netns add "$PREFLIGHT_NS" &&
+        sudo ip netns exec "$PREFLIGHT_NS" iptables -A OUTPUT -o lo -j ACCEPT
+) 2>&1"
+preflight_status=$?
+sudo ip netns del "$PREFLIGHT_NS" >/dev/null 2>&1 || true
+set -e
+if [ "$preflight_status" -ne 0 ]; then
+    skip_or_require \
+        AXIS_REQUIRE_NETNS_HELPER_E2E \
+        "netns helper launch proof requires privileged iptables in network namespaces: ${preflight_output//$'\n'/ }"
+fi
+
+HELPER_TEST_OUTPUT="${TMP_ROOT}/helper-test.out"
+set +e
+AXIS_TEST_NETNS_HELPER_LAUNCH=1 cargo test -p axis-sandbox \
     gated_netns_helper_launch_starts_proxy_mode_sandbox_as_unprivileged_daemon \
-    -- --nocapture
+    -- --nocapture >"$HELPER_TEST_OUTPUT" 2>&1
+helper_test_status=$?
+set -e
+if [ "$helper_test_status" -ne 0 ]; then
+    helper_test_output="$(cat "$HELPER_TEST_OUTPUT")"
+    if capability_skip_output "$helper_test_output" ||
+        helper_launch_capability_skip_output "$helper_test_output"; then
+        tail -n 120 "$HELPER_TEST_OUTPUT"
+        skip_or_require \
+            AXIS_REQUIRE_NETNS_HELPER_E2E \
+            "netns helper launch proof is unavailable on this runner"
+    fi
+    cat "$HELPER_TEST_OUTPUT"
+    exit "$helper_test_status"
+fi
+cat "$HELPER_TEST_OUTPUT"
 
 echo ""
 echo "=== Built axis proxy-mode proof ==="
 
-cargo build --release -p axis-cli
+cargo build --release -p axis-cli -p axis-sandbox --bins
 AXIS_RELEASE="${TARGET_DIR}/release/axis"
 if [ ! -x "$AXIS_RELEASE" ]; then
     echo "ERROR: release axis binary missing: $AXIS_RELEASE"
+    exit 1
+fi
+if [ ! -x "${TARGET_DIR}/release/axis-seccomp-launcher" ]; then
+    echo "ERROR: release axis-seccomp-launcher binary missing: ${TARGET_DIR}/release/axis-seccomp-launcher"
     exit 1
 fi
 

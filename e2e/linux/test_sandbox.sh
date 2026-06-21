@@ -47,7 +47,9 @@ capability_skip_output() {
         grep -Fq "resources: cgroups v2 is unavailable" <<<"$1" ||
         grep -Fq "resources: cgroups v2 is read-only" <<<"$1" ||
         grep -Fq "seccomp: seccomp is unavailable" <<<"$1" ||
-        grep -Fq "filesystem: Landlock unavailable" <<<"$1"
+        grep -Fq "filesystem: Landlock unavailable" <<<"$1" ||
+        grep -Fq "bwrap: setting up uid map: Permission denied" <<<"$1" ||
+        grep -Fq "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" <<<"$1"
 }
 
 require_axis() {
@@ -79,6 +81,8 @@ write_policy() {
     local mode="$1"
     local timeout="${2:-}"
     local blocked_syscall="${3:-}"
+    local runtime_provider="${4:-auto}"
+    local filesystem_compatibility="${5:-best_effort}"
     local dir
     dir="$(new_tmpdir)"
     POLICY_FILE="${dir}/policy.yaml"
@@ -86,7 +90,12 @@ write_policy() {
 version: 1
 name: linux-e2e-${mode}
 
+runtime:
+  containment: process
+  provider: ${runtime_provider}
+
 filesystem:
+  compatibility: ${filesystem_compatibility}
   read_only:
 EOF
     append_read_only_path /bin
@@ -180,7 +189,7 @@ else
 fi
 
 echo "--- Filesystem isolation through axis run ---"
-fs_policy="$(write_policy block)"
+fs_policy="$(write_policy block "" "" axis_native hard_requirement)"
 denied="/tmp/axis-e2e-denied-$$"
 rm -f "$denied"
 expect_axis_success_or_skip \

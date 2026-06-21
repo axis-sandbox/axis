@@ -8,26 +8,33 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.95.0
+  MXC_REPOSITORY: https://github.com/microsoft/mxc
+  MXC_REF: 1736b48398c3fe4d1315b2311c0951cc893eb3ae
 
 jobs:
   # Format and clippy always run (fast, catch style issues on all changes).
   format:
     name: Format
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
@@ -36,6 +43,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -48,6 +56,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'e2e/linux/**'
               - 'install.sh'
               - 'policies/**'
@@ -62,13 +71,31 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux sandbox dependencies
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap python3
 
       - name: Build
         run: cargo build --release
+
+      - name: Build MXC Linux executor
+        timeout-minutes: 15
+        run: |
+          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
+          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+          git -C "$mxc_dir" checkout "$MXC_REF"
+          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+          cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec
 
       - name: Security Tier 0/1 tests
         run: bash scripts/test_security_tier0.sh
@@ -100,6 +127,10 @@ jobs:
         run: bash e2e/linux/test_e2e_daemon.sh
 
       - name: Agent safety tests
+        env:
+          AXIS_AGENT_TEST_RUNTIME_PROVIDER: axis_native
+          AXIS_AGENT_TEST_DISABLE_RESOURCE_LIMITS: "1"
+          AXIS_AGENT_TEST_NETWORK_MODE: block
         run: AXIS_BIN=./target/release/axis bash e2e/agents/test_agents.sh --platform linux
 
   test-linux-netns-helper:
@@ -107,13 +138,29 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Install kernel namespace tooling
-        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables python3
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap iproute2 iptables python3
+
+      - name: Build MXC Linux executor
+        timeout-minutes: 15
+        run: |
+          mkdir -p target/release
+          mxc_dir="$(mktemp -d "$RUNNER_TEMP/mxc-XXXXXX")"
+          git clone --filter=blob:none "$MXC_REPOSITORY" "$mxc_dir"
+          git -C "$mxc_dir" checkout "$MXC_REF"
+          cargo build --release --manifest-path "$mxc_dir/src/Cargo.toml" -p lxc --no-default-features --locked
+          cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec
 
       - name: Helper launch proof
         env:
@@ -126,9 +173,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build

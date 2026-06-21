@@ -3422,6 +3422,8 @@ fn production_executor_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf>
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
+    push_current_exe_dir_candidate(&mut candidates, &mut seen, MXC_EXECUTOR_NAME);
+
     for dir in MXC_EXECUTOR_DIRS {
         push_candidate(
             &mut candidates,
@@ -3439,8 +3441,6 @@ fn production_executor_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf>
         }
     }
 
-    push_current_exe_dir_candidate(&mut candidates, &mut seen, MXC_EXECUTOR_NAME);
-
     candidates
 }
 
@@ -3451,6 +3451,8 @@ fn production_seccomp_launcher_candidates() -> Vec<PathBuf> {
 fn production_seccomp_launcher_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
+
+    push_current_exe_dir_candidate(&mut candidates, &mut seen, AXIS_SECCOMP_LAUNCHER_NAME);
 
     for dir in AXIS_SECCOMP_LAUNCHER_DIRS {
         push_candidate(
@@ -3472,8 +3474,6 @@ fn production_seccomp_launcher_candidates_for_path(path: Option<&OsStr>) -> Vec<
             );
         }
     }
-
-    push_current_exe_dir_candidate(&mut candidates, &mut seen, AXIS_SECCOMP_LAUNCHER_NAME);
 
     candidates
 }
@@ -4935,26 +4935,32 @@ mod tests {
     }
 
     #[test]
-    fn production_executor_candidates_include_package_path_and_current_exe_dirs() {
+    fn production_executor_candidates_prefer_current_exe_dir_then_package_paths() {
         let candidates = production_executor_candidates_for_path(Some(OsStr::new(
             "/home/test/.local/bin:relative:/usr/bin:/opt/axis/bin",
         )));
+
+        let current_exe = std::env::current_exe().unwrap();
+        let current_dir = current_exe.parent().unwrap();
+        assert_eq!(candidates[0], current_dir.join(MXC_EXECUTOR_NAME));
+        let mut stable_start = 1;
+        if current_dir.file_name().is_some_and(|name| name == "deps") {
+            let parent = current_dir.parent().unwrap();
+            assert_eq!(candidates[1], parent.join(MXC_EXECUTOR_NAME));
+            stable_start = 2;
+        }
 
         let stable_dirs = MXC_EXECUTOR_DIRS
             .iter()
             .map(|dir| Path::new(dir).join(MXC_EXECUTOR_NAME))
             .collect::<Vec<_>>();
-        assert_eq!(&candidates[..stable_dirs.len()], stable_dirs.as_slice());
+        assert_eq!(
+            &candidates[stable_start..stable_start + stable_dirs.len()],
+            stable_dirs.as_slice()
+        );
         assert!(candidates.contains(&Path::new("/home/test/.local/bin").join(MXC_EXECUTOR_NAME)));
         assert!(candidates.contains(&Path::new("/opt/axis/bin").join(MXC_EXECUTOR_NAME)));
         assert!(!candidates.contains(&Path::new("relative").join(MXC_EXECUTOR_NAME)));
-        let current_exe = std::env::current_exe().unwrap();
-        let current_dir = current_exe.parent().unwrap();
-        assert!(candidates.contains(&current_dir.join(MXC_EXECUTOR_NAME)));
-        if current_dir.file_name().is_some_and(|name| name == "deps") {
-            let parent = current_dir.parent().unwrap();
-            assert!(candidates.contains(&parent.join(MXC_EXECUTOR_NAME)));
-        }
         assert_eq!(
             candidates
                 .iter()
@@ -4965,11 +4971,29 @@ mod tests {
     }
 
     #[test]
-    fn production_seccomp_launcher_candidates_include_package_path_and_current_exe_dirs() {
+    fn production_seccomp_launcher_candidates_prefer_current_exe_dir_then_package_paths() {
         let candidates = production_seccomp_launcher_candidates_for_path(Some(OsStr::new(
             "/home/test/.local/bin:relative:/usr/bin:/opt/axis/bin",
         )));
 
+        let current_exe = std::env::current_exe().unwrap();
+        let current_dir = current_exe.parent().unwrap();
+        assert_eq!(candidates[0], current_dir.join(AXIS_SECCOMP_LAUNCHER_NAME));
+        let mut stable_start = 1;
+        if current_dir.file_name().is_some_and(|name| name == "deps") {
+            let parent = current_dir.parent().unwrap();
+            assert_eq!(candidates[1], parent.join(AXIS_SECCOMP_LAUNCHER_NAME));
+            stable_start = 2;
+        }
+
+        let stable_dirs = AXIS_SECCOMP_LAUNCHER_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join(AXIS_SECCOMP_LAUNCHER_NAME))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &candidates[stable_start..stable_start + stable_dirs.len()],
+            stable_dirs.as_slice()
+        );
         for dir in AXIS_SECCOMP_LAUNCHER_DIRS {
             assert!(
                 candidates.contains(&Path::new(dir).join(AXIS_SECCOMP_LAUNCHER_NAME)),
@@ -4982,14 +5006,6 @@ mod tests {
         );
         assert!(candidates.contains(&Path::new("/opt/axis/bin").join(AXIS_SECCOMP_LAUNCHER_NAME)));
         assert!(!candidates.contains(&Path::new("relative").join(AXIS_SECCOMP_LAUNCHER_NAME)));
-
-        let current_exe = std::env::current_exe().unwrap();
-        let current_dir = current_exe.parent().unwrap();
-        assert!(candidates.contains(&current_dir.join(AXIS_SECCOMP_LAUNCHER_NAME)));
-        if current_dir.file_name().is_some_and(|name| name == "deps") {
-            let parent = current_dir.parent().unwrap();
-            assert!(candidates.contains(&parent.join(AXIS_SECCOMP_LAUNCHER_NAME)));
-        }
     }
 
     #[test]
@@ -8246,7 +8262,8 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
         file.as_file()
             .set_permissions(fs::Permissions::from_mode(mode))
             .unwrap();
-        file.persist(path).unwrap();
+        let persisted = file.persist(path).unwrap();
+        drop(persisted);
     }
 
     fn fake_seccomp_launcher(root: &tempfile::TempDir) -> MxcSeccompLauncher {

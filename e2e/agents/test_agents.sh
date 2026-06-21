@@ -21,6 +21,12 @@ set -euo pipefail
 AXIS="${AXIS_BIN:-axis}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 POLICY_DIR="${SCRIPT_DIR}/../../policies/agents"
+TMP_ROOT="$(mktemp -d /tmp/axis-agent-e2e-XXXXXX)"
+
+cleanup() {
+    rm -rf "$TMP_ROOT"
+}
+trap cleanup EXIT
 
 # Detect platform.
 PLATFORM="${1:-auto}"
@@ -50,6 +56,117 @@ pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 skip() { echo "  SKIP: $1"; SKIP=$((SKIP+1)); }
 
+capability_skip_output() {
+    grep -Fq "resources: process count rlimit fallback requires a dedicated run_as_user" <<<"$1" ||
+        grep -Fq "resources: CPU rate limits require writable cgroups v2" <<<"$1" ||
+        grep -Fq "resources: cgroups v2 is unavailable" <<<"$1" ||
+        grep -Fq "resources: cgroups v2 is read-only" <<<"$1" ||
+        grep -Fq "seccomp: seccomp is unavailable" <<<"$1" ||
+        grep -Fq "filesystem: Landlock unavailable" <<<"$1" ||
+        grep -Fq "bwrap: setting up uid map: Permission denied" <<<"$1" ||
+        grep -Fq "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" <<<"$1"
+}
+
+prepare_run_policy() {
+    local policy_file="$1"
+    local provider="${AXIS_AGENT_TEST_RUNTIME_PROVIDER:-}"
+    local disable_resources="${AXIS_AGENT_TEST_DISABLE_RESOURCE_LIMITS:-0}"
+    local network_mode="${AXIS_AGENT_TEST_NETWORK_MODE:-}"
+
+    if [ -z "$provider" ] && [ "$disable_resources" != "1" ] && [ -z "$network_mode" ]; then
+        printf '%s\n' "$policy_file"
+        return
+    fi
+
+    local output_file
+    output_file="${TMP_ROOT}/$(basename "${policy_file%.yaml}")-run.yaml"
+    local insert_runtime=0
+    if [ -n "$provider" ] && ! grep -Eq '^runtime:' "$policy_file"; then
+        insert_runtime=1
+    fi
+
+    awk \
+        -v provider="$provider" \
+        -v insert_runtime="$insert_runtime" \
+        -v disable_resources="$disable_resources" \
+        -v network_mode="$network_mode" '
+        BEGIN { inserted = 0; in_process = 0; in_network = 0; skip_network_policies = 0 }
+        /^name:[[:space:]]/ && insert_runtime == "1" && inserted == 0 {
+            print
+            print ""
+            print "runtime:"
+            print "  containment: process"
+            print "  provider: " provider
+            inserted = 1
+            next
+        }
+        /^[A-Za-z_][A-Za-z0-9_]*:/ {
+            skip_network_policies = 0
+            in_process = ($0 ~ /^process:/)
+            in_network = ($0 ~ /^network:/)
+        }
+        skip_network_policies == 1 {
+            next
+        }
+        in_process && disable_resources == "1" && /^[[:space:]]*max_processes:/ {
+            print "  max_processes: 0"
+            next
+        }
+        in_process && disable_resources == "1" && /^[[:space:]]*max_memory_mb:/ {
+            print "  max_memory_mb: 0"
+            next
+        }
+        in_process && disable_resources == "1" && /^[[:space:]]*cpu_rate_percent:/ {
+            print "  cpu_rate_percent: 0"
+            next
+        }
+        in_network && network_mode != "" && /^[[:space:]]*mode:/ {
+            print "  mode: " network_mode
+            next
+        }
+        in_network && network_mode != "" && /^[[:space:]]*policies:/ {
+            skip_network_policies = 1
+            next
+        }
+        { print }
+    ' "$policy_file" >"$output_file"
+
+    printf '%s\n' "$output_file"
+}
+
+validate_run_policy() {
+    local label="$1"
+    local policy_file="$2"
+    local output
+    if output=$($AXIS policy validate "$policy_file" 2>&1); then
+        return 0
+    fi
+    echo "$output"
+    fail "$label: runtime policy validation"
+    return 1
+}
+
+report_start_failure() {
+    local label="$1"
+    local output="$2"
+    if capability_skip_output "$output"; then
+        skip "$label unavailable on this runner: ${output//$'\n'/ }"
+    else
+        echo "$output"
+        fail "$label"
+    fi
+}
+
+axis_run() {
+    local run_home
+    run_home="$(mktemp -d "${TMP_ROOT}/home-XXXXXX")"
+    mkdir -p "${run_home}/.local/share"
+    HOME="$run_home" \
+        XDG_CONFIG_HOME="${run_home}/.config" \
+        XDG_DATA_HOME="${run_home}/.local/share" \
+        "$AXIS" run "$@"
+}
+
 # ── Test function for each agent ──────────────────────────────────────────
 
 test_agent() {
@@ -68,17 +185,21 @@ test_agent() {
     fi
 
     # Test 2: Sandbox starts and runs a test command.
+    local RUN_POLICY
+    RUN_POLICY="$(prepare_run_policy "$POLICY_FILE")"
+    validate_run_policy "$AGENT_NAME" "$RUN_POLICY" || return
+
     local OUTPUT
-    OUTPUT=$($AXIS run --policy "$POLICY_FILE" -- /bin/sh -c "echo SANDBOX_OK" 2>&1) || true
+    OUTPUT=$(axis_run --policy "$RUN_POLICY" -- /bin/sh -c "echo SANDBOX_OK" 2>&1) || true
     if echo "$OUTPUT" | grep -q "SANDBOX_OK"; then
         pass "$AGENT_NAME: sandbox runs"
     else
-        fail "$AGENT_NAME: sandbox start"
+        report_start_failure "$AGENT_NAME: sandbox start" "$OUTPUT"
         return
     fi
 
     # Test 3: Credential files are blocked.
-    OUTPUT=$($AXIS run --policy "$POLICY_FILE" -- /bin/sh -c "cat ~/.ssh/id_rsa 2>&1 || echo BLOCKED" 2>&1) || true
+    OUTPUT=$(axis_run --policy "$RUN_POLICY" -- /bin/sh -c "cat ~/.ssh/id_rsa 2>&1 || echo BLOCKED" 2>&1) || true
     if echo "$OUTPUT" | grep -qi "blocked\|denied\|permission\|No such"; then
         pass "$AGENT_NAME: ~/.ssh blocked"
     else
@@ -86,7 +207,7 @@ test_agent() {
     fi
 
     # Test 4: Workspace writes succeed (use workspace dir, not /tmp).
-    OUTPUT=$($AXIS run --policy "$POLICY_FILE" -- /bin/sh -c 'echo test > axis-write-test && echo WRITE_OK && rm axis-write-test' 2>&1) || true
+    OUTPUT=$(axis_run --policy "$RUN_POLICY" -- /bin/sh -c 'echo test > axis-write-test && echo WRITE_OK && rm axis-write-test' 2>&1) || true
     if echo "$OUTPUT" | grep -q "WRITE_OK"; then
         pass "$AGENT_NAME: workspace write"
     else
@@ -95,9 +216,9 @@ test_agent() {
 
     # Test 5: Network deny (for block-mode policies) or proxy enforcement.
     local NET_MODE
-    NET_MODE=$(grep "mode:" "$POLICY_FILE" | head -1 | awk '{print $2}')
+    NET_MODE=$(grep "mode:" "$RUN_POLICY" | head -1 | awk '{print $2}')
     if [ "$NET_MODE" = "block" ]; then
-        OUTPUT=$($AXIS run --policy "$POLICY_FILE" -- /bin/sh -c "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 https://example.com 2>&1 || echo NETWORK_BLOCKED" 2>&1) || true
+        OUTPUT=$(axis_run --policy "$RUN_POLICY" -- /bin/sh -c "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 https://example.com 2>&1 || echo NETWORK_BLOCKED" 2>&1) || true
         if echo "$OUTPUT" | grep -qi "blocked\|000\|denied\|not permitted\|timed out"; then
             pass "$AGENT_NAME: network blocked"
         else
@@ -105,7 +226,7 @@ test_agent() {
         fi
     elif [ "$NET_MODE" = "proxy" ]; then
         # Test that non-allowed host is denied by proxy.
-        OUTPUT=$($AXIS run --policy "$POLICY_FILE" -- /bin/sh -c "curl -s --proxy \$HTTPS_PROXY -o /dev/null -w '%{http_code}' --connect-timeout 3 https://evil.example.com 2>&1 || echo DENIED" 2>&1) || true
+        OUTPUT=$(axis_run --policy "$RUN_POLICY" -- /bin/sh -c "curl -s --proxy \$HTTPS_PROXY -o /dev/null -w '%{http_code}' --connect-timeout 3 https://evil.example.com 2>&1 || echo DENIED" 2>&1) || true
         if echo "$OUTPUT" | grep -qi "denied\|000\|403"; then
             pass "$AGENT_NAME: proxy denies evil.example.com"
         else
@@ -116,7 +237,7 @@ test_agent() {
     # Test 6: Agent binary check (if available).
     if [ -n "$BINARY_CHECK" ]; then
         if command -v "$BINARY_CHECK" >/dev/null 2>&1; then
-            OUTPUT=$($AXIS run --policy "$POLICY_FILE" -- "$BINARY_CHECK" --version 2>&1) || true
+            OUTPUT=$(axis_run --policy "$RUN_POLICY" -- "$BINARY_CHECK" --version 2>&1) || true
             if echo "$OUTPUT" | grep -qi "version\|[0-9]\.[0-9]"; then
                 pass "$AGENT_NAME: binary runs in sandbox"
             else
@@ -137,19 +258,32 @@ else
     fail "base-deny: policy validation"
 fi
 
-OUTPUT=$($AXIS run --policy "$POLICY_DIR/base-deny.yaml" -- /bin/sh -c "echo DENY_OK" 2>&1) || true
+BASE_RUN_POLICY="$(prepare_run_policy "$POLICY_DIR/base-deny.yaml")"
+BASE_SANDBOX_AVAILABLE=0
+if validate_run_policy "base-deny" "$BASE_RUN_POLICY"; then
+    OUTPUT=$(axis_run --policy "$BASE_RUN_POLICY" -- /bin/sh -c "echo DENY_OK" 2>&1) || true
+else
+    OUTPUT=""
+fi
 if echo "$OUTPUT" | grep -q "DENY_OK"; then
     pass "base-deny: sandbox runs"
+    BASE_SANDBOX_AVAILABLE=1
 else
-    fail "base-deny: sandbox start"
+    report_start_failure "base-deny: sandbox start" "$OUTPUT"
 fi
 
 # Verify network is fully blocked in base deny.
-OUTPUT=$($AXIS run --policy "$POLICY_DIR/base-deny.yaml" -- /bin/sh -c "curl -s --connect-timeout 2 https://example.com 2>&1; echo EXIT=\$?" 2>&1) || true
-if echo "$OUTPUT" | grep -qi "blocked\|denied\|not permitted\|timed out\|EXIT=[^0]"; then
-    pass "base-deny: network blocked"
+if [ "$BASE_SANDBOX_AVAILABLE" -eq 1 ]; then
+    OUTPUT=$(axis_run --policy "$BASE_RUN_POLICY" -- /bin/sh -c "curl -s --connect-timeout 2 https://example.com 2>&1; echo EXIT=\$?" 2>&1) || true
+    if echo "$OUTPUT" | grep -qi "blocked\|denied\|not permitted\|timed out\|EXIT=[^0]"; then
+        pass "base-deny: network blocked"
+    elif capability_skip_output "$OUTPUT"; then
+        skip "base-deny: network blocked unavailable on this runner: ${OUTPUT//$'\n'/ }"
+    else
+        fail "base-deny: network NOT blocked"
+    fi
 else
-    fail "base-deny: network NOT blocked"
+    skip "base-deny: network blocked requires a running sandbox"
 fi
 
 echo ""
