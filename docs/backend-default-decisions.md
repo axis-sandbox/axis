@@ -46,7 +46,7 @@ dependency gates, and status meanings.
 | --- | --- | --- |
 | Linux | `mxc-linux-bubblewrap` | Use the MXC process backend by default while AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around it. |
 | macOS | `axis-native-macos-seatbelt` | Retain native default while direct Seatbelt profile generation remains the proven no-extra-runtime path. |
-| Windows | None (`axis-native-windows` disabled) | Reject native user-command launches before process creation until Job Object, AppContainer/token, ACL, proxy, environment, lifecycle, and cleanup enforcement are implemented and proven together. |
+| Windows | `mxc-windows-processcontainer` | Require packaged MXC BaseContainer with least-privilege mode while AXIS rejects unsupported policy surfaces and owns sanitized executor launch, timeout, and cleanup. AppContainer/DACL fallback remains disabled, and the legacy native host-spawn path is disabled. |
 
 Non-default MXC process backends are candidates. They can become defaults only
 after they match AXIS policy semantics and have benchmark evidence for startup,
@@ -75,7 +75,6 @@ AXIS_RUNTIME_METRICS_PROFILES=mxc_process \
 | `axis-native-linux` | Process | Retained | `AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run --locked --release -p axis-bench --bin runtime-metrics` |
 | `axis-native-windows` | Process | Blocked containment target | No benchmark gate until the pre-execution containment path is implemented |
 | `mxc-macos-seatbelt` | Process | Candidate | `AXIS_BENCH_MXC_MACOS_SEATBELT=1` |
-| `mxc-windows-processcontainer` | Process | Candidate | `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` |
 | `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |
 | `mxc-windows-wslc` | Container | Candidate | `AXIS_BENCH_MXC_WINDOWS_WSLC=1` |
 | `mxc-linux-microvm` | VM | Experimental opt-in | `AXIS_BENCH_MXC_MICROVM=1` |

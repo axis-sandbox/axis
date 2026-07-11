@@ -519,6 +519,16 @@ pub struct ProcessPolicy {
     #[serde(default)]
     pub blocked_syscalls: Vec<String>,
 
+    /// Portable identity intent. Unlike `run_as_user`, this does not name a
+    /// host account and can map to a BaseContainer/AppContainer identity.
+    #[serde(default)]
+    pub identity: ProcessIdentity,
+
+    /// Portable descendant-process intent. `deny` maps to a child-tree process
+    /// limit of one rather than to platform-specific syscall names.
+    #[serde(default)]
+    pub child_processes: ChildProcessPolicy,
+
     /// Maximum wall-clock time in seconds before auto-destroy. None = no timeout.
     #[serde(default)]
     pub timeout_sec: Option<u64>,
@@ -532,6 +542,8 @@ impl Default for ProcessPolicy {
             cpu_rate_percent: default_cpu_rate(),
             run_as_user: None,
             blocked_syscalls: Vec::new(),
+            identity: ProcessIdentity::default(),
+            child_processes: ChildProcessPolicy::default(),
             timeout_sec: None,
         }
     }
@@ -547,6 +559,30 @@ impl ProcessPolicy {
         }
         Ok(())
     }
+
+    pub fn effective_max_processes(&self) -> u32 {
+        if matches!(self.child_processes, ChildProcessPolicy::Deny) {
+            1
+        } else {
+            self.max_processes
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessIdentity {
+    #[default]
+    BackendDefault,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildProcessPolicy {
+    #[default]
+    Allow,
+    Deny,
 }
 
 fn default_max_processes() -> u32 {
@@ -1185,6 +1221,17 @@ runtime:
         assert_eq!(policy.process.max_processes, 0);
         assert_eq!(policy.process.max_memory_mb, 0);
         assert_eq!(policy.process.cpu_rate_percent, 0);
+    }
+
+    #[test]
+    fn portable_process_intents_parse_and_derive_effective_limit() {
+        let policy = Policy::from_yaml(
+            "version: 1\nname: portable-process\nprocess:\n  identity: isolated\n  child_processes: deny\n",
+        )
+        .unwrap();
+        assert_eq!(policy.process.identity, ProcessIdentity::Isolated);
+        assert_eq!(policy.process.child_processes, ChildProcessPolicy::Deny);
+        assert_eq!(policy.process.effective_max_processes(), 1);
     }
 
     #[test]

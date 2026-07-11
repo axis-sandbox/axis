@@ -379,6 +379,19 @@ jobs:
       - name: Build
         run: cargo build --locked --release
 
+      - name: Build pinned MXC Windows executor
+        shell: pwsh
+        run: |
+          $mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
+          git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
+          git -C $mxcDir checkout $env:MXC_REF
+          Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\mxc\patches\*.patch") |
+            Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
+          Push-Location (Join-Path $mxcDir "src")
+          cargo build --release -p wxc --no-default-features --locked
+          Pop-Location
+          Copy-Item (Join-Path $mxcDir "src\target\release\wxc-exec.exe") target\release\wxc-exec.exe
+
       - name: Unit tests
         run: cargo test --locked
 
@@ -448,6 +461,14 @@ jobs:
       - name: Agent safety tests
         run: powershell -ExecutionPolicy Bypass -File e2e\agents\test_agents.ps1 -AxisBin .\target\release\axis.exe
         shell: pwsh
+
+      - name: Windows MXC ProcessContainer smoke and security tests
+        shell: pwsh
+        env:
+          AXIS_RUN_MXC_BASECONTAINER_E2E: "1"
+          AXIS_SKIP_UNAVAILABLE_MXC_BASECONTAINER_E2E: "1"
+          AXIS_TEST_MXC_EXECUTOR: ${{ github.workspace }}\target\release\wxc-exec.exe
+        run: pwsh -NoProfile -File e2e/windows/test_mxc_processcontainer.ps1 -AxisBin ./target/release/axis.exe
 
       - name: Test agent install (PowerShell)
         run: |

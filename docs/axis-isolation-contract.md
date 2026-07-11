@@ -132,6 +132,15 @@ Required behavior:
   proxy credentials unless AXIS intentionally adds sanitized values.
 - `run_as_user` must not run as root and must fail if the requested identity
   cannot be prepared safely.
+- `identity: isolated` is portable intent for a backend-owned isolated token or
+  account. It must not be implemented by guessing a host username. Windows MXC
+  maps it to the actual least-privilege ProcessContainer token; legacy
+  `run_as_user` remains unsupported there.
+- `child_processes: deny` means the workload may have no descendants. Backends
+  enforce it as an atomic one-process tree limit; it is not translated into a
+  guessed list of `fork`, `clone`, or process-creation API names.
+- `blocked_syscalls` remains an explicitly Linux-specific seccomp surface.
+  Portable restrictions must use semantic fields rather than syscall names.
 - Process-tree limits, process groups, sessions, and job handles must not allow
   child processes to escape timeout or destroy behavior.
 - PTY support must be planned explicitly. A backend without PTY support is
@@ -139,6 +148,12 @@ Required behavior:
 - Exit status, stdout, stderr, and timeout status must report the sandboxed
   workload, not an unrelated wrapper failure unless wrapper setup failed before
   spawn.
+
+Per-binary network policy remains unsupported on Windows ProcessContainer. A
+SID-scoped WFP lease proves the sandbox identity but not the executable behind
+each proxied CONNECT; user-mode PID/tuple reconstruction is vulnerable to PID
+reuse and short-lived-connection races. AXIS will not weaken that requirement
+without ALE process metadata or an equivalent race-safe boundary.
 
 ## Credential Semantics
 

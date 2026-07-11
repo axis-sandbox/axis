@@ -54,7 +54,7 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
     // This avoids depending on specific windows crate feature sets
     // that may not be available for cross-compilation.
 
-    type PSID = *mut std::ffi::c_void;
+    type Psid = *mut std::ffi::c_void;
 
     #[link(name = "userenv")]
     unsafe extern "system" {
@@ -64,20 +64,18 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
             pszDescription: *const u16,
             pCapabilities: *const std::ffi::c_void,
             dwCapabilityCount: u32,
-            ppSidAppContainerSid: *mut PSID,
+            ppSidAppContainerSid: *mut Psid,
         ) -> i32; // HRESULT
-
-        fn DeleteAppContainerProfile(pszAppContainerName: *const u16) -> i32;
 
         fn DeriveAppContainerSidFromAppContainerName(
             pszAppContainerName: *const u16,
-            ppsidAppContainerSid: *mut PSID,
+            ppsidAppContainerSid: *mut Psid,
         ) -> i32;
     }
 
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        fn ConvertSidToStringSidW(Sid: PSID, StringSid: *mut *mut u16) -> i32; // BOOL
+        fn ConvertSidToStringSidW(Sid: Psid, StringSid: *mut *mut u16) -> i32; // BOOL
     }
 
     #[link(name = "kernel32")]
@@ -92,7 +90,7 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
             .collect()
     }
 
-    fn sid_to_string(psid: PSID) -> Result<String, String> {
+    fn sid_to_string(psid: Psid) -> Result<String, String> {
         let mut string_sid: *mut u16 = std::ptr::null_mut();
         let ok = unsafe { ConvertSidToStringSidW(psid, &mut string_sid) };
         if ok == 0 {
@@ -111,7 +109,7 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
     let name_w = to_wide(name);
     let display_w = to_wide("AXIS Sandbox");
     let desc_w = to_wide("Isolated agent execution environment");
-    let mut psid: PSID = std::ptr::null_mut();
+    let mut psid: Psid = std::ptr::null_mut();
 
     let hr = unsafe {
         CreateAppContainerProfile(
@@ -137,7 +135,7 @@ fn create_profile_impl(name: &str) -> Result<String, String> {
     // 0x800705B9 = ERROR_ALREADY_EXISTS
     if hr as u32 == 0x800705B9u32 {
         // Profile exists — derive the SID.
-        let mut psid2: PSID = std::ptr::null_mut();
+        let mut psid2: Psid = std::ptr::null_mut();
         let hr2 = unsafe { DeriveAppContainerSidFromAppContainerName(name_w.as_ptr(), &mut psid2) };
         if hr2 == 0 {
             let sid_str = sid_to_string(psid2)?;

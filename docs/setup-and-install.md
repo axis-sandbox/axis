@@ -29,6 +29,8 @@ On Linux, release archives and packages include `axis`, `axisd`,
 `axis-seccomp-launcher`, and the MXC `lxc-exec` executor. The default install
 does not install setuid content, grant file capabilities, configure cgroups,
 enable VM features, or modify firewall rules.
+Windows archives include the pinned MXC `wxc-exec.exe` used by the default
+ProcessContainer path.
 
 Verify the basic process sandbox:
 
@@ -86,6 +88,52 @@ Do not root-install checkout-built privileged helpers as part of normal
 testing. Privileged helper proofs belong in the gated e2e scripts described
 below.
 
+For a Windows source checkout, build the same pinned executor used by release
+jobs and place it beside `axis.exe`:
+
+```powershell
+.\scripts\setup_windows_mxc.ps1
+```
+
+The script keeps its MXC checkout under `%LOCALAPPDATA%\axis-dev\mxc`, pins
+the tested revision, applies AXIS's compatibility patch idempotently, builds
+both release binaries, and configures the current PowerShell process to use
+BaseContainer. Pass `-SkipAxisBuild` when only `wxc-exec.exe` needs rebuilding.
+
+Strict Windows proxy policies additionally require the narrowly privileged
+AXIS WFP broker. From an elevated PowerShell session, build/install it once:
+
+```powershell
+.\scripts\install_windows_wfp_broker.ps1
+Get-Service AxisWfpBroker
+```
+
+The service accepts only a fixed lease operation for a suspended
+`wxc-exec.exe` child. It reads the real AppContainer SID from that child,
+allows TCP only to the exact per-sandbox AXIS proxy endpoint, and blocks other
+IPv4/IPv6 connects. Dynamic proxy permits disappear on broker failure;
+persistent fail-closed blocks are journaled under
+`%ProgramData%\axis\wfp-leases` and reaped on restart after PID creation-time
+validation. The install script restricts that journal to SYSTEM and
+Administrators. Use `-Uninstall` only after all sandboxes have exited.
+
+Windows `auto` and `mxc` policies use ProcessContainer. `axis_native` is
+disabled because the legacy path does not enforce the AXIS policy boundary.
+The supported policy slice includes filesystem read-only/read-write allowlists,
+non-overlapping deny rules that are redundant under BaseContainer default-deny,
+a managed Windows profile, child-tree process/aggregate-memory/CPU limits,
+default allow/block networking, and broker-backed BaseContainer strict proxy
+routing. Nested deny rules and other unmapped Windows
+process-policy surfaces fail before launch. AXIS leaves MXC's upstream
+BaseContainer-first tier selection intact and always emits
+`fallback.allowDaclMutation=false`. An unavailable BaseContainer therefore fails
+closed instead of selecting an older AppContainer/DACL tier or temporarily
+changing host ACLs.
+
+MXC least-privilege mode remains enabled for BaseContainer. AXIS does not select
+an older tier solely to gain a feature, including ConPTY, that the current
+BaseContainer API cannot provide.
+
 ## Linux Host Packages
 
 The package names below are the common Debian/Ubuntu names. Other
@@ -122,7 +170,7 @@ needs the runtime tools that each selected backend uses.
 | MXC LXC container backend | Safe `lxc-exec`, prepared LXC runtime usable by the current user, configured distribution/release or image inputs, `python3` for the smoke harness | Backend-specific host setup; no AXIS helper install required | `AXIS_RUN_MXC_LXC_E2E=1 bash e2e/linux/test_mxc_lxc_smoke.sh` |
 | MXC microVM backend | Safe `lxc-exec`, readable/writable `/dev/kvm`, MXC microVM runtime artifacts, guest/runtime image inputs | KVM access must be granted by the host; backend is experimental | `AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh` |
 | MXC Hyperlight backend | Safe `lxc-exec`, readable/writable `/dev/kvm`, MXC Hyperlight runtime artifacts or snapshots | KVM access must be granted by the host; backend is experimental | `AXIS_RUN_MXC_HYPERLIGHT_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh` |
-| Windows native process sandbox | Disabled until process creation atomically applies Job Object, AppContainer or equivalent token isolation, filesystem ACLs, proxy enforcement, and environment isolation | No user-command launch is currently supported; AXIS rejects before process creation | On Windows: `cargo test --locked -p axis-sandbox native_launcher_rejects_before_workspace_or_process_setup` |
+| Windows process sandbox | Packaged `wxc-exec.exe`, supported MXC BaseContainer, and Windows Job Objects for AXIS lifecycle cleanup | Normal user launch on a BaseContainer-enabled host | `axis run -- python -c "print('hello from axis')"` |
 | Windows VM-style backends | Windows Sandbox, WSL2, Windows Hypervisor Platform, Isolation Session, microVM, or Hyperlight features depending on backend | Explicit Windows feature enablement | Backend-specific gated smoke or benchmark command |
 | macOS Seatbelt process sandbox | macOS Seatbelt profile execution support; Xcode Command Line Tools for source builds and platform test builds | Normal user launch | `axis run -- python3 -c 'print("hello from axis")'` |
 
@@ -230,6 +278,76 @@ AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh
 AXIS_RUN_MXC_HYPERLIGHT_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh
 cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
+
+On a host with the BaseContainer feature enabled, run the AXIS-through-MXC
+ProcessContainer proof with a trusted pinned executor:
+
+```powershell
+$env:AXIS_RUN_MXC_BASECONTAINER_E2E = "1"
+$env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
+.\e2e\windows\test_mxc_processcontainer.ps1 `
+    -AxisBin .\target\release\axis.exe
+```
+
+The suite tests command execution, environment filtering, managed-profile
+projection, explicit/default-deny filesystem behavior, network allow/block
+behavior, process count, aggregate memory, single-CPU-equivalent rate limits,
+timeout descendant cleanup, and absence of host directory ACL mutation.
+Feature-key, fallback, policy, launch, isolation, resource, and cleanup errors
+are test failures once the gate is set.
+
+Run the privileged strict-proxy adversarial suite from an elevated PowerShell
+session after installing the broker:
+
+```powershell
+$env:AXIS_RUN_WINDOWS_WFP_E2E = "1"
+$env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
+.\e2e\windows\test_mxc_strict_proxy.ps1 `
+    -AxisBin .\target\release\axis.exe
+```
+
+It proves allowed HTTPS through the proxy; endpoint denial; raw TCP, DNS,
+QUIC/UDP, and IPv6 bypass resistance; correlated WFP events; concurrent lease
+isolation; and fail-closed broker restart recovery.
+
+With the same broker and BaseContainer prerequisites, run the managed-inference
+boundary proof:
+
+```powershell
+$env:AXIS_RUN_WINDOWS_INFERENCE_E2E = "1"
+$env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
+.\e2e\windows\test_mxc_inference.ps1 `
+    -AxisBin .\target\release\axis.exe
+```
+
+This uses a host mock provider to prove streaming, host-only credential
+injection, guest secret absence, and token-budget rejection before provider
+bytes are forwarded. Windows inference policies require strict proxy mode and
+therefore the BaseContainer/WFP tier. `action_on_exhaust: reject` is currently
+the only exact budget action; queue and fallback require the future trusted
+request scheduler and fail during proxy initialization.
+
+For standalone `axis run`, set `AXIS_INFERENCE_ENDPOINT=127.0.0.1:<port>` to
+map the sandbox-visible `inference.local` route to a managed host provider.
+AXIS consumes this value in the host proxy and does not project it into the
+sandbox environment.
+
+Scoped SSH uses that same BaseContainer/WFP boundary and requires the packaged
+`axis-ssh-proxy.exe` beside `axis.exe`. To run its gated proof:
+
+```powershell
+$env:AXIS_RUN_WINDOWS_SSH_E2E = "1"
+$env:AXIS_TEST_MXC_EXECUTOR = (Resolve-Path ".\target\release\wxc-exec.exe")
+.\e2e\windows\test_mxc_scoped_ssh.ps1 `
+    -AxisBin .\target\release\axis.exe
+```
+
+For enforceable raw-key projection, all selected keys must declare the same
+literal host set, generated config and known-hosts must be enabled, and that
+host set must exactly match the strict network policy's port-22 endpoints.
+This prevents a custom SSH client from using one projected key against another
+key's destination. More granular key-to-host sets require a future signing
+broker rather than readable private-key copies.
 
 Benchmark checks:
 

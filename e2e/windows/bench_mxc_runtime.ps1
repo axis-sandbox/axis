@@ -43,14 +43,14 @@ function Resolve-MxcExecutor {
         return (Resolve-Path -LiteralPath $env:AXIS_TEST_MXC_EXECUTOR).Path
     }
 
-    foreach ($candidate in @("wxc.exe", "wxc", "mxc-exec.exe", "mxc-exec", "lxc-exec.exe", "lxc-exec")) {
+    foreach ($candidate in @("wxc-exec.exe", "wxc.exe", "wxc", "mxc-exec.exe", "mxc-exec", "lxc-exec.exe", "lxc-exec")) {
         $command = Get-Command $candidate -ErrorAction SilentlyContinue
         if ($command) {
             return $command.Source
         }
     }
 
-    Exit-Fail "set AXIS_TEST_MXC_EXECUTOR or provide wxc, mxc-exec, or lxc-exec on PATH"
+    Exit-Fail "set AXIS_TEST_MXC_EXECUTOR or provide wxc-exec, wxc, mxc-exec, or lxc-exec on PATH"
 }
 
 function Quote-Arg([string]$Value) {
@@ -112,7 +112,7 @@ if ($outputPath) {
 }
 Write-Host ""
 
-function New-CommandLine([object]$Backend, [string]$Marker, [int]$SleepMilliseconds) {
+function New-CommandLine([object]$Backend, [string]$Marker, [int]$SleepMilliseconds, [string]$ConfigPath) {
     if ($Backend.CommandFamily -eq "linux") {
         $command = "echo $Marker"
         if ($SleepMilliseconds -gt 0) {
@@ -120,6 +120,26 @@ function New-CommandLine([object]$Backend, [string]$Marker, [int]$SleepMilliseco
             $command = "$command; sleep $seconds"
         }
         return "sh -c '$command'"
+    }
+
+    if ($Backend.Containment -eq "processcontainer") {
+        $scriptPath = "$ConfigPath.cmd"
+        $script = "@echo off`r`necho $Marker`r`n"
+        if ($SleepMilliseconds -gt 0) {
+            $ticks = [Math]::Max(1, [Math]::Ceiling($SleepMilliseconds / 10))
+            $script += @"
+set /a ticks=0
+set "lastTick=%time:~6,5%"
+:waitForTick
+set "currentTick=%time:~6,5%"
+if "%currentTick%"=="%lastTick%" goto waitForTick
+set "lastTick=%currentTick%"
+set /a ticks+=1
+if %ticks% LSS $ticks goto waitForTick
+"@
+        }
+        Set-Content -LiteralPath $scriptPath -Value $script -Encoding ASCII
+        return 'cmd.exe /d /s /c ""' + $scriptPath + '""'
     }
 
     $command = "Write-Output '$Marker'"
@@ -136,7 +156,7 @@ function Write-MxcConfig([string]$Path, [object]$Backend, [string]$Marker, [int]
         containment = $Backend.Containment
         platform = "windows"
         process = [ordered]@{
-            commandLine = New-CommandLine $Backend $Marker $SleepMilliseconds
+            commandLine = New-CommandLine $Backend $Marker $SleepMilliseconds $Path
             timeout = $timeoutSeconds * 1000
         }
         filesystem = [ordered]@{
@@ -152,7 +172,8 @@ function Write-MxcConfig([string]$Path, [object]$Backend, [string]$Marker, [int]
     }
 
     if ($Backend.Containment -eq "processcontainer") {
-        $config.processContainer = [ordered]@{ leastPrivilege = $false }
+        $config.filesystem.readonlyPaths = @("$Path.cmd")
+        $config.processContainer = [ordered]@{ leastPrivilege = $true }
         $config.fallback = [ordered]@{ allowDaclMutation = $false }
     } elseif ($Backend.Containment -eq "wslc") {
         $config.experimental = [ordered]@{
@@ -179,10 +200,12 @@ function Write-MxcConfig([string]$Path, [object]$Backend, [string]$Marker, [int]
         }
     }
 
-    $config | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8
+    # Windows PowerShell 5.1 writes a UTF-8 BOM that MXC rejects. Benchmark
+    # fixtures are ASCII-only, so keep them portable across powershell/pwsh.
+    $config | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding ASCII
 }
 
-function Start-MxcConfig([string]$ConfigPath, [string]$Marker) {
+function Start-MxcConfig([string]$ConfigPath, [string]$Marker, [string]$Containment) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $executor
     $psi.Arguments = "--experimental --config " + (Quote-Arg $ConfigPath)
@@ -233,8 +256,8 @@ function Complete-MxcConfig([object]$Handle) {
     }
 }
 
-function Invoke-MxcConfig([string]$ConfigPath, [string]$Marker) {
-    return Complete-MxcConfig (Start-MxcConfig $ConfigPath $Marker)
+function Invoke-MxcConfig([string]$ConfigPath, [string]$Marker, [string]$Containment) {
+    return Complete-MxcConfig (Start-MxcConfig $ConfigPath $Marker $Containment)
 }
 
 function Get-Summary([double[]]$Values) {
@@ -252,14 +275,14 @@ function Invoke-BackendBenchmark([object]$Backend) {
     $coldMarker = ("AXIS_MXC_BENCH_" + $Backend.Containment.ToUpperInvariant() + "_COLD")
     $coldConfig = Join-Path $tmpdir ($Backend.Containment + "-cold.json")
     Write-MxcConfig $coldConfig $Backend $coldMarker 0
-    $cold = Invoke-MxcConfig $coldConfig $coldMarker
+    $cold = Invoke-MxcConfig $coldConfig $coldMarker $Backend.Containment
 
     $warmResults = @()
     for ($i = 0; $i -lt $runs; $i++) {
         $marker = ("AXIS_MXC_BENCH_" + $Backend.Containment.ToUpperInvariant() + "_WARM_" + $i)
         $config = Join-Path $tmpdir ($Backend.Containment + "-warm-" + $i + ".json")
         Write-MxcConfig $config $Backend $marker 0
-        $warmResults += Invoke-MxcConfig $config $marker
+        $warmResults += Invoke-MxcConfig $config $marker $Backend.Containment
     }
 
     $densityHandles = @()
@@ -268,7 +291,7 @@ function Invoke-BackendBenchmark([object]$Backend) {
         $marker = ("AXIS_MXC_BENCH_" + $Backend.Containment.ToUpperInvariant() + "_DENSITY_" + $i)
         $config = Join-Path $tmpdir ($Backend.Containment + "-density-" + $i + ".json")
         Write-MxcConfig $config $Backend $marker 250
-        $densityHandles += Start-MxcConfig $config $marker
+        $densityHandles += Start-MxcConfig $config $marker $Backend.Containment
     }
     $densityResults = @()
     foreach ($handle in $densityHandles) {

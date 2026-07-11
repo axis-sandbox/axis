@@ -1,0 +1,16 @@
+version: 1
+name: windows-basecontainer-smoke
+runtime:
+  containment: process
+  provider: mxc
+filesystem:
+  read_write:
+    - "{workspace}"
+  compatibility: hard_requirement
+process:
+  max_processes: 0
+  max_memory_mb: 0
+  cpu_rate_percent: 0
+  timeout_sec: 15
+network:
+  mode: block

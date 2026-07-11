@@ -267,7 +267,7 @@ pub fn build_container_backend_execution_spec(
         filesystem: container_filesystem_spec(policy),
         network: container_network_spec(policy),
         resources: ContainerBackendResourceSpec {
-            max_processes: policy.process.max_processes,
+            max_processes: policy.process.effective_max_processes(),
             max_memory_mb: policy.process.max_memory_mb,
             cpu_rate_percent: policy.process.cpu_rate_percent,
         },

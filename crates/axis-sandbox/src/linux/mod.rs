@@ -1348,7 +1348,7 @@ fn prepare_rlimits_for_plan(
     };
     let max_processes = match process_limit {
         strategy::ProcessLimitFallback::RlimitNprocWithDedicatedUser => {
-            Some(rlim_from_u64(u64::from(policy.max_processes))?)
+            Some(rlim_from_u64(u64::from(policy.effective_max_processes()))?)
         }
         strategy::ProcessLimitFallback::NotRequested => None,
     };

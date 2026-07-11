@@ -187,6 +187,20 @@ jobs:
             cmp "$RUNNER_TEMP/axis-first-build/$binary" "target/$TARGET/release/$binary"
           done
 
+      - name: Build MXC Windows executor
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
+          git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
+          git -C $mxcDir checkout $env:MXC_REF
+          Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\mxc\patches\*.patch") |
+            Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
+          Push-Location (Join-Path $mxcDir "src")
+          cargo build --release -p wxc --no-default-features --locked --target ${{ matrix.target }}
+          Pop-Location
+          Copy-Item (Join-Path $mxcDir "src\target\${{ matrix.target }}\release\wxc-exec.exe") target\${{ matrix.target }}\release\wxc-exec.exe
+
       - name: Build MXC Linux executor
         if: matrix.platform == 'linux-x86_64'
         env:
@@ -277,6 +291,10 @@ jobs:
           New-Item -ItemType Directory -Path "$packageDir" -Force
           Copy-Item -LiteralPath (Join-Path "$targetDir" "axis.exe") -Destination "$packageDir"
           Copy-Item -LiteralPath (Join-Path "$targetDir" "axisd.exe") -Destination "$packageDir"
+          Copy-Item -LiteralPath (Join-Path "$targetDir" "wxc-exec.exe") -Destination "$packageDir"
+          Copy-Item -LiteralPath (Join-Path "$targetDir" "axis-wfp-broker.exe") -Destination "$packageDir"
+          Copy-Item -LiteralPath (Join-Path "$targetDir" "axis-ssh-proxy.exe") -Destination "$packageDir"
+          Copy-Item -LiteralPath "scripts/install_windows_wfp_broker.ps1" -Destination "$packageDir"
           Copy-Item -Path "policies\*.yaml" -Destination "$packageDir"
           Copy-Item -LiteralPath "README.md" -Destination "$packageDir"
           Copy-Item -LiteralPath "LICENSE" -Destination "$packageDir"
@@ -314,6 +332,10 @@ jobs:
           "axis-$env:PLATFORM"
           --require axis.exe
           --require axisd.exe
+          --require wxc-exec.exe
+          --require axis-wfp-broker.exe
+          --require axis-ssh-proxy.exe
+          --require install_windows_wfp_broker.ps1
           --require REPRODUCIBILITY.json
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

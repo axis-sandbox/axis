@@ -209,19 +209,51 @@ impl CredentialInjector {
         is_tls: bool,
         head: &[u8],
     ) -> Result<RewrittenHttpRequestHead, SecretError> {
+        self.rewrite_http_request_head_with_body_length_impl(
+            connect_host,
+            connect_port,
+            is_tls,
+            head,
+            false,
+        )
+    }
+
+    pub(crate) fn inspect_http_request_head_with_body_length(
+        &self,
+        connect_host: &str,
+        connect_port: u16,
+        is_tls: bool,
+        head: &[u8],
+    ) -> Result<RewrittenHttpRequestHead, SecretError> {
+        self.rewrite_http_request_head_with_body_length_impl(
+            connect_host,
+            connect_port,
+            is_tls,
+            head,
+            true,
+        )
+    }
+
+    fn rewrite_http_request_head_with_body_length_impl(
+        &self,
+        connect_host: &str,
+        connect_port: u16,
+        is_tls: bool,
+        head: &[u8],
+        inspect_without_rules: bool,
+    ) -> Result<RewrittenHttpRequestHead, SecretError> {
         let host = normalize_host(connect_host);
         let rules: Vec<_> = self
             .rules
             .iter()
             .filter(|rule| rule.matches_connection(&host, connect_port, is_tls))
             .collect();
-        if rules.is_empty() {
+        if rules.is_empty() && !inspect_without_rules {
             return Ok(RewrittenHttpRequestHead {
                 head: None,
                 body_length: 0,
             });
         }
-
         let scheme = EndpointScheme::from_tls(is_tls);
         let parsed = ParsedHttpHead::parse(head, scheme)?;
         let connect_authority = NormalizedAuthority {
@@ -232,6 +264,12 @@ impl CredentialInjector {
             return Err(SecretError::InvalidHttpRequest(
                 "Host authority does not match CONNECT destination".into(),
             ));
+        }
+        if rules.is_empty() {
+            return Ok(RewrittenHttpRequestHead {
+                head: None,
+                body_length: parsed.body_length,
+            });
         }
         let Some(rule) = rules
             .into_iter()

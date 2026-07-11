@@ -230,6 +230,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "serde_json",
  "serde_yaml",
  "sha2",
  "tempfile",

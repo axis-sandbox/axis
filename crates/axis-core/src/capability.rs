@@ -93,6 +93,7 @@ pub struct ProcessCapabilities {
     pub environment: CapabilitySupport,
     pub stdio: CapabilitySupport,
     pub user_identity: CapabilitySupport,
+    pub isolated_identity: CapabilitySupport,
     pub syscall_filtering: CapabilitySupport,
     pub pty: CapabilitySupport,
     pub timeout: CapabilitySupport,
@@ -561,6 +562,17 @@ fn requirements_for_policy(
             &backend.process.user_identity,
         );
     }
+    if matches!(
+        policy.process.identity,
+        crate::policy::ProcessIdentity::Isolated
+    ) {
+        push(
+            &mut requirements,
+            PolicySurface::Process,
+            "process.isolated_identity",
+            &backend.process.isolated_identity,
+        );
+    }
     if !policy.process.blocked_syscalls.is_empty() {
         push(
             &mut requirements,
@@ -639,7 +651,7 @@ fn requirements_for_policy(
         );
     }
 
-    if policy.process.max_processes > 0 {
+    if policy.process.effective_max_processes() > 0 {
         push(
             &mut requirements,
             PolicySurface::Resources,
@@ -828,7 +840,7 @@ fn push(
 }
 
 fn resources_requested(policy: &Policy) -> bool {
-    policy.process.max_processes > 0
+    policy.process.effective_max_processes() > 0
         || policy.process.max_memory_mb > 0
         || policy.process.cpu_rate_percent > 0
 }
@@ -882,6 +894,7 @@ mod tests {
                 environment: CapabilitySupport::exact(),
                 stdio: CapabilitySupport::exact(),
                 user_identity: CapabilitySupport::exact(),
+                isolated_identity: CapabilitySupport::exact(),
                 syscall_filtering: CapabilitySupport::exact(),
                 pty: CapabilitySupport::unsupported("pty not implemented"),
                 timeout: CapabilitySupport::exact(),
@@ -948,6 +961,8 @@ mod tests {
                 cpu_rate_percent: 0,
                 run_as_user: None,
                 blocked_syscalls: Vec::new(),
+                identity: Default::default(),
+                child_processes: Default::default(),
                 timeout_sec: None,
             },
             network: NetworkPolicy {

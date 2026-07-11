@@ -1434,6 +1434,8 @@ mod tests {
                 cpu_rate_percent: 0,
                 run_as_user: None,
                 blocked_syscalls: Vec::new(),
+                identity: Default::default(),
+                child_processes: Default::default(),
                 timeout_sec: None,
             },
             network: NetworkPolicy {

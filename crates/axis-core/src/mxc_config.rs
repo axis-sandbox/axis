@@ -132,6 +132,8 @@ pub struct MxcProcessConfigOptions {
     pub strict_proxy_enforced_by_axis: bool,
     pub cooperative_proxy_configured_by_mxc: bool,
     pub resource_limits_enforced_by_axis: bool,
+    pub proxy_url: Option<String>,
+    pub axis_wfp: Option<MxcAxisWfpConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -242,6 +244,13 @@ pub struct MxcFilesystemConfig {
 pub struct MxcNetworkConfig {
     #[serde(rename = "defaultPolicy")]
     pub default_policy: MxcNetworkDefaultPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<MxcNetworkProxy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcNetworkProxy {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +274,27 @@ pub struct MxcProcessContainerConfig {
     pub least_privilege: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    pub resources: MxcProcessResourceConfig,
+    #[serde(rename = "axisWfp", skip_serializing_if = "Option::is_none")]
+    pub axis_wfp: Option<MxcAxisWfpConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcAxisWfpConfig {
+    #[serde(rename = "pipeName")]
+    pub pipe_name: String,
+    #[serde(rename = "leaseId")]
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MxcProcessResourceConfig {
+    #[serde(rename = "maxProcesses")]
+    pub max_processes: u32,
+    #[serde(rename = "maxMemoryMb")]
+    pub max_memory_mb: u64,
+    #[serde(rename = "cpuRatePercent")]
+    pub cpu_rate_percent: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +424,7 @@ pub fn build_mxc_container_config(
     };
     let network = MxcNetworkConfig {
         default_policy: mxc_network_policy(spec, &options)?,
+        proxy: None,
     };
     let lifecycle = MxcLifecycleConfig {
         destroy_on_exit: spec.destroy_on_exit,
@@ -456,6 +487,7 @@ pub fn build_mxc_process_config(
     };
     let network = MxcNetworkConfig {
         default_policy: mxc_process_network_policy(spec, &options)?,
+        proxy: options.proxy_url.clone().map(|url| MxcNetworkProxy { url }),
     };
     let lifecycle = MxcLifecycleConfig {
         destroy_on_exit: true,
@@ -485,7 +517,16 @@ pub fn build_mxc_process_config(
             filesystem,
             network,
             lifecycle,
-            process_container: Some(MxcProcessContainerConfig::default()),
+            process_container: Some(MxcProcessContainerConfig {
+                least_privilege: true,
+                capabilities: Vec::new(),
+                resources: MxcProcessResourceConfig {
+                    max_processes: spec.resources.max_processes,
+                    max_memory_mb: spec.resources.max_memory_mb,
+                    cpu_rate_percent: spec.resources.cpu_rate_percent,
+                },
+                axis_wfp: options.axis_wfp,
+            }),
             fallback: Some(MxcFallbackConfig {
                 allow_dacl_mutation: false,
             }),
@@ -532,6 +573,7 @@ pub fn build_mxc_vm_config(
     };
     let network = MxcNetworkConfig {
         default_policy: mxc_vm_network_policy(spec, &options)?,
+        proxy: None,
     };
     let lifecycle = MxcLifecycleConfig {
         destroy_on_exit: spec.destroy_on_exit,
@@ -655,7 +697,14 @@ fn validate_process_resources(
     spec: &ProcessBackendExecutionSpec,
     options: &MxcProcessConfigOptions,
 ) -> Result<(), MxcConfigError> {
-    if process_resources_requested(spec) && !options.resource_limits_enforced_by_axis {
+    let emitted_to_windows_processcontainer = matches!(
+        spec.config_format,
+        ProcessBackendConfigFormat::MxcWindowsProcessContainer
+    );
+    if process_resources_requested(spec)
+        && !emitted_to_windows_processcontainer
+        && !options.resource_limits_enforced_by_axis
+    {
         return Err(MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
     }
     Ok(())
@@ -1107,10 +1156,53 @@ mod tests {
         assert_eq!(json["containment"], "processcontainer");
         assert_eq!(json["platform"], "windows");
         assert_eq!(json["network"]["defaultPolicy"], "allow");
-        assert_eq!(json["processContainer"]["leastPrivilege"], false);
+        assert_eq!(json["processContainer"]["leastPrivilege"], true);
         assert!(json["processContainer"].get("capabilities").is_none());
+        assert_eq!(
+            json["processContainer"]["resources"],
+            serde_json::json!({
+                "maxProcesses": 0,
+                "maxMemoryMb": 0,
+                "cpuRatePercent": 0
+            })
+        );
         assert_eq!(json["fallback"]["allowDaclMutation"], false);
         assert!(json.get("experimental").is_none());
+    }
+
+    #[test]
+    fn windows_strict_proxy_serializes_axis_wfp_pre_resume_contract() {
+        let spec = process_execution_spec(
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            NetworkMode::Proxy,
+        )
+        .unwrap();
+        let config = build_mxc_process_config(
+            "agent --version",
+            &spec,
+            MxcProcessConfigOptions {
+                container_id: Some("axis-windows-proxy".into()),
+                strict_proxy_enforced_by_axis: true,
+                proxy_url: Some("http://127.0.0.1:31280".into()),
+                axis_wfp: Some(MxcAxisWfpConfig {
+                    pipe_name: r"\\.\pipe\axis-wfp-broker-v1".into(),
+                    lease_id: "d5406689-f871-42e0-ae5b-eb4b5720ad2a".into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(config).unwrap();
+
+        assert_eq!(json["network"]["defaultPolicy"], "allow");
+        assert_eq!(json["network"]["proxy"]["url"], "http://127.0.0.1:31280");
+        assert_eq!(
+            json["processContainer"]["axisWfp"],
+            serde_json::json!({
+                "pipeName": r"\\.\pipe\axis-wfp-broker-v1",
+                "leaseId": "d5406689-f871-42e0-ae5b-eb4b5720ad2a"
+            })
+        );
     }
 
     #[test]
@@ -1458,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn process_resource_limits_require_axis_owned_layer_before_mxc_config() {
+    fn windows_process_resource_limits_are_emitted_for_mxc_inner_job() {
         let mut spec = process_execution_spec(
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             NetworkMode::Allow,
@@ -1468,7 +1560,7 @@ mod tests {
         spec.resources.max_memory_mb = 1024;
         spec.resources.cpu_rate_percent = 50;
 
-        let err = build_mxc_process_config(
+        let config = build_mxc_process_config(
             "agent --version",
             &spec,
             MxcProcessConfigOptions {
@@ -1477,21 +1569,11 @@ mod tests {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-
-        assert_eq!(err, MxcConfigError::ProcessResourceLimitsRequireAxisLayer);
-
-        let config = build_mxc_process_config(
-            "agent --version",
-            &spec,
-            MxcProcessConfigOptions {
-                container_id: Some("axis-windows".into()),
-                resource_limits_enforced_by_axis: true,
-                ..Default::default()
-            },
-        )
         .unwrap();
-        assert_eq!(config.containment, MxcContainment::ProcessContainer);
+        let resources = &config.process_container.unwrap().resources;
+        assert_eq!(resources.max_processes, 32);
+        assert_eq!(resources.max_memory_mb, 1024);
+        assert_eq!(resources.cpu_rate_percent, 50);
     }
 
     #[test]
@@ -2126,8 +2208,12 @@ mod tests {
         id: BackendCapabilityMapId,
         mode: NetworkMode,
     ) -> Result<ProcessBackendExecutionSpec, ProcessBackendSpecError> {
+        let mut policy = process_policy(mode);
+        if id == BackendCapabilityMapId::MxcWindowsProcessContainer {
+            policy.filesystem.deny.clear();
+        }
         build_process_backend_execution_spec(
-            &process_policy(mode),
+            &policy,
             id,
             process_launch(),
             &present_runtime_for_backend(id),

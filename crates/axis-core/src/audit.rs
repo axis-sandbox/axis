@@ -178,6 +178,15 @@ impl AuditLog {
             format!("credential leak detected: {pattern}"),
         ));
     }
+
+    pub fn inference_budget_denied(&self, sandbox_id: SandboxId, reason: &str) {
+        self.emit(&AuditEvent::new(
+            EventCategory::InferenceActivity,
+            Severity::Medium,
+            Some(sandbox_id),
+            format!("inference token budget denied request: {reason}"),
+        ));
+    }
 }
 
 impl Default for AuditLog {

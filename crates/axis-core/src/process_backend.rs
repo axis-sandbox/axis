@@ -337,7 +337,7 @@ pub fn build_process_backend_execution_spec(
         filesystem: process_filesystem_spec(policy),
         network: process_network_spec(policy),
         resources: ProcessBackendResourceSpec {
-            max_processes: policy.process.max_processes,
+            max_processes: policy.process.effective_max_processes(),
             max_memory_mb: policy.process.max_memory_mb,
             cpu_rate_percent: policy.process.cpu_rate_percent,
         },
@@ -600,7 +600,10 @@ mod tests {
     #[test]
     fn process_execution_spec_covers_all_process_backend_formats() {
         for descriptor in process_backend_descriptors() {
-            let policy = process_policy(NetworkMode::Allow);
+            let mut policy = process_policy(NetworkMode::Allow);
+            if descriptor.id == BackendCapabilityMapId::MxcWindowsProcessContainer {
+                policy.filesystem.deny.clear();
+            }
             let runtime = present_runtime_for_backend(descriptor.id);
             let result = build_process_backend_execution_spec(
                 &policy,
@@ -696,24 +699,24 @@ mod tests {
     }
 
     #[test]
-    fn process_execution_spec_for_windows_mxc_rejects_proxy_before_config() {
+    fn process_execution_spec_for_windows_mxc_accepts_proxy_with_wfp_dependencies() {
         let runtime =
             present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
+        let mut policy = process_policy(NetworkMode::Proxy);
+        // BaseContainer deny normalization is owned by the Windows adapter and
+        // runs before this platform-neutral execution-spec builder.
+        policy.filesystem.deny.clear();
 
-        let err = build_process_backend_execution_spec(
-            &process_policy(NetworkMode::Proxy),
+        let spec = build_process_backend_execution_spec(
+            &policy,
             BackendCapabilityMapId::MxcWindowsProcessContainer,
             launch_options(),
             &runtime,
             &PlannerOptions::new(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(
-            err,
-            ProcessBackendSpecError::RejectedBeforeConfig(_)
-        ));
-        assert!(err.to_string().contains("audit.bypass_evidence"));
+        assert_eq!(spec.network.mode, ProcessBackendNetworkMode::StrictProxy);
     }
 
     #[test]
@@ -750,8 +753,13 @@ mod tests {
 
         for descriptor in process_backend_descriptors() {
             let runtime = present_runtime_for_backend(descriptor.id);
+            let mut backend_policy = policy.clone();
+            if descriptor.id == BackendCapabilityMapId::MxcWindowsProcessContainer {
+                // BaseContainer deny normalization precedes the portable planner.
+                backend_policy.filesystem.deny.clear();
+            }
             let plan = plan_process_backend_policy(
-                &policy,
+                &backend_policy,
                 descriptor.id,
                 &runtime,
                 &PlannerOptions::new(),
@@ -810,8 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_resources_require_job_object_dependency() {
+    fn mxc_windows_resources_require_job_object_dependency() {
         let mut policy = process_policy(NetworkMode::Allow);
+        policy.filesystem.deny.clear();
         policy.process.max_processes = 8;
         policy.process.max_memory_mb = 256;
         policy.process.cpu_rate_percent = 50;
@@ -837,6 +846,46 @@ mod tests {
             error.contains(host_dependency::WINDOWS_JOBOBJECT),
             "{error}"
         );
+    }
+
+    #[test]
+    fn mxc_windows_resources_use_inner_job_accounting() {
+        let mut policy = process_policy(NetworkMode::Allow);
+        policy.filesystem.deny.clear();
+        policy.process.max_processes = 8;
+        policy.process.max_memory_mb = 256;
+        policy.process.cpu_rate_percent = 50;
+        let runtime =
+            present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
+        let plan = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+        for requirement in [
+            "resources.process_count",
+            "resources.memory",
+            "resources.cpu",
+            "cleanup.resources",
+        ] {
+            let decision = plan
+                .policy_plan
+                .decisions
+                .iter()
+                .find(|decision| decision.requirement == requirement)
+                .unwrap();
+            assert!(
+                !matches!(
+                    decision.support,
+                    CapabilitySupport::Unsupported { .. } | CapabilitySupport::WeakerOnly { .. }
+                ),
+                "{decision:?}"
+            );
+        }
     }
 
     #[test]
@@ -1003,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_processcontainer_rejects_proxy_when_bypass_evidence_is_unmapped() {
+    fn windows_processcontainer_requires_wfp_for_proxy_and_bypass_evidence() {
         let runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(
@@ -1011,7 +1060,9 @@ mod tests {
                 DependencyState::Present,
             )
             .with_dependency(host_dependency::WINDOWS_JOBOBJECT, DependencyState::Present);
-        let policy = process_policy(NetworkMode::Proxy);
+        let mut policy = process_policy(NetworkMode::Proxy);
+        // BaseContainer deny normalization precedes the portable planner.
+        policy.filesystem.deny.clear();
 
         let plan = plan_process_backend_policy(
             &policy,
@@ -1023,11 +1074,11 @@ mod tests {
 
         assert!(matches!(
             plan.policy_plan.outcome,
-            BackendPlanOutcome::Unsupported { .. }
+            BackendPlanOutcome::ExactWithHostDependency { .. }
         ));
         assert!(!plan.spawn_allowed());
         let error = plan.pre_spawn_error().unwrap();
-        assert!(error.contains("audit.bypass_evidence"));
+        assert!(error.contains(host_dependency::WINDOWS_WFP_BROKER));
 
         let strict_proxy = plan
             .policy_plan
@@ -1037,8 +1088,43 @@ mod tests {
             .unwrap();
         assert!(matches!(
             strict_proxy.support,
-            CapabilitySupport::WeakerOnly { .. }
+            CapabilitySupport::ExactWithHostDependency { .. }
         ));
+
+        let runtime = runtime.with_dependency(
+            host_dependency::WINDOWS_WFP_BROKER,
+            DependencyState::Present,
+        );
+        let plan = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+    }
+
+    #[test]
+    fn windows_binary_attribution_remains_fail_closed_despite_wfp() {
+        let runtime =
+            present_runtime_for_backend(BackendCapabilityMapId::MxcWindowsProcessContainer);
+        let mut policy = process_policy(NetworkMode::Proxy);
+        policy.filesystem.deny.clear();
+        policy.network.policies.push(endpoint_policy_with_binary());
+
+        let plan = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(!plan.spawn_allowed());
+        let error = plan.pre_spawn_error().unwrap();
+        assert!(error.contains("network.binary_attribution"));
+        assert!(error.contains("PID reuse"));
     }
 
     #[test]
@@ -1160,6 +1246,8 @@ mod tests {
                 cpu_rate_percent: 0,
                 run_as_user: None,
                 blocked_syscalls: Vec::new(),
+                identity: Default::default(),
+                child_processes: Default::default(),
                 timeout_sec: None,
             },
             network: NetworkPolicy {

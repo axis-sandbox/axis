@@ -18,9 +18,9 @@ pub struct WindowsPtyMaster {
     /// Handle to the pseudoconsole (HPCON).
     hpc: isize,
     /// Read handle — reads child output from the console.
-    read_handle: std::os::windows::io::OwnedHandle,
+    _read_handle: std::os::windows::io::OwnedHandle,
     /// Write handle — writes input to the child via console.
-    write_handle: std::os::windows::io::OwnedHandle,
+    _write_handle: std::os::windows::io::OwnedHandle,
 }
 
 /// Slave info for Windows ConPTY — the child process needs the HPCON
@@ -136,8 +136,8 @@ pub fn create_pty_windows(size: WinSize) -> Result<PtySession, PtyError> {
 
     let master = WindowsPtyMaster {
         hpc,
-        read_handle: unsafe { OwnedHandle::from_raw_handle(pipe_out_read as *mut _) },
-        write_handle: unsafe { OwnedHandle::from_raw_handle(pipe_in_write as *mut _) },
+        _read_handle: unsafe { OwnedHandle::from_raw_handle(pipe_out_read as *mut _) },
+        _write_handle: unsafe { OwnedHandle::from_raw_handle(pipe_in_write as *mut _) },
     };
 
     let slave = ConPtySlave {

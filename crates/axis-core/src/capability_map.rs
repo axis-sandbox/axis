@@ -41,6 +41,7 @@ pub mod host_dependency {
     pub const WINDOWS_JOBOBJECT: &str = "windows.job_object";
     pub const WINDOWS_LOW_INTEGRITY: &str = "windows.low_integrity";
     pub const WINDOWS_PROCESS_CONTAINER: &str = "windows.processcontainer";
+    pub const WINDOWS_WFP_BROKER: &str = "windows.axis_wfp_broker";
     pub const WINDOWS_SANDBOX: &str = "windows.windows_sandbox";
     pub const WINDOWS_WHP: &str = "windows.whp";
     pub const WINDOWS_WSL2: &str = "windows.wsl2";
@@ -244,6 +245,12 @@ pub fn validate_backend_capability_map(backend: &BackendCapabilities) -> Result<
     validate_support(
         &backend.process.user_identity,
         "process.user_identity",
+        &declared,
+        &mut problems,
+    );
+    validate_support(
+        &backend.process.isolated_identity,
+        "process.isolated_identity",
         &declared,
         &mut problems,
     );
@@ -512,6 +519,9 @@ fn axis_native_linux() -> BackendCapabilities {
             user_identity: CapabilitySupport::unsupported(
                 "run_as_user needs a platform identity adapter before it can be planned generically",
             ),
+            isolated_identity: CapabilitySupport::unsupported(
+                "the native Linux process backend does not create a distinct identity by default",
+            ),
             syscall_filtering: seccomp.clone(),
             pty: CapabilitySupport::unsupported(
                 "PTY attachment is not part of the current backend contract",
@@ -586,6 +596,9 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             environment: CapabilitySupport::AxisOwned,
             stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::AxisOwned,
+            isolated_identity: CapabilitySupport::unsupported(
+                "MXC bubblewrap isolated identity semantics are not yet proven",
+            ),
             syscall_filtering: dep_support(host_dependency::AXIS_SECCOMP_LAUNCHER),
             pty: CapabilitySupport::unsupported("MXC bubblewrap PTY support is not mapped by AXIS"),
             timeout: CapabilitySupport::AxisOwned,
@@ -651,6 +664,7 @@ fn mxc_linux_lxc() -> BackendCapabilities {
             environment: CapabilitySupport::AxisOwned,
             stdio: CapabilitySupport::AxisOwned,
             user_identity: mxc_lxc.clone(),
+            isolated_identity: mxc_lxc.clone(),
             syscall_filtering: CapabilitySupport::weaker(
                 "LXC profile support is host configuration dependent and not yet proven against the AXIS syscall matrix",
             ),
@@ -748,6 +762,9 @@ fn axis_native_macos_seatbelt() -> BackendCapabilities {
             user_identity: CapabilitySupport::unsupported(
                 "macOS run_as_user parity is not part of the current AXIS contract",
             ),
+            isolated_identity: CapabilitySupport::unsupported(
+                "Seatbelt does not create a distinct process identity",
+            ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "Seatbelt profiles do not expose seccomp-style syscall filtering",
             ),
@@ -831,6 +848,9 @@ fn mxc_macos_seatbelt() -> BackendCapabilities {
             user_identity: CapabilitySupport::unsupported(
                 "MXC Seatbelt run_as_user parity is not mapped by AXIS",
             ),
+            isolated_identity: CapabilitySupport::unsupported(
+                "MXC Seatbelt isolated identity semantics are not mapped",
+            ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "Seatbelt does not provide AXIS seccomp-style syscall filtering",
             ),
@@ -907,6 +927,7 @@ fn axis_native_windows() -> BackendCapabilities {
             environment: unavailable.clone(),
             stdio: unavailable.clone(),
             user_identity: unavailable.clone(),
+            isolated_identity: unavailable.clone(),
             syscall_filtering: unavailable.clone(),
             pty: unavailable.clone(),
             timeout: unavailable.clone(),
@@ -973,11 +994,14 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             host_dependency::MXC_EXECUTOR,
             host_dependency::WINDOWS_PROCESS_CONTAINER,
             host_dependency::WINDOWS_JOBOBJECT,
+            host_dependency::WINDOWS_WFP_BROKER,
         ]),
         filesystem: FilesystemCapabilities {
             read_only: processcontainer.clone(),
             read_write: processcontainer.clone(),
-            deny: processcontainer.clone(),
+            deny: CapabilitySupport::unsupported(
+                "MXC ProcessContainer deniedPaths support depends on the selected Windows isolation tier and is not uniformly enforceable",
+            ),
             workspace: processcontainer.clone(),
         },
         process: ProcessCapabilities {
@@ -986,26 +1010,31 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             environment: CapabilitySupport::AxisOwned,
             stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
-                "MXC ProcessContainer run_as_user parity is not mapped",
+                "MXC ProcessContainer cannot map a caller-named host account",
             ),
+            isolated_identity: processcontainer.clone(),
             syscall_filtering: CapabilitySupport::unsupported(
                 "ProcessContainer does not provide AXIS seccomp-style syscall filtering",
             ),
-            pty: CapabilitySupport::unsupported("MXC ProcessContainer PTY support is not mapped"),
+            pty: CapabilitySupport::unsupported(
+                "the BaseContainer launch API rejects pseudoconsole handles, and AXIS does not force the older AppContainer/DACL tier to obtain ConPTY support",
+            ),
             timeout: CapabilitySupport::AxisOwned,
         },
         network: NetworkCapabilities {
             allow: processcontainer.clone(),
             block: processcontainer.clone(),
-            strict_proxy: CapabilitySupport::weaker(
-                "MXC ProcessContainer strict proxy requires AXIS WFP/AppContainer routing that is not mapped yet",
-            ),
+            strict_proxy: deps_support([
+                host_dependency::MXC_EXECUTOR,
+                host_dependency::WINDOWS_PROCESS_CONTAINER,
+                host_dependency::WINDOWS_WFP_BROKER,
+            ]),
             cooperative_proxy: CapabilitySupport::weaker(
                 "cooperative proxy environment variables cannot prevent direct socket bypass",
             ),
             endpoint_policy: CapabilitySupport::AxisOwned,
             binary_attribution: CapabilitySupport::unsupported(
-                "connect-time executable attribution is not implemented for MXC ProcessContainer",
+                "SID-scoped WFP filters prove the sandbox boundary but not the initiating image; user-mode PID/tuple lookup is raceable through PID reuse and short-lived connects, so per-binary rules remain fail-closed without ALE process metadata or a callout",
             ),
             l7_policy: unsupported_l7_policy(),
         },
@@ -1027,9 +1056,7 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
         audit: AuditCapabilities {
             denials: CapabilitySupport::AxisOwned,
             dependency_reasons: CapabilitySupport::AxisOwned,
-            bypass_evidence: CapabilitySupport::unsupported(
-                "Windows bypass evidence collection is not mapped",
-            ),
+            bypass_evidence: dep_support(host_dependency::WINDOWS_WFP_BROKER),
         },
     }
 }
@@ -1105,6 +1132,9 @@ fn mxc_windows_wslc() -> BackendCapabilities {
             stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "WSL identity mapping is not planned as AXIS run_as_user parity",
+            ),
+            isolated_identity: CapabilitySupport::unsupported(
+                "WSLC isolated identity semantics are not yet mapped",
             ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "MXC WSLC syscall behavior is not mapped to the AXIS seccomp contract",
@@ -1214,6 +1244,9 @@ fn vm_backend<const N: usize>(
             user_identity: CapabilitySupport::unsupported(
                 "VM identity mapping is not planned as AXIS run_as_user parity",
             ),
+            isolated_identity: CapabilitySupport::unsupported(
+                "VM guest identity is not yet mapped to the portable process identity contract",
+            ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "VM backends isolate the guest but do not expose the AXIS per-process syscall contract",
             ),
@@ -1312,6 +1345,9 @@ fn windows_vm_like_backend<const N: usize>(
             stdio: CapabilitySupport::AxisOwned,
             user_identity: CapabilitySupport::unsupported(
                 "Windows VM-style identity mapping is not planned as AXIS run_as_user parity",
+            ),
+            isolated_identity: CapabilitySupport::unsupported(
+                "Windows VM-style guest identity is not mapped to the portable process identity contract",
             ),
             syscall_filtering: CapabilitySupport::unsupported(
                 "Windows VM-style backends do not expose AXIS seccomp-style syscall filtering",
@@ -1453,6 +1489,9 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
         host_dependency::WINDOWS_JOBOBJECT => "Windows Job Object resource enforcement",
         host_dependency::WINDOWS_LOW_INTEGRITY => "Windows low-integrity token support",
         host_dependency::WINDOWS_PROCESS_CONTAINER => "Windows ProcessContainer support",
+        host_dependency::WINDOWS_WFP_BROKER => {
+            "installed AXIS WFP broker service with a reachable lease pipe"
+        }
         host_dependency::WINDOWS_SANDBOX => "Windows Sandbox optional feature",
         host_dependency::WINDOWS_WHP => "Windows Hypervisor Platform feature",
         host_dependency::WINDOWS_WSL2 => "Windows Subsystem for Linux 2 feature",
@@ -1821,6 +1860,8 @@ mod tests {
                 cpu_rate_percent: 0,
                 run_as_user: None,
                 blocked_syscalls: Vec::new(),
+                identity: Default::default(),
+                child_processes: Default::default(),
                 timeout_sec: None,
             },
             network: NetworkPolicy {

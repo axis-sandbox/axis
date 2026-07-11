@@ -425,6 +425,7 @@ async fn main() -> Result<()> {
 
             #[cfg(windows)]
             {
+                let _ = use_system;
                 let install_script = include_str!("../../../e2e/agents/install_agents.ps1");
                 let script_path = std::env::temp_dir().join("axis-install-agents.ps1");
                 std::fs::write(&script_path, install_script)?;
@@ -785,11 +786,13 @@ async fn main() -> Result<()> {
                         } else {
                             None
                         };
+                    let inference_endpoint = configured_standalone_inference_endpoint()?;
 
                     // Start an inline proxy if policy uses proxy mode.
                     let proxy_addr = match standalone_proxy_config_for_sandbox(
                         sandbox_id,
                         &policy,
+                        inference_endpoint,
                         connect_attribution.clone(),
                     ) {
                         Some(proxy_config) => {
@@ -1222,6 +1225,7 @@ fn proxy_bind_addr_for_sandbox(
 fn standalone_proxy_config_for_sandbox(
     id: axis_core::types::SandboxId,
     policy: &axis_core::policy::Policy,
+    inference_endpoint: Option<std::net::SocketAddr>,
     connect_attribution: Option<axis_core::connect_attribution::ConnectAttributionStore>,
 ) -> Option<axis_proxy::proxy::ProxyConfig> {
     if !matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
@@ -1233,11 +1237,24 @@ fn standalone_proxy_config_for_sandbox(
         bind_addr: proxy_bind_addr_for_sandbox(id, 0, policy),
         policy: policy.clone(),
         enable_leak_detection: true,
-        inference_endpoint: None,
+        inference_endpoint,
         connect_attribution,
         enable_identity_diagnostics: false,
         timing_tx: None,
     })
+}
+
+fn configured_standalone_inference_endpoint() -> anyhow::Result<Option<std::net::SocketAddr>> {
+    let Some(value) = std::env::var_os("AXIS_INFERENCE_ENDPOINT") else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("AXIS_INFERENCE_ENDPOINT must be valid Unicode"))?;
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("invalid AXIS_INFERENCE_ENDPOINT '{value}': {error}"))
 }
 
 fn collect_standalone_sandbox_env() -> Vec<(String, String)> {
@@ -1355,7 +1372,7 @@ mod tests {
             for mode in [NetworkMode::Block, NetworkMode::Allow, NetworkMode::Proxy] {
                 let policy = test_policy(provider, mode.clone());
                 let bind_addr = proxy_bind_addr_for_sandbox(id, 0, &policy);
-                let proxy_config = standalone_proxy_config_for_sandbox(id, &policy, None);
+                let proxy_config = standalone_proxy_config_for_sandbox(id, &policy, None, None);
 
                 if matches!(mode, NetworkMode::Proxy) {
                     #[cfg(target_os = "linux")]
@@ -1397,12 +1414,26 @@ mod tests {
     }
 
     #[test]
+    fn standalone_proxy_keeps_host_inference_endpoint_out_of_policy_data() {
+        let id = SandboxId::new();
+        let policy = test_policy(RuntimeProvider::Mxc, NetworkMode::Proxy);
+        let endpoint = "127.0.0.1:8080".parse().unwrap();
+
+        let config =
+            standalone_proxy_config_for_sandbox(id, &policy, Some(endpoint), None).unwrap();
+
+        assert_eq!(config.inference_endpoint, Some(endpoint));
+        assert!(config.policy.inference.routes.is_empty());
+    }
+
+    #[test]
     fn standalone_env_collection_omits_provider_secrets_and_proxy_vars() {
         let env = collect_standalone_sandbox_env_from(vec![
             ("PATH".into(), "/bin".into()),
             ("ANTHROPIC_API_KEY".into(), "secret".into()),
             ("OPENAI_API_KEY".into(), "secret".into()),
             ("ANTHROPIC_BASE_URL".into(), "https://api.example".into()),
+            ("AXIS_INFERENCE_ENDPOINT".into(), "127.0.0.1:8080".into()),
             ("All_Proxy".into(), "http://proxy-with-creds".into()),
             ("UNRELATED".into(), "value".into()),
         ]);

@@ -91,6 +91,24 @@ network:
 "#,
     },
     PolicyScenario {
+        name: "portable_isolated_no_children",
+        description: "portable isolated identity with an atomic one-process tree limit",
+        yaml: r#"
+version: 1
+name: evidence-portable-isolated-no-children
+filesystem:
+  read_write:
+    - "{workspace}"
+process:
+  identity: isolated
+  child_processes: deny
+  max_memory_mb: 0
+  cpu_rate_percent: 0
+network:
+  mode: block
+"#,
+    },
+    PolicyScenario {
         name: "inference_routes_streaming",
         description: "local inference, local host-boundary credentials, and external streaming",
         yaml: r#"
@@ -331,7 +349,7 @@ mod tests {
 
         assert_eq!(reports.len(), backend_default_records().len());
         for report in reports {
-            assert_eq!(report.scenario_count, 4);
+            assert_eq!(report.scenario_count, POLICY_SCENARIOS.len());
             assert_eq!(report.scenarios.len(), report.scenario_count);
             assert!(
                 report.benchmark_gate.is_some(),

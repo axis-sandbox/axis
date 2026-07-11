@@ -250,7 +250,7 @@ fn prepare_managed_agent_workspace(
     manage_agent_workspace: bool,
     backend: PlatformBackendSelection,
 ) -> Result<Vec<(PathBuf, PathBuf)>, SandboxError> {
-    if uses_mxc_managed_home_for_scoped_ssh(config, backend) {
+    if uses_mxc_managed_home(config, backend) {
         prepare_mxc_managed_home_workspace(config)?;
         return Ok(Vec::new());
     }
@@ -337,10 +337,7 @@ fn cleanup_prepared_agent_workspace_on_setup_failure(agent_symlinks: &[(PathBuf,
     crate::workspace::cleanup_agent_symlinks(agent_symlinks);
 }
 
-fn uses_mxc_managed_home_for_scoped_ssh(
-    config: &SandboxConfig,
-    backend: PlatformBackendSelection,
-) -> bool {
+fn uses_mxc_managed_home(config: &SandboxConfig, backend: PlatformBackendSelection) -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(
@@ -351,9 +348,18 @@ fn uses_mxc_managed_home_for_scoped_ssh(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = backend;
-        let _ = config;
-        false
+        #[cfg(target_os = "windows")]
+        {
+            let _ = config;
+            matches!(backend, PlatformBackendSelection::WindowsMxc)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = backend;
+            let _ = config;
+            false
+        }
     }
 }
 
@@ -371,9 +377,11 @@ fn prepare_mxc_managed_home_workspace(config: &mut SandboxConfig) -> Result<(), 
             &mut config.policy.filesystem.read_write,
         )?;
         reject_unmanaged_home_grants_for_mxc_managed_home(config)?;
-        crate::workspace::prepare_ssh_workspace_at(&policy_name, &config.policy.ssh, &ssh_dir)
-            .map_err(|err| format!("scoped SSH workspace: {err}"))?;
-        push_unique_policy_path(&mut config.policy.filesystem.read_only, &ssh_dir)?;
+        if !config.policy.ssh.allowed_keys.is_empty() {
+            crate::workspace::prepare_ssh_workspace_at(&policy_name, &config.policy.ssh, &ssh_dir)
+                .map_err(|err| format!("scoped SSH workspace: {err}"))?;
+            push_unique_policy_path(&mut config.policy.filesystem.read_only, &ssh_dir)?;
+        }
         set_managed_home_env(&mut config.env, &managed_home)?;
         Ok(())
     })
@@ -388,10 +396,37 @@ fn set_managed_home_env(
     let xdg_config_home = policy_path_string(&managed_home.join(".config"))?;
     let xdg_data_home = policy_path_string(&managed_home.join(".local/share"))?;
     let xdg_cache_home = policy_path_string(&managed_home.join(".cache"))?;
-    upsert_env(env, "HOME", home);
+    upsert_env(env, "HOME", home.clone());
     upsert_env(env, "XDG_CONFIG_HOME", xdg_config_home);
     upsert_env(env, "XDG_DATA_HOME", xdg_data_home);
     upsert_env(env, "XDG_CACHE_HOME", xdg_cache_home);
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = managed_home.join("AppData").join("Roaming");
+        let local_appdata = managed_home.join("AppData").join("Local");
+        for directory in [
+            managed_home.join(".config"),
+            managed_home.join(".local").join("share"),
+            managed_home.join(".cache"),
+            appdata.clone(),
+            local_appdata.clone(),
+        ] {
+            std::fs::create_dir_all(&directory).map_err(|err| {
+                format!(
+                    "create managed Windows home directory '{}': {err}",
+                    directory.display()
+                )
+            })?;
+        }
+
+        upsert_env(env, "USERPROFILE", home.clone());
+        upsert_env(env, "APPDATA", policy_path_string(&appdata)?);
+        upsert_env(env, "LOCALAPPDATA", policy_path_string(&local_appdata)?);
+        if home.as_bytes().get(1) == Some(&b':') {
+            upsert_env(env, "HOMEDRIVE", home[..2].to_string());
+            upsert_env(env, "HOMEPATH", home[2..].to_string());
+        }
+    }
     Ok(())
 }
 
@@ -489,6 +524,7 @@ fn reject_unmanaged_home_grants_for_mxc_managed_home(config: &SandboxConfig) -> 
     )?;
     let workspace = normalize_existing_or_absolute_path(&config.workspace_dir)?;
     let tmpdir = normalize_existing_or_absolute_path(&sandbox_tmpdir_path(&config.workspace_dir))?;
+    let host_temp = normalize_existing_or_absolute_path(&std::env::temp_dir())?;
     let guard = ManagedHomeGrantGuard {
         home: &home,
         agent_root: &agent_root,
@@ -496,6 +532,7 @@ fn reject_unmanaged_home_grants_for_mxc_managed_home(config: &SandboxConfig) -> 
         generated_ssh: &generated_ssh,
         workspace: &workspace,
         tmpdir: &tmpdir,
+        host_temp: &host_temp,
         raw_workspace: &config.workspace_dir,
         lexical_home: &lexical_home,
     };
@@ -510,6 +547,7 @@ struct ManagedHomeGrantGuard<'a> {
     generated_ssh: &'a Path,
     workspace: &'a Path,
     tmpdir: &'a Path,
+    host_temp: &'a Path,
     raw_workspace: &'a Path,
     lexical_home: &'a Path,
 }
@@ -540,6 +578,7 @@ fn reject_unmanaged_home_grants(
             && !path_contains_or_equal(guard.agent_root, &expanded)
             && !path_contains_or_equal(guard.workspace, &expanded)
             && !path_contains_or_equal(guard.tmpdir, &expanded)
+            && !is_allowed_host_temp_grant(&expanded, guard)
         {
             return Err(format!(
                 "MXC managed HOME cannot grant real home {section} path '{}' (expanded '{}')",
@@ -549,6 +588,12 @@ fn reject_unmanaged_home_grants(
         }
     }
     Ok(())
+}
+
+fn is_allowed_host_temp_grant(expanded: &Path, guard: &ManagedHomeGrantGuard<'_>) -> bool {
+    cfg!(target_os = "windows")
+        && path_contains_or_equal(guard.home, guard.host_temp)
+        && path_contains_or_equal(guard.host_temp, expanded)
 }
 
 fn expand_managed_home_guard_path(
@@ -587,36 +632,26 @@ fn normalize_existing_or_absolute_path(path: &Path) -> Result<PathBuf, String> {
         return normalize_absolute_path(&canonical);
     }
 
-    let mut existing_prefix = PathBuf::from("/");
-    let mut probe = PathBuf::from("/");
+    let mut existing_prefix = normalized.clone();
     let mut missing_suffix = Vec::new();
-    let mut missing = false;
-
-    for component in normalized.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(part) if !missing => {
-                probe.push(part);
-                if probe.exists() {
-                    existing_prefix = probe.clone();
-                } else {
-                    missing = true;
-                    missing_suffix.push(part.to_os_string());
-                }
-            }
-            Component::Normal(part) => missing_suffix.push(part.to_os_string()),
-            Component::CurDir | Component::ParentDir => {}
-            Component::Prefix(_) => {
-                return Err(format!(
-                    "linux policy path '{}' must not contain a non-linux prefix",
-                    path.display()
-                ));
-            }
+    while !existing_prefix.exists() {
+        let part = existing_prefix.file_name().ok_or_else(|| {
+            format!(
+                "policy path '{}' has no resolvable ancestor",
+                path.display()
+            )
+        })?;
+        missing_suffix.push(part.to_os_string());
+        if !existing_prefix.pop() {
+            return Err(format!(
+                "policy path '{}' has no resolvable ancestor",
+                path.display()
+            ));
         }
     }
 
     let mut resolved = std::fs::canonicalize(&existing_prefix).unwrap_or(existing_prefix);
-    for part in missing_suffix {
+    for part in missing_suffix.into_iter().rev() {
         resolved.push(part);
     }
     normalize_absolute_path(&resolved)
@@ -633,23 +668,18 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => {}
             Component::ParentDir => {
                 normalized.pop();
             }
             Component::Normal(part) => normalized.push(part),
-            Component::Prefix(_) => {
-                return Err(format!(
-                    "linux policy path '{}' must not contain a non-linux prefix",
-                    path.display()
-                ));
-            }
         }
     }
 
     if normalized.as_os_str().is_empty() {
-        Ok(PathBuf::from("/"))
+        Ok(PathBuf::from(std::path::MAIN_SEPARATOR_STR))
     } else {
         Ok(normalized)
     }
@@ -698,6 +728,8 @@ pub(crate) enum PlatformBackendSelection {
     LinuxNative,
     #[cfg(target_os = "linux")]
     LinuxMxc,
+    #[cfg(target_os = "windows")]
+    WindowsMxc,
 }
 
 fn platform_backend_for_policy(policy: &Policy) -> Result<PlatformBackendSelection, SandboxError> {
@@ -715,11 +747,18 @@ fn process_backend_for_provider(
         #[cfg(target_os = "linux")]
         RuntimeProvider::AxisNative => Ok(PlatformBackendSelection::LinuxNative),
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        RuntimeProvider::Auto | RuntimeProvider::Mxc => Ok(PlatformBackendSelection::WindowsMxc),
+        #[cfg(target_os = "windows")]
+        RuntimeProvider::AxisNative => Err(SandboxError::Unsupported(
+            "runtime provider 'axis_native' is disabled on Windows because the legacy native path does not currently enforce AXIS policy; use 'auto' or 'mxc'".into(),
+        )),
+
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         RuntimeProvider::Auto | RuntimeProvider::AxisNative => {
             Ok(PlatformBackendSelection::Default)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         RuntimeProvider::Mxc => Err(SandboxError::Unsupported(format!(
             "runtime provider 'mxc' is not available on {}",
             std::env::consts::OS
@@ -738,8 +777,12 @@ fn ensure_platform_backend_available(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = backend;
-        crate::windows::ensure_containment_available()
+        match backend {
+            PlatformBackendSelection::WindowsMxc => Ok(()),
+            _ => Err(SandboxError::Unsupported(
+                "native Windows containment is unavailable; select the MXC process backend".into(),
+            )),
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -814,8 +857,14 @@ fn create_platform_sandbox_with_backend(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = backend;
-        Ok(Box::new(crate::windows::WindowsSandbox::new(config)?))
+        match backend {
+            PlatformBackendSelection::WindowsMxc => Ok(Box::new(
+                crate::windows::mxc::MxcWindowsSandbox::new(config)?,
+            )),
+            PlatformBackendSelection::Default => Err(SandboxError::Unsupported(
+                "legacy native Windows host execution is disabled".into(),
+            )),
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -842,9 +891,13 @@ fn effective_linux_backend(backend: PlatformBackendSelection) -> PlatformBackend
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use axis_core::policy::Compatibility;
+    #[cfg(unix)]
+    use axis_core::policy::SshKeySpec;
     use axis_core::policy::{
-        Compatibility, FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy,
-        ProcessPolicy, RuntimeProvider, SshKeySpec, SshPolicy,
+        FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, ProcessPolicy,
+        RuntimeProvider, SshPolicy,
     };
     use std::path::Path;
 
@@ -888,7 +941,7 @@ mod tests {
         PlatformBackendSelection::LinuxNative
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn native_process_backend_selection() -> PlatformBackendSelection {
         PlatformBackendSelection::Default
     }
@@ -922,64 +975,72 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
-    fn assert_windows_front_door_rejects_without_mutation(
-        create: impl FnOnce(SandboxConfig) -> Result<Sandbox, SandboxError>,
-    ) {
-        let parent = tempfile::tempdir().unwrap();
-        let home = parent.path().join("home");
-        std::fs::create_dir(&home).unwrap();
-        let real_state = home.join(".codex");
-        std::fs::create_dir(&real_state).unwrap();
-        std::fs::write(real_state.join("state.json"), "original").unwrap();
+    #[test]
+    fn windows_mxc_uses_physical_managed_home_and_profile_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
 
-        crate::test_support::with_home(&home, || {
+        with_home(home.path(), || {
             let mut config = test_config();
-            config.policy.name = "windows-front-door".into();
-            config.policy.filesystem.read_write = vec!["~/.codex".into()];
-            config.workspace_dir = parent.path().join("workspace");
-            let trace = StartupTrace::new();
-            config.startup_trace = Some(trace.clone());
+            config.policy.name = "windows-managed-home-test".into();
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.policy.filesystem.read_write = vec!["{workspace}".into(), "~/.codex".into()];
 
-            let err = match create(config.clone()) {
-                Ok(_) => panic!("disabled Windows containment must reject creation"),
-                Err(err) => err,
+            let symlinks = prepare_managed_agent_workspace(
+                &mut config,
+                true,
+                PlatformBackendSelection::WindowsMxc,
+            )
+            .unwrap();
+            let managed_home = home
+                .path()
+                .join(".axis")
+                .join("agents")
+                .join("windows-managed-home-test")
+                .join("home");
+            let managed_codex = managed_home.join(".codex");
+
+            assert!(symlinks.is_empty());
+            assert!(managed_codex.is_dir());
+            assert!(!managed_codex.is_symlink());
+            assert!(managed_home.join("AppData/Roaming").is_dir());
+            assert!(managed_home.join("AppData/Local").is_dir());
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&managed_home.to_string_lossy().into_owned()),
+                "read_write={:?}, expected={}",
+                config.policy.filesystem.read_write,
+                managed_home.display()
+            );
+            assert!(
+                config
+                    .policy
+                    .filesystem
+                    .read_write
+                    .contains(&managed_codex.to_string_lossy().into_owned())
+            );
+
+            let env_value = |name: &str| {
+                config
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
             };
-
-            assert!(matches!(err, SandboxError::Unsupported(_)));
-            assert!(err.to_string().contains("containment is unavailable"));
-            assert!(!config.workspace_dir.exists());
-            assert!(!home.join(".axis").exists());
-            assert!(!home.join(".codex.axis-backup").exists());
-            assert!(real_state.is_dir());
-            assert!(!real_state.is_symlink());
+            assert_eq!(env_value("HOME"), managed_home.to_str());
+            assert_eq!(env_value("USERPROFILE"), managed_home.to_str());
             assert_eq!(
-                std::fs::read_to_string(real_state.join("state.json")).unwrap(),
-                "original"
+                env_value("APPDATA"),
+                managed_home.join("AppData").join("Roaming").to_str()
             );
             assert_eq!(
-                trace
-                    .phases()
-                    .iter()
-                    .map(|timing| timing.phase)
-                    .collect::<Vec<_>>(),
-                vec![
-                    "front_door.policy_validation",
-                    "front_door.platform_availability"
-                ]
+                env_value("LOCALAPPDATA"),
+                managed_home.join("AppData").join("Local").to_str()
             );
         });
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn public_create_rejects_disabled_windows_backend_without_filesystem_mutation() {
-        assert_windows_front_door_rejects_without_mutation(Sandbox::create);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn public_create_for_exec_rejects_disabled_windows_backend_without_filesystem_mutation() {
-        assert_windows_front_door_rejects_without_mutation(Sandbox::create_for_exec);
     }
 
     #[cfg(target_os = "linux")]
@@ -1004,7 +1065,37 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn process_runtime_provider_selects_windows_backend() {
+        let mut policy = test_config().policy;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::WindowsMxc
+        );
+
+        policy.runtime.provider = RuntimeProvider::Mxc;
+        assert_eq!(
+            platform_backend_for_policy(&policy).unwrap(),
+            PlatformBackendSelection::WindowsMxc
+        );
+
+        policy.runtime.provider = RuntimeProvider::AxisNative;
+        let error = platform_backend_for_policy(&policy).unwrap_err();
+        assert!(error.to_string().contains("disabled on Windows"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_windows_default_cannot_spawn_directly() {
+        let error =
+            create_platform_sandbox_with_backend(&test_config(), PlatformBackendSelection::Default)
+                .err()
+                .expect("legacy Windows host execution must reject");
+        assert!(error.to_string().contains("host execution is disabled"));
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
     #[test]
     fn mxc_runtime_provider_is_rejected_without_platform_backend() {
         let mut policy = test_config().policy;
@@ -2323,6 +2414,7 @@ mod tests {
         assert!(err.to_string().contains("default-deny"));
     }
 
+    #[cfg(target_os = "linux")]
     fn disable_resource_limits(config: &mut SandboxConfig) {
         config.policy.process.max_processes = 0;
         config.policy.process.max_memory_mb = 0;

@@ -26,11 +26,11 @@ administrator-controlled package steps, or disposable CI/e2e scripts.
 
 | Runtime path | Runtime dependencies | Privilege boundary |
 | --- | --- | --- |
-| AXIS-native process sandbox | Landlock and seccomp on Linux and Seatbelt on macOS. The Windows containment target requires Job Object, AppContainer or equivalent token isolation, filesystem ACLs, proxy enforcement, and environment isolation to be applied before user code executes. | Supported native paths reject before spawn when a requested policy cannot be enforced. The Windows native path is disabled and rejects every user-command launch before process creation until its full containment target is implemented and proven. |
-| MXC process sandbox | Packaged MXC executor for the selected platform backend. Bubblewrap, unprivileged user namespaces, and AXIS seccomp launcher support are the Linux process-backend dependencies. | Default user install for packaged non-privileged executors. Optional tools are discovered safely and are not installed as part of normal tests. |
+| AXIS-native process sandbox | Landlock and seccomp on Linux and Seatbelt on macOS. The Windows native path is disabled until Job Object, AppContainer or equivalent token isolation, filesystem controls, proxy enforcement, and environment isolation can be applied before user code executes. | Supported native paths reject before spawn when a requested policy cannot be enforced. Windows uses the MXC process backend instead of the incomplete native host-spawn path. |
+| MXC process sandbox | Packaged MXC executor for the selected platform backend: `lxc-exec` on Linux and `wxc-exec.exe` on Windows. Bubblewrap, unprivileged user namespaces, and AXIS seccomp launcher support are additional Linux dependencies. Windows ProcessContainer also requires a supported Windows build/API state. | Default user install for packaged non-privileged executors. Optional host features are discovered safely and missing enforcement fails closed. |
 | MXC container sandbox | LXC for Linux container launches or WSL2 for Windows container launches, plus configured rootfs/image inputs. | Host runtime setup is explicit and backend-specific. Unsupported or unavailable runtime state must reject before spawn rather than falling back silently. |
 | MXC VM-style sandbox | KVM on Linux, WHP on Windows, Windows Sandbox, Hyperlight runtime artifacts, microVM images, snapshots, or guest-agent assets depending on the selected backend. | VM and host-feature enablement is explicit setup. VM-style backends remain gated until AXIS can prove command, filesystem, network, lifecycle, and cleanup semantics for the requested policy. |
-| AXIS proxy networking | The AXIS proxy plus platform network controls. Linux strict native proxy mode needs `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional `axis-netns-helper`; binary-restricted Linux proxy policies additionally need connect-time attribution from the native seccomp-notify path. | The default quickstart does not require proxy-mode privileges. Privileged helper install and file capability setup are explicit choices. |
+| AXIS proxy networking | The AXIS proxy plus platform network controls. Linux strict native proxy mode needs `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional `axis-netns-helper`; binary-restricted Linux proxy policies additionally need connect-time attribution from the native seccomp-notify path. Windows BaseContainer strict proxy mode needs the installed `AxisWfpBroker` service and patched MXC executor. | The default quickstart does not require proxy-mode privileges. Linux helper/capability setup and Windows WFP service installation are explicit administrator choices. Missing broker state rejects proxy policies before spawn. |
 | Source builds | Rust toolchain and platform build tools. Xcode Command Line Tools may be needed to build or test macOS binaries from source. | Build tools are developer dependencies, not runtime prerequisites for installing release artifacts. |
 
 ## Optional Backend Dependencies
@@ -81,6 +81,9 @@ Base packages install ordinary AXIS binaries and non-privileged executor/helper
 files. Linux base packages include the MXC `lxc-exec` executor and the AXIS
 `axis-seccomp-launcher`; they do not install the privileged `axis-netns-helper`
 as setuid content by default.
+Windows archives include the pinned `wxc-exec.exe` beside AXIS. They require
+BaseContainer but do not enable Windows feature keys or consent to MXC's
+host-DACL fallback.
 
 Privileged setup is intentionally separate from the base package contract:
 

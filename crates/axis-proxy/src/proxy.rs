@@ -16,9 +16,10 @@ use axis_core::connect_attribution::{
     policy_requires_connect_attribution,
 };
 use axis_core::opa::PolicyEngine;
-use axis_core::policy::Policy;
+use axis_core::policy::{ExhaustAction, Policy, TokenBudget};
 use axis_core::types::{NetworkAction, SandboxId};
 use axis_safety::leak_detect::LeakDetector;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -148,6 +149,67 @@ struct ProxyState {
     credential_injector: CredentialInjector,
     connect_attribution: Option<ConnectAttributionStore>,
     identity_mode: ProxyIdentityMode,
+    inference_budget: Option<InferenceBudget>,
+}
+
+struct InferenceBudget {
+    config: TokenBudget,
+    reserved_tokens: u64,
+    window_start: Instant,
+    hosts: HashSet<String>,
+}
+
+impl InferenceBudget {
+    fn new(config: TokenBudget, hosts: HashSet<String>) -> Result<Self, ProxyError> {
+        if !matches!(config.action_on_exhaust, ExhaustAction::Reject) {
+            return Err(ProxyError::BindFailed(
+                "inference token budgets currently support only action_on_exhaust: reject; queue and fallback require a trusted request scheduler"
+                    .into(),
+            ));
+        }
+        if config.max_tokens_per_hour == 0 || config.max_tokens_per_request == 0 {
+            return Err(ProxyError::BindFailed(
+                "inference token budget limits must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            config,
+            reserved_tokens: 0,
+            window_start: Instant::now(),
+            hosts,
+        })
+    }
+
+    fn applies_to(&self, hostname: &str) -> bool {
+        self.hosts.contains(&hostname.to_ascii_lowercase())
+    }
+
+    fn reserve(&mut self, request_body: &[u8]) -> Result<u64, String> {
+        if self.window_start.elapsed() >= Duration::from_secs(3600) {
+            self.reserved_tokens = 0;
+            self.window_start = Instant::now();
+        }
+        let input_upper_bound = request_body.len() as u64;
+        let declared_output = declared_output_tokens(request_body)?.ok_or_else(|| {
+            "token-budgeted requests must declare max_tokens, max_completion_tokens, or max_output_tokens"
+                .to_string()
+        })?;
+        let requested = input_upper_bound.saturating_add(declared_output);
+        if requested > self.config.max_tokens_per_request {
+            return Err(format!(
+                "request reserves {requested} tokens, exceeding per-request limit {}",
+                self.config.max_tokens_per_request
+            ));
+        }
+        if self.reserved_tokens.saturating_add(requested) > self.config.max_tokens_per_hour {
+            return Err(format!(
+                "hourly token budget exhausted: {} reserved, {requested} requested, {} allowed",
+                self.reserved_tokens, self.config.max_tokens_per_hour
+            ));
+        }
+        self.reserved_tokens = self.reserved_tokens.saturating_add(requested);
+        Ok(requested)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +260,14 @@ impl AxisProxy {
         let credential_injector = CredentialInjector::from_policy(&config.policy)
             .map_err(|e| ProxyError::BindFailed(format!("credential injection: {e}")))?;
         let identity_mode = proxy_identity_mode(&config.policy, config.enable_identity_diagnostics);
+        let inference_hosts = inference_route_hosts(&config.policy);
+        let inference_budget = config
+            .policy
+            .inference
+            .token_budget
+            .clone()
+            .map(|budget| InferenceBudget::new(budget, inference_hosts))
+            .transpose()?;
 
         let state = Arc::new(Mutex::new(ProxyState {
             policy_engine,
@@ -207,6 +277,7 @@ impl AxisProxy {
             credential_injector,
             connect_attribution: config.connect_attribution.clone(),
             identity_mode,
+            inference_budget,
         }));
 
         Ok(Self {
@@ -602,12 +673,12 @@ async fn handle_connection(
         st.leak_detector.is_some()
     };
 
-    let credential_injection_enabled = {
+    let request_policy_enabled = {
         let st = state.lock().unwrap();
-        st.credential_injector.has_rules()
+        st.credential_injector.has_rules() || st.inference_budget.is_some()
     };
 
-    if leak_enabled || credential_injection_enabled {
+    if leak_enabled || request_policy_enabled {
         relay_with_leak_detection(sandbox_id, &host, port, false, reader, upstream, state).await
     } else {
         relay_plain(reader, upstream).await
@@ -826,12 +897,16 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let requires_injection = {
+    let requires_request_policy = {
         let st = state.lock().unwrap();
         st.credential_injector
             .connection_requires_injection(hostname, port, is_tls)
+            || st
+                .inference_budget
+                .as_ref()
+                .is_some_and(|budget| budget.applies_to(hostname))
     };
-    if !requires_injection {
+    if !requires_request_policy {
         return relay_scanned_bytes(sandbox_id, client_read, upstream_write, state).await;
     }
 
@@ -878,10 +953,48 @@ where
             let rewritten = {
                 let st = state.lock().unwrap();
                 st.credential_injector
-                    .rewrite_http_request_head_with_body_length(hostname, port, is_tls, &head)
+                    .inspect_http_request_head_with_body_length(hostname, port, is_tls, &head)
                     .map_err(secret_error_to_io)?
             };
             let next_body_len = rewritten.body_length;
+            let budgeted = {
+                let st = state.lock().unwrap();
+                st.inference_budget
+                    .as_ref()
+                    .is_some_and(|budget| budget.applies_to(hostname))
+                    && is_token_generating_inference_request(&head, hostname)
+            };
+            if budgeted {
+                let complete_request_len =
+                    head_end.checked_add(next_body_len).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "inference request length overflow",
+                        )
+                    })?;
+                if pending.len() < complete_request_len {
+                    break;
+                }
+                let body = &pending[head_end..complete_request_len];
+                let mut st = state.lock().unwrap();
+                let result = st
+                    .inference_budget
+                    .as_mut()
+                    .expect("budget presence checked")
+                    .reserve(body);
+                match result {
+                    Ok(reserved) => {
+                        tracing::info!("sandbox {sandbox_id}: reserved {reserved} inference tokens")
+                    }
+                    Err(reason) => {
+                        st.audit_log.inference_budget_denied(sandbox_id, &reason);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("inference token budget denied request: {reason}"),
+                        ));
+                    }
+                }
+            }
             if let Some(rewritten_head) = rewritten.head {
                 tokio::io::AsyncWriteExt::write_all(upstream_write, &rewritten_head).await?;
             } else {
@@ -913,6 +1026,89 @@ where
         ));
     }
     Ok(())
+}
+
+fn is_token_generating_inference_request(head: &[u8], hostname: &str) -> bool {
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let Some(request_line) = text.lines().next() else {
+        return false;
+    };
+    let mut parts = request_line.split_whitespace();
+    let Some(method) = parts.next() else {
+        return false;
+    };
+    let Some(path) = parts.next() else {
+        return false;
+    };
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    let known_path = matches!(
+        path,
+        "/v1/chat/completions"
+            | "/chat/completions"
+            | "/v1/completions"
+            | "/v1/responses"
+            | "/v1/messages"
+            | "/messages"
+    );
+    let _ = hostname;
+    method.eq_ignore_ascii_case("POST") && known_path
+}
+
+fn declared_output_tokens(body: &[u8]) -> Result<Option<u64>, String> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("inference request body is not valid JSON: {error}"))?;
+    for field in ["max_output_tokens", "max_completion_tokens", "max_tokens"] {
+        if let Some(value) = value.get(field) {
+            return value
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| format!("{field} must be a non-negative integer"));
+        }
+    }
+    Ok(None)
+}
+
+fn inference_route_hosts(policy: &Policy) -> HashSet<String> {
+    let mut hosts = HashSet::from(["inference.local".to_string()]);
+    for route in &policy.inference.routes {
+        if let Some(endpoint) = route.endpoint.as_deref()
+            && let Some(host) = inference_endpoint_host(endpoint)
+        {
+            hosts.insert(host);
+        }
+        if let Some(provider) = route.provider.as_deref() {
+            match provider.to_ascii_lowercase().as_str() {
+                "openai" | "openai-compatible" => {
+                    hosts.insert("api.openai.com".into());
+                }
+                "anthropic" => {
+                    hosts.insert("api.anthropic.com".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    hosts
+}
+
+fn inference_endpoint_host(endpoint: &str) -> Option<String> {
+    let authority = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))?
+        .split(['/', '?', '#'])
+        .next()?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(host, _)| host.to_ascii_lowercase());
+    }
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.parse::<u16>().is_ok())
+        .map_or(authority, |(host, _)| host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 async fn relay_scanned_bytes<R, W>(
@@ -1523,6 +1719,68 @@ network:
         drop(slow_clients);
         upstream_task.await.unwrap();
         proxy_task.abort();
+    }
+
+    #[test]
+    fn inference_budget_reserves_conservative_input_and_declared_output() {
+        let mut budget = InferenceBudget::new(
+            TokenBudget {
+                max_tokens_per_hour: 1_000,
+                max_tokens_per_request: 500,
+                action_on_exhaust: ExhaustAction::Reject,
+                fallback_route: None,
+            },
+            HashSet::from(["inference.local".into()]),
+        )
+        .unwrap();
+        let body = br#"{"model":"test","max_tokens":100}"#;
+        assert_eq!(budget.reserve(body).unwrap(), body.len() as u64 + 100);
+        assert_eq!(budget.reserved_tokens, body.len() as u64 + 100);
+    }
+
+    #[test]
+    fn inference_budget_fails_closed_for_oversize_and_unsupported_actions() {
+        let mut budget = InferenceBudget::new(
+            TokenBudget {
+                max_tokens_per_hour: 1_000,
+                max_tokens_per_request: 100,
+                action_on_exhaust: ExhaustAction::Reject,
+                fallback_route: None,
+            },
+            HashSet::new(),
+        )
+        .unwrap();
+        assert!(budget.reserve(br#"{"max_output_tokens":101}"#).is_err());
+        assert!(budget.reserve(br#"{"model":"missing-limit"}"#).is_err());
+
+        let error = InferenceBudget::new(
+            TokenBudget {
+                max_tokens_per_hour: 1_000,
+                max_tokens_per_request: 100,
+                action_on_exhaust: ExhaustAction::Queue,
+                fallback_route: None,
+            },
+            HashSet::new(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("trusted request scheduler"));
+    }
+
+    #[test]
+    fn budget_detection_is_limited_to_token_generating_inference_posts() {
+        assert!(is_token_generating_inference_request(
+            b"POST /v1/chat/completions HTTP/1.1\r\n\r\n",
+            "inference.local"
+        ));
+        assert!(!is_token_generating_inference_request(
+            b"GET /v1/models HTTP/1.1\r\n\r\n",
+            "inference.local"
+        ));
+        assert!(!is_token_generating_inference_request(
+            b"POST /unrelated HTTP/1.1\r\n\r\n",
+            "inference.local"
+        ));
     }
 
     #[cfg(target_os = "linux")]

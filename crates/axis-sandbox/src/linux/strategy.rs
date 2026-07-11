@@ -529,7 +529,7 @@ fn plan_resources(
     fallbacks: &mut Vec<PlanFallback>,
 ) -> Result<ResourceStrategy, StrategyError> {
     let memory_requested = policy.max_memory_mb > 0;
-    let process_requested = policy.max_processes > 0;
+    let process_requested = policy.effective_max_processes() > 0;
     let cpu_requested = policy.cpu_rate_percent > 0;
 
     if !memory_requested && !process_requested && !cpu_requested {

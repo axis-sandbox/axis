@@ -1047,6 +1047,8 @@ fn proxy_bind_addr_for_sandbox(id: SandboxId, proxy_port: u16, policy: &Policy) 
     }
 
     let _ = id;
+    #[cfg(not(target_os = "linux"))]
+    let _ = policy;
     format!("127.0.0.1:{proxy_port}").parse().unwrap()
 }
 

@@ -209,8 +209,8 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         id: BackendCapabilityMapId::MxcWindowsProcessContainer,
         platform: BackendPlatform::Windows,
         execution_class: BackendExecutionClass::Process,
-        status: BackendDefaultStatus::Candidate,
-        rationale: "MXC ProcessContainer is a Windows process candidate and must prove resource, lifecycle, startup, and policy behavior before becoming a current default.",
+        status: BackendDefaultStatus::CurrentDefault,
+        rationale: "MXC ProcessContainer is the Windows process default. AXIS rejects unsupported policy surfaces, sanitizes the executor boundary, and owns timeout and cleanup around the packaged MXC runtime.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
         benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1"),
@@ -311,6 +311,10 @@ mod tests {
                 BackendPlatform::Macos,
                 BackendCapabilityMapId::AxisNativeMacosSeatbelt,
             ),
+            (
+                BackendPlatform::Windows,
+                BackendCapabilityMapId::MxcWindowsProcessContainer,
+            ),
         ] {
             let defaults = backend_default_records()
                 .iter()
@@ -331,15 +335,6 @@ mod tests {
                 "{platform:?} process default must match the declared backend decision"
             );
         }
-
-        assert!(
-            backend_default_records().iter().all(|record| {
-                record.platform != BackendPlatform::Windows
-                    || record.execution_class != BackendExecutionClass::Process
-                    || record.status != BackendDefaultStatus::CurrentDefault
-            }),
-            "Windows must not advertise a current process default before confinement is implemented"
-        );
     }
 
     #[test]

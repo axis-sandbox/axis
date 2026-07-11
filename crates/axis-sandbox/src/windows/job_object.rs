@@ -9,8 +9,10 @@
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::*;
-use windows::Win32::System::Threading::OpenProcess;
-use windows::Win32::System::Threading::PROCESS_ALL_ACCESS;
+use windows::Win32::System::Threading::{
+    ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, OpenProcess,
+};
+use windows::Win32::System::Threading::{PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 use windows::core::HSTRING;
 
 /// Wrapper around a Win32 Job Object handle.
@@ -44,8 +46,11 @@ pub fn create_job_object(
         .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
 
     // Set extended limit information.
+    let job = JobHandle { handle };
     let mut ext_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    ext_info.BasicLimitInformation.ActiveProcessLimit = max_processes;
+    if max_processes > 0 {
+        ext_info.BasicLimitInformation.ActiveProcessLimit = max_processes;
+    }
     ext_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         // NOTE: DIE_ON_UNHANDLED_EXCEPTION removed — V8/Node.js uses SEH for
@@ -56,7 +61,7 @@ pub fn create_job_object(
 
     unsafe {
         SetInformationJobObject(
-            handle,
+            job.handle,
             JobObjectExtendedLimitInformation,
             &ext_info as *const _ as *const std::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -65,16 +70,20 @@ pub fn create_job_object(
     .map_err(|e| format!("SetInformationJobObject (limits) failed: {e}"))?;
 
     // Set CPU rate control.
-    if cpu_rate_percent > 0 && cpu_rate_percent < 100 {
-        let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
-        cpu_info.ControlFlags =
-            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+    if cpu_rate_percent > 0 {
+        let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+            ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+            ..Default::default()
+        };
         // CpuRate is in hundredths of a percent (100 = 1%, 10000 = 100%).
-        cpu_info.Anonymous.CpuRate = cpu_rate_percent * 100;
+        let processors = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) }.max(1);
+        cpu_info.Anonymous.CpuRate = (cpu_rate_percent * 100)
+            .div_ceil(processors)
+            .clamp(1, 10_000);
 
         unsafe {
             SetInformationJobObject(
-                handle,
+                job.handle,
                 JobObjectCpuRateControlInformation,
                 &cpu_info as *const _ as *const std::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
@@ -87,12 +96,38 @@ pub fn create_job_object(
         "job object '{name}': max_procs={max_processes}, max_mem={max_memory_mb}MB, cpu={cpu_rate_percent}%"
     );
 
-    Ok(JobHandle { handle })
+    Ok(job)
+}
+
+/// Create a Job Object used only as a fail-closed process-tree lifetime guard.
+/// Resource limits are added separately once their accounting semantics have
+/// been proven for the selected backend.
+pub fn create_kill_on_close_job(name: &str) -> Result<JobHandle, String> {
+    let job_name = HSTRING::from(name);
+    let handle = unsafe { CreateJobObjectW(None, &job_name) }
+        .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
+    let job = JobHandle { handle };
+    let mut ext_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // MXC's BaseContainer child may explicitly break away before it is placed
+    // in MXC's child-only resource Job. Silent breakaway remains disabled, so
+    // ordinary descendants cannot escape this lifecycle boundary.
+    ext_info.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    unsafe {
+        SetInformationJobObject(
+            job.handle,
+            JobObjectExtendedLimitInformation,
+            &ext_info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }
+    .map_err(|e| format!("SetInformationJobObject (lifetime guard) failed: {e}"))?;
+    Ok(job)
 }
 
 /// Assign a process to a Job Object by PID.
 pub fn assign_process_to_job(job: &JobHandle, pid: u32) -> Result<(), String> {
-    let proc_handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, pid) }
+    let proc_handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) }
         .map_err(|e| format!("OpenProcess({pid}) failed: {e}"))?;
 
     let result = unsafe { AssignProcessToJobObject(job.handle, proc_handle) };

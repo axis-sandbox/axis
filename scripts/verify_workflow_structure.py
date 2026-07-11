@@ -124,7 +124,7 @@ EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "6294ecb850d44565fa8a2943defd1395a9665c5fe562bb9e2f0da3bd3c5c148b",
     "gate": "fc94d9feb6f93110b6bedce5e09da23c7d031574a6d575c4192fd06eb05b4a16",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "4e183d9e7aeab170221e195546c1e928bc8b9b609fe69aff28873b54169af89a",
+    "build": "839a3b40e18fa9ce04f72b7340319ea6d0e5554fe70289751a2238dcb33b78b4",
     "package-linux": "21e55ae45b81a72b31525ffe4109bd3247661c931ee36a05c630f5b7622afea4",
     "sbom": "5ad3b64222cba6805099381d74434212b7762f86fdaef758857f127a36723c3a",
     "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
@@ -135,7 +135,7 @@ EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "d63a4365d5bee45367b514de586c88040c4f1e1ce35622dd5459bf8833a5b103",
     "gate": "b84a2d8debf8476fb38e7fcd255ebc7b17eb54e9ecf8549bad7a2ce7aa4ffe94",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "476b88832348bd78320dcb9c0ab899d878de6c818f5abf14952bb4c8cd86cdc3",
+    "build": "7369787aa1a9c99e7216d74cf2983323b2d6e4957332ed43546471a10c393315",
     "sbom": "150ce03d29e1847b65425b801d31640da6085adc3e475d0eee1c92c1c14cd41d",
     "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
     "attest": "1afb5eaa52877a128c776660566c1e076615468790fcaeecf4b3cbaa61c4ea16",
@@ -240,12 +240,14 @@ POWERSHELL_PROVIDER_MUTATORS = {
 REVIEWED_SHELLS = {
     "release": [
         ("build", "Build (Windows)", "pwsh"),
+        ("build", "Build MXC Windows executor", "pwsh"),
         ("build", "Install Rust toolchain (Windows)", "pwsh"),
         ("build", "Package (Windows)", "pwsh"),
         ("build", "Verify Windows release archive", "pwsh"),
     ],
     "nightly": [
         ("build", "Build (Windows)", "pwsh"),
+        ("build", "Build MXC Windows executor", "pwsh"),
         ("build", "Install Rust toolchain (Windows)", "pwsh"),
         ("build", "Package (Windows)", "pwsh"),
         ("build", "Verify Windows nightly archive", "pwsh"),
@@ -257,9 +259,15 @@ REVIEWED_SHELLS = {
         ("test-windows", "Agent policy validation", "pwsh"),
         ("test-windows", "Agent safety tests", "pwsh"),
         ("test-windows", "Assemble and install Windows release archive", "pwsh"),
+        ("test-windows", "Build pinned MXC Windows executor", "pwsh"),
         ("test-windows", "PowerShell installer bounded output tests", "pwsh"),
         ("test-windows", "Reject invalid Windows installer checksums", "pwsh"),
         ("test-windows", "Test agent install (PowerShell)", "pwsh"),
+        (
+            "test-windows",
+            "Windows MXC ProcessContainer smoke and security tests",
+            "pwsh",
+        ),
     ],
     "security": [],
 }
@@ -892,6 +900,28 @@ def verify_common_release_build(workflow: dict[str, Any], *, nightly: bool) -> N
         'cp "$mxc_dir/src/target/release/lxc-exec" "target/$TARGET/release/lxc-exec"',
         "MXC build step",
     )
+    windows_mxc_step = require_step(
+        build,
+        "Build MXC Windows executor",
+        condition="runner.os == 'Windows'",
+    )
+    expected_windows_mxc_step = {
+        "name": "Build MXC Windows executor",
+        "if": "runner.os == 'Windows'",
+        "shell": "pwsh",
+        "run": """$mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
+git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
+git -C $mxcDir checkout $env:MXC_REF
+Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\\mxc\\patches\\*.patch") |
+  Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
+Push-Location (Join-Path $mxcDir "src")
+cargo build --release -p wxc --no-default-features --locked --target ${{ matrix.target }}
+Pop-Location
+Copy-Item (Join-Path $mxcDir "src\\target\\${{ matrix.target }}\\release\\wxc-exec.exe") target\\${{ matrix.target }}\\release\\wxc-exec.exe
+""",
+    }
+    if windows_mxc_step != expected_windows_mxc_step:
+        raise WorkflowError("MXC Windows build step is not exact")
     package_step = require_step(
         build, "Package (Unix)", condition="runner.os != 'Windows'"
     )
@@ -932,6 +962,10 @@ def verify_common_release_build(workflow: dict[str, Any], *, nightly: bool) -> N
                 "python scripts/verify_release_archive.py "
                 '"dist/axis-$env:PLATFORM.zip" "axis-$env:PLATFORM" '
                 "--require axis.exe --require axisd.exe "
+                "--require wxc-exec.exe "
+                "--require axis-wfp-broker.exe "
+                "--require axis-ssh-proxy.exe "
+                "--require install_windows_wfp_broker.ps1 "
                 "--require REPRODUCIBILITY.json"
             ),
         },
@@ -944,6 +978,14 @@ def verify_common_release_build(workflow: dict[str, Any], *, nightly: bool) -> N
             "axis.exe",
             "--require",
             "axisd.exe",
+            "--require",
+            "wxc-exec.exe",
+            "--require",
+            "axis-wfp-broker.exe",
+            "--require",
+            "axis-ssh-proxy.exe",
+            "--require",
+            "install_windows_wfp_broker.ps1",
             "--require",
             "REPRODUCIBILITY.json",
         ],
@@ -1657,6 +1699,48 @@ done
         mxc_step,
         'cp "$mxc_dir/src/target/release/lxc-exec" target/release/lxc-exec',
         "CI MXC build step",
+    )
+    windows = require_job(workflow, "test-windows")
+    windows_mxc_step = require_step(windows, "Build pinned MXC Windows executor")
+    if windows_mxc_step != {
+        "name": "Build pinned MXC Windows executor",
+        "shell": "pwsh",
+        "run": """$mxcDir = Join-Path $env:RUNNER_TEMP "mxc"
+git clone --filter=blob:none $env:MXC_REPOSITORY $mxcDir
+git -C $mxcDir checkout $env:MXC_REF
+Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "third_party\\mxc\\patches\\*.patch") |
+  Sort-Object Name | ForEach-Object { git -C $mxcDir apply --whitespace=error $_.FullName }
+Push-Location (Join-Path $mxcDir "src")
+cargo build --release -p wxc --no-default-features --locked
+Pop-Location
+Copy-Item (Join-Path $mxcDir "src\\target\\release\\wxc-exec.exe") target\\release\\wxc-exec.exe
+""",
+    }:
+        raise WorkflowError("CI MXC Windows build step is not exact")
+    require_exact_command_step(
+        windows,
+        {
+            "name": "Windows MXC ProcessContainer smoke and security tests",
+            "shell": "pwsh",
+            "env": {
+                "AXIS_RUN_MXC_BASECONTAINER_E2E": "1",
+                "AXIS_SKIP_UNAVAILABLE_MXC_BASECONTAINER_E2E": "1",
+                "AXIS_TEST_MXC_EXECUTOR": "${{ github.workspace }}\\target\\release\\wxc-exec.exe",
+            },
+            "run": (
+                "pwsh -NoProfile -File e2e/windows/test_mxc_processcontainer.ps1 "
+                "-AxisBin ./target/release/axis.exe"
+            ),
+        },
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            "e2e/windows/test_mxc_processcontainer.ps1",
+            "-AxisBin",
+            "./target/release/axis.exe",
+        ],
+        "CI Windows MXC smoke step",
     )
     package_step = require_step(linux, "Build and inspect Linux native packages")
     require_command_line(

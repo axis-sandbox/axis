@@ -1330,6 +1330,86 @@ inference:
 }
 
 #[tokio::test]
+async fn inference_token_budget_allows_bounded_request_and_rejects_oversize_before_forwarding() {
+    let policy = r#"
+version: 1
+name: proxy-token-budget-test
+
+network:
+  mode: proxy
+  policies:
+    - name: inference
+      endpoints:
+        - host: "inference.local"
+          port: 443
+          access: read-write
+
+inference:
+  routes:
+    - name: local
+      endpoint: "http://inference.local:443"
+  token_budget:
+    max_tokens_per_hour: 1000
+    max_tokens_per_request: 100
+    action_on_exhaust: reject
+"#;
+
+    let (allowed_upstream, allowed_received) =
+        start_recording_http_server_until("max_tokens").await;
+    let (_sandbox_id, allowed_proxy) =
+        start_proxy_with_policy(policy, Some(allowed_upstream)).await;
+    let mut allowed = TcpStream::connect(allowed_proxy).await.unwrap();
+    allowed
+        .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(allowed);
+    let mut response = String::new();
+    reader.read_line(&mut response).await.unwrap();
+    assert!(response.contains("200"));
+    let body = br#"{"max_tokens":10}"#;
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        String::from_utf8_lossy(body)
+    );
+    reader
+        .into_inner()
+        .write_all(request.as_bytes())
+        .await
+        .unwrap();
+    assert!(allowed_received.await.unwrap().contains("max_tokens"));
+
+    let (denied_upstream, denied_received) = start_recording_http_server().await;
+    let (_sandbox_id, denied_proxy) = start_proxy_with_policy(policy, Some(denied_upstream)).await;
+    let mut denied = TcpStream::connect(denied_proxy).await.unwrap();
+    denied
+        .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(denied);
+    response.clear();
+    reader.read_line(&mut response).await.unwrap();
+    assert!(response.contains("200"));
+    let body = br#"{"max_tokens":101}"#;
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        String::from_utf8_lossy(body)
+    );
+    reader
+        .into_inner()
+        .write_all(request.as_bytes())
+        .await
+        .unwrap();
+    let denied_request = denied_received.await.unwrap();
+    assert!(
+        denied_request.is_empty(),
+        "oversize inference body reached provider: {denied_request:?}"
+    );
+}
+
+#[tokio::test]
 async fn provider_credentials_fail_closed_for_unbound_or_ambiguous_host() {
     unsafe {
         std::env::set_var("AXIS_TEST_PROXY_AUTHORITY_KEY", "authority-secret");

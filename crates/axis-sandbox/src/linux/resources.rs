@@ -231,7 +231,7 @@ fn cgroup_limits(policy: &ProcessPolicy) -> Result<CgroupLimits, String> {
         } else {
             None
         },
-        pids_max: (policy.max_processes > 0).then_some(policy.max_processes),
+        pids_max: (policy.effective_max_processes() > 0).then(|| policy.effective_max_processes()),
         cpu_max: (policy.cpu_rate_percent > 0).then(|| CpuMax {
             quota_us: CPU_PERIOD_US * u64::from(policy.cpu_rate_percent) / 100,
             period_us: CPU_PERIOD_US,
@@ -354,6 +354,8 @@ mod tests {
             cpu_rate_percent: 25,
             run_as_user: None,
             blocked_syscalls: Vec::new(),
+            identity: Default::default(),
+            child_processes: Default::default(),
             timeout_sec: None,
         }
     }

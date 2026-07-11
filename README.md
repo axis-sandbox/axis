@@ -13,11 +13,11 @@ platform backend is available:
 
 | Layer | Linux | Windows | macOS |
 |---|---|---|---|
-| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | Launch blocked; Restricted Token + Job Object are containment targets | Seatbelt (sandbox-exec) |
-| Filesystem | MXC Bubblewrap mounts or native Landlock LSM | Launch blocked; NTFS ACLs + Low Integrity are containment targets | Seatbelt profile (subpath rules) |
-| Network | block mode or strict netns proxy | Launch blocked; AppContainer + loopback proxy are containment targets | Seatbelt network deny + proxy |
-| GPU | Optional HIP Remote artifacts | Unavailable while native launch is blocked | Optional HIP Remote artifacts |
-| Inference | Local LLM via llama.cpp or vLLM | Unavailable while native launch is blocked | Same |
+| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | MXC ProcessContainer with AXIS-owned lifecycle cleanup | Seatbelt (sandbox-exec) |
+| Filesystem | MXC Bubblewrap mounts or native Landlock LSM | MXC ProcessContainer path allowlists | Seatbelt profile (subpath rules) |
+| Network | block mode, MXC cooperative proxy, or strict native netns proxy | MXC allow/block plus BaseContainer strict proxy through the installed AXIS WFP broker | Seatbelt network deny + proxy |
+| GPU | Optional HIP Remote artifacts | Optional HIP Remote artifacts | Optional HIP Remote artifacts |
+| Inference | Local LLM via llama.cpp or vLLM | Same | Same |
 
 In proxy mode, allowed network requests go through a policy-evaluated proxy.
 HIP Remote policies route GPU API calls to a worker process when the optional
@@ -70,6 +70,11 @@ the default no-admin path unless `--with-netns-helper` is requested. Advanced
 Linux users may choose
 `--with-cap-net-admin --prefix /usr/local/bin` instead, but the helper is the
 narrower privileged path.
+
+Windows release archives include the pinned MXC `wxc-exec.exe` beside
+`axis.exe`. Windows `runtime.provider: auto` and `mxc` use ProcessContainer;
+the incomplete legacy `axis_native` host-spawn path is disabled and never used
+as a fallback.
 
 The Linux default MXC process backend also needs the host `bubblewrap` runtime
 and unprivileged user namespaces enabled. Those are host runtime prerequisites,
@@ -148,14 +153,38 @@ fails closed when the selected provider cannot enforce the policy:
 5. bubblewrap fallback — block-mode fallback when Landlock is unavailable and a
    safe system `bwrap` can preserve the requested semantics
 
-### Windows (Launch Blocked)
+### Windows (MXC ProcessContainer)
 
-The native Windows backend fails closed before creating a user process. Its
-current code does not apply a Job Object, AppContainer, restricted token, NTFS
-ACL boundary, proxy boundary, or isolated environment to the initial process.
-Those controls remain implementation targets, and no Windows native containment
-or bypass-detection claim should be treated as proven until the complete launch
-path and negative tests land.
+Windows process policies default to the packaged MXC `wxc-exec.exe` backend.
+AXIS translates the shared policy into MXC JSON, clears the executor environment,
+rejects secrets and unsupported surfaces before launch, and places the executor
+in a kill-on-close Job Object for timeout and teardown cleanup. AXIS requires
+MXC BaseContainer by default, enables its least-privilege token mode, and fails
+closed rather than silently selecting another ProcessContainer tier.
+
+The supported slice now includes filesystem read-only/read-write allowlists,
+BaseContainer-default-deny normalization for non-overlapping deny rules, a
+physical managed Windows profile, child-tree process/aggregate-memory/CPU limits,
+default allow/block networking, and BaseContainer strict proxy routing through
+the installed AXIS WFP broker. The broker installs an exact proxy permit plus
+IPv4/IPv6 default-deny filters against the SID read from the suspended child;
+direct TCP, UDP, DNS, and QUIC bypasses remain blocked. Nested deny rules and
+GPU/AMD policies still reject instead of weakening the policy. Scoped SSH is
+supported through BaseContainer strict proxy mode when every projected key has
+the same literal host set and that set exactly matches port-22 network rules.
+Managed inference, streaming, host-side provider credential injection, and
+conservative token-budget reservation are supported through BaseContainer strict
+proxy mode; token-budget exhaustion currently supports the exact `reject` action
+only.
+
+Interactive ConPTY is unsupported through BaseContainer on Windows build 26300
+because its creation API rejects pseudoconsole startup handles with
+`ERROR_INVALID_HANDLE`. AXIS does not force the older AppContainer/DACL tier to
+obtain terminal support. AppContainer/DACL fallback remains disabled in the MXC
+configuration, so an unavailable BaseContainer is a launch failure.
+The pinned MXC project is an early preview and does not claim its profiles are
+security boundaries; AXIS therefore treats unsupported or unavailable behavior
+as a launch failure, not as permission to execute on the host.
 
 ## GPU Sandbox
 
