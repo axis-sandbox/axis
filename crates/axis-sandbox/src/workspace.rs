@@ -1012,24 +1012,30 @@ mod tests {
 
     #[test]
     fn only_known_agent_state_paths_are_contained() {
-        let home = Path::new("/home/user");
-        let agent_root = Path::new("/home/user/.axis/agents/test");
+        let temporary_home = tempfile::tempdir().unwrap();
+        let home = temporary_home.path();
+        let agent_root = home.join(".axis/agents/test");
+        let absolute_agent_root = agent_root.to_string_lossy();
 
         assert_eq!(
-            contained_agent_dir_for_relative(Path::new(".codex"), agent_root),
+            contained_agent_dir_for_relative(Path::new(".codex"), &agent_root),
             Some(agent_root.join("codex"))
         );
         assert_eq!(
-            contained_agent_dir_for_relative(Path::new(".config"), agent_root),
+            contained_agent_dir_for_relative(Path::new(".config"), &agent_root),
             Some(agent_root.join("config"))
         );
         assert_eq!(
-            contained_agent_dir_for_relative(Path::new("fixture/project"), agent_root),
+            contained_agent_dir_for_relative(Path::new("fixture/project"), &agent_root),
             None
         );
         assert_eq!(
-            agent_state_mapping_for_policy_path_with_home("~/.axis/agents/test", home, agent_root,)
-                .unwrap(),
+            agent_state_mapping_for_policy_path_with_home(
+                "~/.axis/agents/test",
+                home,
+                &agent_root,
+            )
+            .unwrap(),
             None,
             "a policy-owned state root is a grant target, not a home alias"
         );
@@ -1037,7 +1043,7 @@ mod tests {
             managed_home_agent_state_mapping_for_policy_path_with_home(
                 "~/.axis/agents/test",
                 home,
-                agent_root,
+                &agent_root,
             )
             .unwrap(),
             Some((home.join(".axis/agents/test"), agent_root.join("axis"))),
@@ -1045,9 +1051,9 @@ mod tests {
         );
         assert_eq!(
             managed_home_agent_state_mapping_for_policy_path_with_home(
-                "/home/user/.axis/agents/test",
+                &absolute_agent_root,
                 home,
-                agent_root,
+                &agent_root,
             )
             .unwrap(),
             Some((home.join(".axis/agents/test"), agent_root.join("axis"))),

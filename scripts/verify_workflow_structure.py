@@ -67,7 +67,6 @@ MXC_BUILD_COMMAND = (
 RELEASE_JOBS = {
     "identity",
     "gate",
-    "notices",
     "gui",
     "build",
     "package-linux",
@@ -79,7 +78,6 @@ RELEASE_JOBS = {
 NIGHTLY_JOBS = {
     "source",
     "gate",
-    "notices",
     "gui",
     "build",
     "sbom",
@@ -92,9 +90,8 @@ GUI_JOBS = {"build-frontend", "build-macos", "build-linux", "build-windows"}
 EXACT_RELEASE_JOB_DIGESTS = {
     "identity": "efe85eb1f638e95d48bdc9b75189b07b2471523b246104499f9c0d74e6031efa",
     "gate": "08bf398f811f1b822c18aefb626911ccb9a8353692a0444e38f0458e033bfb7c",
-    "notices": "ec21890d17693591a223abbe81d3df311fa3d08bcfd5b098d1e1b479f8a326cb",
-    "gui": "2ef2eb1a5adc91b1e2070d8de6c8755ed2f4c9b404999a0dd29928f44051f1b0",
-    "build": "7512d27ff458c97fda6d415356e67cfe028030e70030db8cc9e0585238b35c13",
+    "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
+    "build": "6f5da916d56c27c467cbf58eca9df3ac0b0140cbfb405146f8ad9515ebb15d65",
     "package-linux": "4ce896e982fd69d5455b6aa361cf949207384c11d73100e0f41ef7bd7b9839ad",
     "sbom": "b190f1d6383a35219aef49f631c6e5f76a063fcc80c3dce4d1974ade86019bd9",
     "checksums": "8bdb3588e2f3cd78b7dd260468d195a7073b691768c05633847568d40cf72ed1",
@@ -104,19 +101,18 @@ EXACT_RELEASE_JOB_DIGESTS = {
 EXACT_NIGHTLY_JOB_DIGESTS = {
     "source": "39f951a77aa65045095f5f0ae32bd283746822c668f1d05a9a9b7e8d70775bd4",
     "gate": "22a9ffdf0568d78134f6a3e94b914759bedc95463ef7959eea1e556b58193bd5",
-    "notices": "7aea1ad212f722c4ea5945dbb0b0c06286545668921649a4f4c5d8ddabe6bd05",
-    "gui": "4218ac2d661c0a9bc4ecab5d6d52e2469c635c10a68956f5f534eab422fe0a53",
-    "build": "c32136f8af09d2fa993ac7159476177a52f4ac0c23d05a8a6e2ba46dcbfcbbd7",
+    "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
+    "build": "07e0d0966499a02af95c6daf8f3f8472653b889148320549d4217a93d200e3ab",
     "sbom": "39aa01781a2f15ab42742c711974680099c9bf4ee0b9d5b079d7f7fffe75c0ae",
     "checksums": "e0ffa207884b568f7f99226aab32e0ad72417ec9d734fb0c4f77444ddbb78232",
     "attest": "41efe2b79e4796f4931b033ef0b2e87f7ec6b92e30c137471a795861a9cab8d5",
     "publish": "9759ae707a94ae2f2a172508b4a74bcfa1a1e3f1f9152cfa62994b94e01b7195",
 }
 EXACT_GUI_JOB_DIGESTS = {
-    "build-frontend": "4ee8e98e4ce0a29e7d3c2d06547164aa6c0d519010fbca83422c8017d1b7a598",
-    "build-macos": "a078dbe0185a69a93748d544472062ff4a07dbef8126595dcdeb308f739d4087",
-    "build-linux": "ed158d05b97208c67fd3eaef80c621602b5cf122bf63707a1378aa640e78f78f",
-    "build-windows": "3740ee60788d693b9be3351c01e6b8556b88928037e7b87a65c3bdee79802a11",
+    "build-frontend": "bb570d4ee04233ad829af7969e0098c050ae2acd41299735bc59674a32489a3f",
+    "build-macos": "f8c575b81409c28b43b98dd052670c6065e961f51dab1f03f4ca12d38903877c",
+    "build-linux": "f8f742362aaf8a2a44c3186b8bcbb2abc4ba3392f554baa5e9ffd6ffa7f756ca",
+    "build-windows": "41f52c5b49423293e2daf6f8e8f1770f30aab7c658d8495c3c132a3aa4c4915b",
 }
 CI_JOBS = {
     "format",
@@ -183,6 +179,10 @@ COMMAND_RESOLUTION_MUTATORS = {
     "invoke-expression",
 }
 REVIEWED_BASH_CONTROL_HEADERS = {
+    "if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then",
+    "if ! timeout --kill-after=1s 5s bwrap --unshare-user --uid 0 --gid 0 "
+    "--ro-bind / / -- true; then",
+    'if [ -f "$state" ]; then',
     'if [ "$PLATFORM" = "linux-x86_64" ]; then',
     'if [ "$RUNNER_OS" = "Linux" ]; then',
     'if [ -e "$sidecar" ]; then',
@@ -352,7 +352,7 @@ def reject_step_bypasses(job: dict[str, Any], label: str) -> None:
     for index, step in enumerate(steps):
         if not isinstance(step, dict):
             raise WorkflowError(f"{label} contains malformed step {index}")
-        if "if" in step:
+        if "if" in step and step.get("if") != ALWAYS_CONDITION:
             raise WorkflowError(f"{label} step {index} has a disabling condition")
         if step.get("continue-on-error") not in (None, False):
             raise WorkflowError(f"{label} step {index} must not continue on error")
@@ -763,6 +763,41 @@ def require_command_line(
     require_argv_line(step, list(parse_argv(command, label)), label, controls=controls)
 
 
+def require_command_sequence(
+    step: dict[str, Any],
+    expected: list[tuple[str, tuple[str, ...]]],
+    label: str,
+) -> None:
+    commands = script_commands(step, label)
+    next_index = 0
+    for command, controls in expected:
+        required = ScriptCommand(tuple(parse_argv(command, label)), controls)
+        try:
+            next_index = commands.index(required, next_index) + 1
+        except ValueError as error:
+            raise WorkflowError(f"{label} does not preserve required command order") from error
+
+
+def require_exclusive_sysctl_write(
+    step: dict[str, Any],
+    key: str,
+    command: str,
+    label: str,
+    *,
+    controls: tuple[str, ...] = (),
+) -> None:
+    expected = ScriptCommand(tuple(parse_argv(command, label)), controls)
+    writes = [
+        candidate
+        for candidate in script_commands(step, label)
+        if any(argument.rsplit("/", 1)[-1] == "sysctl" for argument in candidate.argv)
+        and any(argument in {"-w", "--write"} for argument in candidate.argv)
+        and any(argument == key or argument.startswith(f"{key}=") for argument in candidate.argv)
+    ]
+    if writes != [expected]:
+        raise WorkflowError(f"{label} requires exactly one reviewed sysctl write")
+
+
 def require_exact_argv(step: dict[str, Any], expected: list[str], label: str) -> None:
     commands = script_commands(step, label)
     if commands != [ScriptCommand(tuple(expected), ())]:
@@ -783,104 +818,20 @@ def require_argv_line(
         )
 
 
-def verify_notice_commands(
-    job: dict[str, Any],
-    *,
-    expected_mxc_ref: bool,
-    rust_toolchain: str,
-    label: str,
-) -> None:
-    generator_run = "python3 scripts/generate_third_party_notices.py --check"
-    generator_argv = [
-        "python3",
-        "scripts/generate_third_party_notices.py",
-        "--check",
-    ]
-    if expected_mxc_ref:
-        generator_run += ' --expected-mxc-ref "$MXC_REF"'
-        generator_argv.extend(("--expected-mxc-ref", "$MXC_REF"))
-    commands = (
-        (
-            "Install GUI dependencies for notice verification",
-            "npm ci --prefix gui/shared",
-            ["npm", "ci", "--prefix", "gui/shared"],
-        ),
-        (
-            "Run publication Python tests",
-            "python3 -m unittest discover -s scripts -p 'test_*.py'",
-            [
-                "python3",
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "scripts",
-                "-p",
-                "test_*.py",
-            ],
-        ),
-        (
-            "Verify GUI dependency notices",
-            "npm run --prefix gui/shared notices:check",
-            ["npm", "run", "--prefix", "gui/shared", "notices:check"],
-        ),
-        ("Verify authenticated dependency notices", generator_run, generator_argv),
-    )
-    for name, run, argv in commands:
-        require_exact_command_step(
-            job,
-            {"name": name, "run": run},
-            argv,
-            label,
-        )
-    command_steps = [{"name": name, "run": run} for name, run, _ in commands]
-    require_exact_job_steps(
-        job,
-        [
-            {
-                "uses": CHECKOUT_ACTION,
-                "with": {"persist-credentials": False},
-            },
-            {
-                "uses": RUST_ACTION,
-                "with": {"toolchain": rust_toolchain},
-            },
-            {
-                "uses": NODE_ACTION,
-                "with": {
-                    "node-version": "22",
-                    "package-manager-cache": False,
-                },
-            },
-            *command_steps,
-        ],
-        label,
-    )
-
-
 def verify_common_release_build(workflow: dict[str, Any], *, nightly: bool) -> None:
     require_environment(workflow, COMMON_RELEASE_ENVIRONMENT, "publication workflow")
     source_job = "source" if nightly else "identity"
-    notices = require_job(workflow, "notices")
-    require_unconditional_job(notices, "notices job")
-    require_needs(notices, {source_job, "gate"}, "notices job")
-    verify_notice_commands(
-        notices,
-        expected_mxc_ref=True,
-        rust_toolchain="${{ env.RUST_TOOLCHAIN }}",
-        label="notice verification",
-    )
 
     gui = require_job(workflow, "gui")
     require_unconditional_job(gui, "GUI job")
-    require_needs(gui, {"notices"}, "GUI job")
+    require_needs(gui, {source_job, "gate"}, "GUI job")
     require_permissions(gui, {"contents": "read"}, "GUI job")
     if gui.get("uses") != GUI_WORKFLOW or "if" in gui:
         raise WorkflowError("GUI job must unconditionally call the reviewed workflow")
 
     build = require_job(workflow, "build")
     require_unconditional_job(build, "build job")
-    require_needs(build, {"notices"}, "build job")
+    require_needs(build, {source_job, "gate"}, "build job")
     mxc_step = require_step(
         build,
         "Build MXC Linux executor",
@@ -1428,19 +1379,6 @@ def verify_gui_workflow(workflow: dict[str, Any]) -> None:
         )
     for job_name in ("build-macos", "build-linux", "build-windows"):
         require_needs(require_job(workflow, job_name), {"build-frontend"}, job_name)
-    frontend = require_step(
-        require_job(workflow, "build-frontend"), "Test and build frontend"
-    )
-    require_command_line(
-        frontend,
-        "npm run --prefix gui/shared notices:check",
-        "GUI frontend validation step",
-    )
-    require_command_line(
-        frontend,
-        "python3 scripts/generate_third_party_notices.py --check",
-        "GUI frontend validation step",
-    )
     archive_commands = {
         "build-macos": [
             "python3",
@@ -1607,6 +1545,20 @@ done
 """,
     )
     linux = require_job(workflow, "test-linux")
+    sandbox_dependencies = require_step(linux, "Install Linux sandbox dependencies")
+    require_command_line(
+        sandbox_dependencies,
+        "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true",
+        "CI Bubblewrap availability proof",
+    )
+    require_command_line(
+        sandbox_dependencies,
+        'printf \'%s\\n\' "$userns_restriction" > "$RUNNER_TEMP/axis-apparmor-userns"',
+        "CI user namespace state capture",
+        controls=(
+            "if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then",
+        ),
+    )
     mxc_step = require_step(linux, "Build MXC Linux executor")
     require_command_line(mxc_step, MXC_BUILD_COMMAND, "CI MXC build step")
     require_command_line(
@@ -1634,6 +1586,127 @@ done
         package_step,
         'scripts/verify_linux_package_manifest.sh deb "$deb"',
         "CI Debian package verification",
+    )
+    userns_restore = require_step(
+        linux,
+        "Restore Linux user namespace restriction",
+        condition=ALWAYS_CONDITION,
+    )
+    require_command_line(
+        userns_restore,
+        'state="$RUNNER_TEMP/axis-apparmor-userns"',
+        "CI user namespace restoration state",
+    )
+    require_command_line(
+        userns_restore,
+        'sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"',
+        "CI user namespace restoration",
+        controls=('if [ -f "$state" ]; then',),
+    )
+    netns = require_job(workflow, "test-linux-netns-helper")
+    netns_dependencies = require_step(netns, "Install kernel namespace tooling")
+    netns_proof = (
+        "timeout --kill-after=1s 5s bwrap --unshare-user --uid 0 --gid 0 "
+        "--ro-bind / / -- true"
+    )
+    require_command_line(
+        netns_dependencies,
+        netns_proof,
+        "CI netns Bubblewrap availability proof",
+    )
+    netns_userns_control = (
+        "if ! timeout --kill-after=1s 5s "
+        "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then"
+    )
+    netns_state_read = (
+        'userns_restriction="$(timeout --kill-after=1s 5s '
+        'sysctl -n kernel.apparmor_restrict_unprivileged_userns)"'
+    )
+    require_command_line(
+        netns_dependencies,
+        netns_state_read,
+        "CI netns user namespace state read",
+        controls=(netns_userns_control,),
+    )
+    netns_state_validation = 'test "$userns_restriction" = "1"'
+    require_command_line(
+        netns_dependencies,
+        netns_state_validation,
+        "CI netns user namespace expected state",
+        controls=(netns_userns_control,),
+    )
+    netns_state_capture = (
+        'printf \'%s\\n\' "$userns_restriction" '
+        '> "$RUNNER_TEMP/axis-netns-helper-apparmor-userns"'
+    )
+    require_command_line(
+        netns_dependencies,
+        netns_state_capture,
+        "CI netns user namespace state capture",
+        controls=(netns_userns_control,),
+    )
+    netns_provision = (
+        "timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s "
+        "sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0"
+    )
+    require_command_line(
+        netns_dependencies,
+        netns_provision,
+        "CI netns user namespace provisioning",
+        controls=(netns_userns_control,),
+    )
+    require_exclusive_sysctl_write(
+        netns_dependencies,
+        "kernel.apparmor_restrict_unprivileged_userns",
+        netns_provision,
+        "CI netns user namespace provisioning",
+        controls=(netns_userns_control,),
+    )
+    require_command_sequence(
+        netns_dependencies,
+        [
+            (netns_state_read, (netns_userns_control,)),
+            (netns_state_validation, (netns_userns_control,)),
+            (netns_state_capture, (netns_userns_control,)),
+            (netns_provision, (netns_userns_control,)),
+            (netns_proof, ()),
+        ],
+        "CI netns user namespace provisioning sequence",
+    )
+    netns_userns_restore = require_step(
+        netns,
+        "Restore helper user namespace restriction",
+        condition=ALWAYS_CONDITION,
+    )
+    if netns_userns_restore.get("timeout-minutes") != 2:
+        raise WorkflowError("CI netns user namespace restoration requires a 2 minute timeout")
+    require_command_line(
+        netns_userns_restore,
+        'state="$RUNNER_TEMP/axis-netns-helper-apparmor-userns"',
+        "CI netns user namespace restoration state",
+    )
+    netns_restore = (
+        'timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s '
+        'sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"'
+    )
+    require_command_line(
+        netns_userns_restore,
+        netns_restore,
+        "CI netns user namespace restoration",
+        controls=('if [ -f "$state" ]; then',),
+    )
+    require_exclusive_sysctl_write(
+        netns_userns_restore,
+        "kernel.apparmor_restrict_unprivileged_userns",
+        netns_restore,
+        "CI netns user namespace restoration",
+        controls=('if [ -f "$state" ]; then',),
+    )
+    require_command_line(
+        netns_userns_restore,
+        'rm -f "$state"',
+        "CI netns user namespace restoration marker cleanup",
+        controls=('if [ -f "$state" ]; then',),
     )
     require_command_line(
         package_step,

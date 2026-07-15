@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { afterEach } from "node:test";
@@ -281,9 +281,8 @@ test("print mode emits exactly one complete generated section", async () => {
   const { stdout, stderr } = await execFileAsync(process.execPath, [scriptPath, "--print"]);
   assert.equal(stderr, "");
   assert.equal(stdout, `${await generateSection()}\n`);
-  const committed = await readFile(path.resolve(path.dirname(scriptPath), "../../../THIRD_PARTY_NOTICES.md"), "utf8");
-  assert.match(committed, /### vite 7\.3\.6/);
-  assert.match(committed, /Shipped runtime component: Vite module-preload polyfill/);
+  assert.match(stdout, /### vite 7\.3\.6/);
+  assert.match(stdout, /Shipped runtime component: Vite module-preload polyfill/);
 });
 
 test("rejects unsupported command modes", async () => {

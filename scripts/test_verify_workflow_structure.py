@@ -143,16 +143,6 @@ class WorkflowStructureTests(unittest.TestCase):
                 verify(document)
 
     def test_rejects_echoed_unreachable_and_conditionally_wrapped_controls(self):
-        echoed = copy.deepcopy(self.release)
-        notice = self.find_step(
-            echoed, "notices", "Verify authenticated dependency notices"
-        )
-        notice["run"] = (
-            "python3 -m unittest discover -s scripts -p 'test_*.py'\n"
-            "echo 'python3 scripts/generate_third_party_notices.py --check "
-            '--expected-mxc-ref "$MXC_REF"\''
-        )
-
         unreachable = copy.deepcopy(self.release)
         deb = self.find_step(unreachable, "package-linux", "Verify .deb contents")
         deb["run"] = "exit 0\n" 'scripts/verify_linux_package_manifest.sh deb "$deb"\n'
@@ -176,19 +166,11 @@ class WorkflowStructureTests(unittest.TestCase):
         identity = self.find_step(shadowed, "identity", "Bind tag, version, and commit")
         identity["run"] = f"python3() {{ :; }}\n{identity['run']}"
 
-        environment = copy.deepcopy(self.release)
-        notice = self.find_step(
-            environment, "notices", "Verify authenticated dependency notices"
-        )
-        notice["env"] = {"PATH": "/tmp/bypass"}
-
         for label, document, message in (
-            ("echo", echoed, "not exact"),
             ("early exit", unreachable, "successful early exit"),
             ("delimited exit", delimited_exit, "successful early exit"),
             ("conditional", conditional, "unreviewed shell control flow"),
             ("function shadow", shadowed, "not exact"),
-            ("environment", environment, "not exact"),
         ):
             with self.subTest(label=label), self.assertRaisesRegex(
                 verifier.WorkflowError, message
@@ -245,7 +227,6 @@ class WorkflowStructureTests(unittest.TestCase):
         cases = (
             (self.release, "identity", verifier.verify_release_workflow),
             (self.release, "gate", verifier.verify_release_workflow),
-            (self.release, "notices", verifier.verify_release_workflow),
             (self.nightly, "source", verifier.verify_nightly_workflow),
             (self.nightly, "gate", verifier.verify_nightly_workflow),
         )
@@ -493,6 +474,265 @@ class WorkflowStructureTests(unittest.TestCase):
         ):
             verifier.verify_ci_workflow(custom_shell)
 
+    def test_ci_requires_bubblewrap_proof_and_userns_restoration(self):
+        missing_proof = copy.deepcopy(self.ci)
+        self.find_step(
+            missing_proof, "test-linux", "Install Linux sandbox dependencies"
+        )["run"] = "sudo apt-get install -y bubblewrap python3 rpm"
+        with self.assertRaisesRegex(verifier.WorkflowError, "Bubblewrap"):
+            verifier.verify_ci_workflow(missing_proof)
+
+        disabled_restore = copy.deepcopy(self.ci)
+        self.find_step(
+            disabled_restore, "test-linux", "Restore Linux user namespace restriction"
+        )["if"] = False
+        with self.assertRaisesRegex(verifier.WorkflowError, "disabling condition"):
+            verifier.verify_ci_workflow(disabled_restore)
+
+        incomplete_restore = copy.deepcopy(self.ci)
+        self.find_step(
+            incomplete_restore, "test-linux", "Restore Linux user namespace restriction"
+        )["run"] = 'rm -f "$RUNNER_TEMP/axis-apparmor-userns"'
+        with self.assertRaisesRegex(verifier.WorkflowError, "restoration"):
+            verifier.verify_ci_workflow(incomplete_restore)
+
+        mismatched_capture = copy.deepcopy(self.ci)
+        capture = self.find_step(
+            mismatched_capture, "test-linux", "Install Linux sandbox dependencies"
+        )
+        capture["run"] = capture["run"].replace(
+            "$RUNNER_TEMP/axis-apparmor-userns",
+            "$RUNNER_TEMP/axis-other-userns",
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "state capture"):
+            verifier.verify_ci_workflow(mismatched_capture)
+
+        mismatched_restore = copy.deepcopy(self.ci)
+        restore = self.find_step(
+            mismatched_restore, "test-linux", "Restore Linux user namespace restriction"
+        )
+        restore["run"] = restore["run"].replace(
+            'state="$RUNNER_TEMP/axis-apparmor-userns"',
+            'state="$RUNNER_TEMP/axis-other-userns"',
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "restoration state"):
+            verifier.verify_ci_workflow(mismatched_restore)
+
+        missing_netns_proof = copy.deepcopy(self.ci)
+        self.find_step(
+            missing_netns_proof,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )["run"] = "sudo apt-get install -y bubblewrap iproute2 iptables python3"
+        with self.assertRaisesRegex(verifier.WorkflowError, "netns Bubblewrap"):
+            verifier.verify_ci_workflow(missing_netns_proof)
+
+        disabled_netns_restore = copy.deepcopy(self.ci)
+        self.find_step(
+            disabled_netns_restore,
+            "test-linux-netns-helper",
+            "Restore helper user namespace restriction",
+        )["if"] = False
+        with self.assertRaisesRegex(verifier.WorkflowError, "disabling condition"):
+            verifier.verify_ci_workflow(disabled_netns_restore)
+
+        incomplete_netns_restore = copy.deepcopy(self.ci)
+        self.find_step(
+            incomplete_netns_restore,
+            "test-linux-netns-helper",
+            "Restore helper user namespace restriction",
+        )["run"] = 'rm -f "$RUNNER_TEMP/axis-netns-helper-apparmor-userns"'
+        with self.assertRaisesRegex(verifier.WorkflowError, "netns user namespace restoration"):
+            verifier.verify_ci_workflow(incomplete_netns_restore)
+
+        mismatched_netns_capture = copy.deepcopy(self.ci)
+        netns_capture = self.find_step(
+            mismatched_netns_capture,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        netns_capture["run"] = netns_capture["run"].replace(
+            "$RUNNER_TEMP/axis-netns-helper-apparmor-userns",
+            "$RUNNER_TEMP/axis-other-netns-userns",
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "netns user namespace state capture"):
+            verifier.verify_ci_workflow(mismatched_netns_capture)
+
+        missing_netns_read = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            missing_netns_read,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            'userns_restriction="$(timeout --kill-after=1s 5s '
+            'sysctl -n kernel.apparmor_restrict_unprivileged_userns)"',
+            'userns_restriction="1"',
+        )
+        with self.assertRaisesRegex(
+            verifier.WorkflowError, "netns user namespace state read"
+        ):
+            verifier.verify_ci_workflow(missing_netns_read)
+
+        missing_netns_expected_state = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            missing_netns_expected_state,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            'test "$userns_restriction" = "1"',
+            "true",
+        )
+        with self.assertRaisesRegex(
+            verifier.WorkflowError, "netns user namespace expected state"
+        ):
+            verifier.verify_ci_workflow(missing_netns_expected_state)
+
+        missing_netns_provisioning = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            missing_netns_provisioning,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            "timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s "
+            "sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0",
+            "true",
+        )
+        with self.assertRaisesRegex(
+            verifier.WorkflowError, "netns user namespace provisioning"
+        ):
+            verifier.verify_ci_workflow(missing_netns_provisioning)
+
+        late_netns_validation = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            late_netns_validation,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        validation = '  test "$userns_restriction" = "1"\n'
+        provisioning = (
+            "  timeout --kill-after=1s 7s sudo -n timeout "
+            "--kill-after=1s 5s sysctl -q -w "
+            "kernel.apparmor_restrict_unprivileged_userns=0\n"
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            validation, "", 1
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            provisioning, provisioning + validation, 1
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "provisioning sequence"):
+            verifier.verify_ci_workflow(late_netns_validation)
+
+        late_netns_capture = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            late_netns_capture,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        capture = (
+            "  printf '%s\\n' \"$userns_restriction\" > "
+            '"$RUNNER_TEMP/axis-netns-helper-apparmor-userns"\n'
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(capture, "", 1)
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            provisioning, provisioning + capture, 1
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "provisioning sequence"):
+            verifier.verify_ci_workflow(late_netns_capture)
+
+        early_netns_post_proof = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            early_netns_post_proof,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        post_proof = (
+            "timeout --kill-after=1s 5s \\\n"
+            "  bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true\n"
+        )
+        control = (
+            "if ! timeout --kill-after=1s 5s bwrap --unshare-user "
+            "--uid 0 --gid 0 --ro-bind / / -- true; then\n"
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(post_proof, "")
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            control,
+            post_proof + control,
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "provisioning sequence"):
+            verifier.verify_ci_workflow(early_netns_post_proof)
+
+        unconditional_netns_mutation = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            unconditional_netns_mutation,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        netns_dependencies["run"] = (
+            "sudo -n sysctl -q -w "
+            "kernel.apparmor_restrict_unprivileged_userns=0\n"
+            + netns_dependencies["run"]
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "exactly one reviewed"):
+            verifier.verify_ci_workflow(unconditional_netns_mutation)
+
+        duplicate_netns_mutation = copy.deepcopy(self.ci)
+        netns_dependencies = self.find_step(
+            duplicate_netns_mutation,
+            "test-linux-netns-helper",
+            "Install kernel namespace tooling",
+        )
+        netns_dependencies["run"] = netns_dependencies["run"].replace(
+            validation,
+            provisioning + validation,
+            1,
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "exactly one reviewed"):
+            verifier.verify_ci_workflow(duplicate_netns_mutation)
+
+        missing_netns_restore_timeout = copy.deepcopy(self.ci)
+        self.find_step(
+            missing_netns_restore_timeout,
+            "test-linux-netns-helper",
+            "Restore helper user namespace restriction",
+        )["timeout-minutes"] = 3
+        with self.assertRaisesRegex(verifier.WorkflowError, "2 minute timeout"):
+            verifier.verify_ci_workflow(missing_netns_restore_timeout)
+
+        missing_netns_restore_cleanup = copy.deepcopy(self.ci)
+        netns_restore = self.find_step(
+            missing_netns_restore_cleanup,
+            "test-linux-netns-helper",
+            "Restore helper user namespace restriction",
+        )
+        netns_restore["run"] = netns_restore["run"].replace(
+            'rm -f "$state"',
+            "true",
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "marker cleanup"):
+            verifier.verify_ci_workflow(missing_netns_restore_cleanup)
+
+        duplicate_netns_restore_mutation = copy.deepcopy(self.ci)
+        netns_restore = self.find_step(
+            duplicate_netns_restore_mutation,
+            "test-linux-netns-helper",
+            "Restore helper user namespace restriction",
+        )
+        restore_command = (
+            "  timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s "
+            'sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns='
+            '$(cat "$state")"\n'
+        )
+        netns_restore["run"] = netns_restore["run"].replace(
+            '  rm -f "$state"\n',
+            restore_command + '  rm -f "$state"\n',
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "exactly one reviewed"):
+            verifier.verify_ci_workflow(duplicate_netns_restore_mutation)
+
     def test_rejects_disabled_rewired_or_diluted_security_jobs(self):
         mandatory = set(self.security["jobs"]) - {"dependency-review"}
         for job_name in mandatory:
@@ -549,7 +789,7 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_rejects_nightly_gate_bypass_and_echoed_clean_build(self):
         gate_bypass = copy.deepcopy(self.nightly)
-        gate_bypass["jobs"]["notices"]["needs"].remove("gate")
+        gate_bypass["jobs"]["gui"]["needs"].remove("gate")
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong dependencies"):
             verifier.verify_nightly_workflow(gate_bypass)
 

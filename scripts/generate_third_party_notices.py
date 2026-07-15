@@ -1085,11 +1085,11 @@ def generate(mxc_dir: Path | None = None, expected_mxc_ref: str | None = None) -
 def apply_generated_document(
     expected: bytes, *, check: bool, path: Path = NOTICES_PATH
 ) -> None:
-    try:
-        current = path.read_bytes()
-    except OSError as error:
-        raise NoticeError(f"failed to read {path}") from error
     if check:
+        try:
+            current = path.read_bytes()
+        except OSError as error:
+            raise NoticeError(f"failed to read {path}") from error
         if current != expected:
             raise NoticeError(
                 "THIRD_PARTY_NOTICES.md is stale; run "

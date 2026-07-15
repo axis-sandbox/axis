@@ -30,7 +30,7 @@ from bounded_tar import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+LEGAL_FILES = ("LICENSE",)
 MAX_COMPRESSED_ARCHIVE_SIZE = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_ARCHIVE_MEMBER_SIZE = 128 * 1024 * 1024
@@ -60,6 +60,8 @@ WINDOWS_RESERVED_NAMES = {
 }
 PACKAGE_CONVERTER_TIMEOUT_SECONDS = 120
 MAX_PACKAGE_CONVERTER_ERROR_SIZE = 64 * 1024
+TRUSTED_PACKAGE_TOOL_DIRS = (Path("/usr/bin"), Path("/bin"))
+TRUSTED_PACKAGE_TOOLS = frozenset({"dpkg-deb", "rpm2archive"})
 
 
 class ArchiveError(RuntimeError):
@@ -889,6 +891,39 @@ def extract_converter_output(
             safe_extract_newc(archive, destination)
 
 
+def trusted_package_tool(name: str) -> Path:
+    def has_trusted_parents(path: Path) -> bool:
+        for parent in path.parents:
+            try:
+                metadata = parent.stat()
+            except OSError:
+                return False
+            if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                return False
+        return True
+
+    if name not in TRUSTED_PACKAGE_TOOLS:
+        raise ArchiveError(f"unsupported package converter: {name}")
+    for directory in TRUSTED_PACKAGE_TOOL_DIRS:
+        candidate = directory / name
+        try:
+            resolved = candidate.resolve(strict=True)
+            metadata = resolved.stat()
+        except OSError:
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+            or not os.access(resolved, os.X_OK)
+            or not has_trusted_parents(candidate)
+            or not has_trusted_parents(resolved)
+        ):
+            continue
+        return resolved
+    raise ArchiveError(f"trusted system package converter is required: {name}")
+
+
 def extraction_main(arguments: list[str]) -> int:
     mode = arguments[0]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -907,7 +942,9 @@ def converter_main(arguments: list[str]) -> int:
     if len(arguments) < 3:
         raise ArchiveError("package converter command is required")
     archive_kind = "tar" if mode == "--extract-command-tar" else "newc"
-    extract_converter_output(archive_kind, Path(arguments[1]), arguments[2:])
+    tool = trusted_package_tool(arguments[2])
+    command = [str(tool), *arguments[3:]]
+    extract_converter_output(archive_kind, Path(arguments[1]), command)
     return 0
 
 

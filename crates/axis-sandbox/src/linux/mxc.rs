@@ -99,7 +99,7 @@ pub enum MxcTranslationError {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MxcExecutorError {
-    #[error("no safe MXC executor found in stable install locations or PATH")]
+    #[error("no safe MXC executor found in eligible install locations")]
     Unavailable,
 
     #[error("unsafe MXC executor candidate '{}': {reason}", path.display())]
@@ -158,6 +158,8 @@ pub struct MxcExecutionSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcExecutor {
     path: PathBuf,
+    #[cfg(test)]
+    injected_script: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,9 +167,36 @@ struct MxcSeccompLauncher {
     path: PathBuf,
 }
 
+#[cfg(test)]
+fn injected_executor_script_path(path: &Path) -> PathBuf {
+    path.with_extension("axis-test-script")
+}
+
 impl MxcExecutor {
     pub fn resolve() -> Result<Self, MxcExecutorError> {
         Self::resolve_from_candidates(production_executor_candidates())
+    }
+
+    fn resolve_for_helper_launch() -> Result<Self, MxcExecutorError> {
+        for candidate in helper_executor_candidates() {
+            if let Ok(executor) = Self::from_helper_path(candidate) {
+                return Ok(executor);
+            }
+        }
+        Err(MxcExecutorError::Unavailable)
+    }
+
+    fn from_helper_path<P>(path: P) -> Result<Self, MxcExecutorError>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        validate_executor_path(&path, ExecutorPathMode::PrivilegedHelper)?;
+        Ok(Self {
+            path,
+            #[cfg(test)]
+            injected_script: None,
+        })
     }
 
     pub fn resolve_from_candidates<I, P>(candidates: I) -> Result<Self, MxcExecutorError>
@@ -190,7 +219,11 @@ impl MxcExecutor {
     {
         let path = path.into();
         validate_executor_path(&path, ExecutorPathMode::Production)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            #[cfg(test)]
+            injected_script: None,
+        })
     }
 
     #[cfg(test)]
@@ -200,7 +233,12 @@ impl MxcExecutor {
     {
         let path = path.into();
         validate_executor_path(&path, ExecutorPathMode::TestInjected)?;
-        Ok(Self { path })
+        let script = injected_executor_script_path(&path);
+        let injected_script = script.is_file().then_some(script);
+        Ok(Self {
+            path,
+            injected_script,
+        })
     }
 
     #[cfg(test)]
@@ -220,6 +258,21 @@ impl MxcExecutor {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn command(&self) -> Command {
+        #[cfg(test)]
+        {
+            let mut command = Command::new(&self.path);
+            if let Some(script) = &self.injected_script {
+                command.arg(script);
+            }
+            command
+        }
+        #[cfg(not(test))]
+        {
+            Command::new(&self.path)
+        }
     }
 
     pub fn dry_run(
@@ -249,7 +302,7 @@ impl MxcExecutor {
             .try_clone()
             .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
 
-        let mut command = Command::new(&self.path);
+        let mut command = self.command();
         command
             .arg("--experimental")
             .arg("--dry-run")
@@ -724,8 +777,13 @@ impl MxcLinuxSandbox {
         })?;
         Self::new_with_resolvers(
             config,
-            || {
-                MxcExecutor::resolve().map_err(|err| {
+            |helper_launch| {
+                let executor = if helper_launch {
+                    MxcExecutor::resolve_for_helper_launch()
+                } else {
+                    MxcExecutor::resolve()
+                };
+                executor.map_err(|err| {
                     SandboxError::IsolationFailed(format!("MXC Linux executor unavailable: {err}"))
                 })
             },
@@ -749,7 +807,7 @@ impl MxcLinuxSandbox {
     ) -> Result<Self, SandboxError> {
         Self::new_with_resolvers(
             config,
-            || Ok(executor),
+            |_| Ok(executor),
             || Ok(seccomp_launcher),
             || Ok(no_proxy_network_strategy()),
             || Ok(no_resource_limits_strategy()),
@@ -765,7 +823,7 @@ impl MxcLinuxSandbox {
     ) -> Result<Self, SandboxError> {
         Self::new_with_resolvers(
             config,
-            || Ok(executor),
+            |_| Ok(executor),
             || Ok(seccomp_launcher),
             || Ok(no_proxy_network_strategy()),
             || Ok(resource_strategy),
@@ -783,7 +841,7 @@ impl MxcLinuxSandbox {
     ) -> Result<Self, SandboxError> {
         Self::new_with_resolvers(
             config,
-            || Ok(executor),
+            |_| Ok(executor),
             || Ok(seccomp_launcher),
             || Ok((network_strategy, proxy_strategy)),
             || Ok(resource_strategy),
@@ -800,7 +858,7 @@ impl MxcLinuxSandbox {
     ) -> Result<Self, SandboxError> {
         Self::new_with_spec_builder(
             config,
-            || Ok(executor),
+            |_| Ok(executor),
             || Ok(seccomp_launcher),
             || Ok(no_proxy_network_strategy()),
             || Ok(no_resource_limits_strategy()),
@@ -818,7 +876,7 @@ impl MxcLinuxSandbox {
         resolve_resources: I,
     ) -> Result<Self, SandboxError>
     where
-        F: FnOnce() -> Result<MxcExecutor, SandboxError>,
+        F: FnOnce(bool) -> Result<MxcExecutor, SandboxError>,
         G: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
         H: FnOnce() -> Result<
             (
@@ -850,7 +908,7 @@ impl MxcLinuxSandbox {
         build_spec: J,
     ) -> Result<Self, SandboxError>
     where
-        F: FnOnce() -> Result<MxcExecutor, SandboxError>,
+        F: FnOnce(bool) -> Result<MxcExecutor, SandboxError>,
         G: FnOnce() -> Result<MxcSeccompLauncher, SandboxError>,
         H: FnOnce() -> Result<
             (
@@ -980,16 +1038,15 @@ impl MxcLinuxSandbox {
                 append_cleanup_failure(err, cleanup_error)
             })?;
         }
-        let executor = crate::sandbox::record_startup_result(
-            &trace,
-            "backend.preflight.executor",
-            resolve_executor,
-        )
-        .map_err(|err| {
-            let cleanup_error =
-                cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
-            append_cleanup_failure(err, cleanup_error)
-        })?;
+        let executor =
+            crate::sandbox::record_startup_result(&trace, "backend.preflight.executor", || {
+                resolve_executor(network_requires_helper_executor(&network_strategy))
+            })
+            .map_err(|err| {
+                let cleanup_error =
+                    cleanup_tmpdir_on_setup_failure(&config.workspace_dir, tmpdir_active);
+                append_cleanup_failure(err, cleanup_error)
+            })?;
         let allowed_proxy_env = allowed_proxy_env(&proxy_strategy);
         if config.backend_preflight == BackendPreflight::DryRun {
             crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_dry_run", || {
@@ -1319,6 +1376,16 @@ fn validate_mxc_network_strategy(
         super::strategy::ProxyNetworkSetup::IpNetnsWithCapNetAdmin => Ok(()),
         super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch => Ok(()),
     }
+}
+
+fn network_requires_helper_executor(network: &super::strategy::NetworkStrategy) -> bool {
+    matches!(
+        network,
+        super::strategy::NetworkStrategy::Proxy {
+            setup: super::strategy::ProxyNetworkSetup::AxisNetnsHelperLaunch,
+            ..
+        }
+    )
 }
 
 fn validate_mxc_linux_capability_plan(
@@ -1683,7 +1750,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             None
         };
 
-        let mut command = Command::new(self.executor.path());
+        let mut command = self.executor.command();
         command
             .arg("--experimental")
             .arg("--config")
@@ -3451,6 +3518,12 @@ fn production_executor_candidates() -> Vec<PathBuf> {
     production_executor_candidates_for_path(std::env::var_os("PATH").as_deref())
 }
 
+fn helper_executor_candidates() -> impl Iterator<Item = PathBuf> {
+    MXC_EXECUTOR_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(MXC_EXECUTOR_NAME))
+}
+
 fn production_executor_candidates_for_path(path: Option<&OsStr>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
@@ -3537,6 +3610,7 @@ fn push_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, ca
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutorPathMode {
     Production,
+    PrivilegedHelper,
     #[allow(dead_code)]
     TestInjected,
 }
@@ -3581,11 +3655,22 @@ fn validate_safe_executable_path(
         let injected_sticky_ancestor = current != path
             && metadata.is_dir()
             && allows_sticky_writable_ancestor(mode_bits, validation_mode);
-        if current != Path::new("/") && uid != 0 && uid != trusted_uid && !injected_sticky_ancestor
+        if current != Path::new("/")
+            && !executor_component_owner_allowed(
+                uid,
+                trusted_uid,
+                injected_sticky_ancestor,
+                validation_mode,
+            )
         {
+            let required_owner = if matches!(validation_mode, ExecutorPathMode::PrivilegedHelper) {
+                "root"
+            } else {
+                "root or the current user"
+            };
             return Err(format!(
-                "path component '{}' is not owned by root or the current user",
-                current.display()
+                "path component '{}' is not owned by {required_owner}",
+                current.display(),
             ));
         }
 
@@ -3618,6 +3703,20 @@ fn validate_safe_executable_path(
     }
 
     Ok(())
+}
+
+fn executor_component_owner_allowed(
+    uid: u32,
+    trusted_uid: u32,
+    injected_sticky_ancestor: bool,
+    validation_mode: ExecutorPathMode,
+) -> bool {
+    match validation_mode {
+        ExecutorPathMode::PrivilegedHelper => uid == 0,
+        ExecutorPathMode::Production | ExecutorPathMode::TestInjected => {
+            uid == 0 || uid == trusted_uid || injected_sticky_ancestor
+        }
+    }
 }
 
 fn allows_sticky_writable_ancestor(mode_bits: u32, validation_mode: ExecutorPathMode) -> bool {
@@ -5008,6 +5107,12 @@ mod tests {
         let executor = MxcExecutor::from_injected_path(&executable).unwrap();
 
         assert_eq!(executor.path(), executable);
+        let command = executor.command();
+        assert_eq!(command.get_program(), &*executable);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [&*injected_executor_script_path(&executable)]
+        );
     }
 
     #[test]
@@ -5044,6 +5149,42 @@ mod tests {
         write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o700);
 
         assert_unsafe_candidate(&executable, "group- or world-writable");
+    }
+
+    #[test]
+    fn helper_executor_owner_policy_requires_root_for_every_component() {
+        let user_uid = 1000;
+
+        assert!(executor_component_owner_allowed(
+            0,
+            user_uid,
+            false,
+            ExecutorPathMode::PrivilegedHelper
+        ));
+        assert!(!executor_component_owner_allowed(
+            user_uid,
+            user_uid,
+            false,
+            ExecutorPathMode::PrivilegedHelper
+        ));
+        assert!(!executor_component_owner_allowed(
+            user_uid,
+            user_uid,
+            true,
+            ExecutorPathMode::PrivilegedHelper
+        ));
+        assert!(executor_component_owner_allowed(
+            user_uid,
+            user_uid,
+            false,
+            ExecutorPathMode::Production
+        ));
+        assert!(executor_component_owner_allowed(
+            user_uid,
+            2000,
+            true,
+            ExecutorPathMode::TestInjected
+        ));
     }
 
     #[test]
@@ -5101,6 +5242,17 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn helper_executor_candidates_use_only_stable_install_locations() {
+        let candidates = helper_executor_candidates().collect::<Vec<_>>();
+        let expected = MXC_EXECUTOR_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join(MXC_EXECUTOR_NAME))
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, expected);
     }
 
     #[test]
@@ -5831,7 +5983,7 @@ mod tests {
 
         let result = MxcLinuxSandbox::new_with_resolvers(
             &config,
-            || panic!("executor must not be resolved after seccomp preparation failure"),
+            |_| panic!("executor must not be resolved after seccomp preparation failure"),
             || panic!("launcher must not be resolved after seccomp preparation failure"),
             || Ok(no_proxy_network_strategy()),
             || Ok(no_resource_limits_strategy()),
@@ -5865,7 +6017,7 @@ mod tests {
 
         let result = MxcLinuxSandbox::new_with_resolvers(
             &config,
-            || panic!("executor must not be resolved when seccomp support path is denied"),
+            |_| panic!("executor must not be resolved when seccomp support path is denied"),
             || Ok(launcher),
             || Ok(no_proxy_network_strategy()),
             || Ok(no_resource_limits_strategy()),
@@ -5892,7 +6044,7 @@ mod tests {
 
             let result = MxcLinuxSandbox::new_with_resolvers(
                 &config,
-                || panic!("executor must not be resolved after invalid run_as_user"),
+                |_| panic!("executor must not be resolved after invalid run_as_user"),
                 || panic!("seccomp launcher must not be resolved after invalid run_as_user"),
                 || panic!("network strategy must not be resolved after invalid run_as_user"),
                 || panic!("resource strategy must not be resolved after invalid run_as_user"),
@@ -7775,7 +7927,7 @@ mod tests {
             "AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires a working python3"
         );
 
-        let executor = MxcExecutor::resolve().unwrap_or_else(|err| {
+        let executor = MxcExecutor::resolve_for_helper_launch().unwrap_or_else(|err| {
             panic!("AXIS_TEST_MXC_NETNS_HELPER_LAUNCH=1 requires lxc-exec: {err}")
         });
         assert!(
@@ -8193,6 +8345,25 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
         )
     }
 
+    #[test]
+    fn helper_network_selects_helper_compatible_executor_resolution() {
+        let id = SandboxId::new();
+        let (native, _) = native_mxc_proxy_strategies(id, 3128);
+        let (helper, _) = helper_mxc_proxy_strategies(id, 3128);
+
+        assert!(!network_requires_helper_executor(&native));
+        assert!(network_requires_helper_executor(&helper));
+        assert!(!network_requires_helper_executor(
+            &strategy::NetworkStrategy::AllowHost
+        ));
+        assert!(!network_requires_helper_executor(
+            &strategy::NetworkStrategy::BlockedBySeccomp
+        ));
+        assert!(!network_requires_helper_executor(
+            &strategy::NetworkStrategy::BlockedByBubblewrap
+        ));
+    }
+
     fn test_mxc_executor_from_env(path: Option<OsString>) -> Result<MxcExecutor, MxcExecutorError> {
         match path {
             Some(path) => MxcExecutor::from_injected_path(PathBuf::from(path)),
@@ -8409,15 +8580,29 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
     }
 
     fn write_executable(path: &Path, script: &str, mode: u32) {
-        let parent = path.parent().expect("test executable should have a parent");
-        let mut file = tempfile::NamedTempFile::new_in(parent).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        file.flush().unwrap();
-        file.as_file()
-            .set_permissions(fs::Permissions::from_mode(mode))
+        if path.file_name() == Some(OsStr::new("lxc-exec"))
+            && script.starts_with("#!/bin/sh\n")
+            && mode & 0o111 != 0
+            && mode & 0o022 == 0
+        {
+            write_file(&injected_executor_script_path(path), script, 0o600);
+            fs::copy("/bin/sh", path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            return;
+        }
+        write_file(path, script, mode);
+    }
+
+    fn write_file(path: &Path, contents: &str, mode: u32) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
             .unwrap();
-        let persisted = file.persist(path).unwrap();
-        drop(persisted);
+        file.write_all(contents.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn fake_seccomp_launcher(root: &tempfile::TempDir) -> MxcSeccompLauncher {

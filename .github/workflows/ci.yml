@@ -114,6 +114,13 @@ jobs:
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
           sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap python3 rpm
+          if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-apparmor-userns"
+            sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
 
       - name: Build
         run: cargo build --locked --release
@@ -129,6 +136,9 @@ jobs:
 
       - name: Security Tier 0/1 tests
         run: bash scripts/test_security_tier0.sh
+
+      - name: Release tooling tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Unit & integration tests
         run: cargo test --locked
@@ -158,7 +168,7 @@ jobs:
           cp target/release/lxc-exec target/release/axis-seccomp-launcher \
             target/release/axis-netns-helper dist/axis-linux-x86_64/
           cp policies/*.yaml dist/axis-linux-x86_64/
-          cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/axis-linux-x86_64/
+          cp README.md LICENSE dist/axis-linux-x86_64/
           tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner \
             -cf - -C dist axis-linux-x86_64 | gzip -n > dist/axis-linux-x86_64.tar.gz
           (cd dist && sha256sum axis-linux-x86_64.tar.gz > axis-linux-x86_64.tar.gz.sha256)
@@ -186,6 +196,15 @@ jobs:
           rpm_path="$(find target/generate-rpm -name '*.rpm' -print -quit)"
           test -n "$rpm_path"
           scripts/verify_linux_package_manifest.sh rpm "$rpm_path"
+
+      - name: Restore Linux user namespace restriction
+        if: ${{ always() }}
+        run: |
+          state="$RUNNER_TEMP/axis-apparmor-userns"
+          if [ -f "$state" ]; then
+            sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi
 
       - name: Success metrics
         run: ./target/release/success-metrics
@@ -232,7 +251,7 @@ jobs:
           mkdir -p "$package_dir"
           cp target/release/axis target/release/axisd "$package_dir/"
           cp policies/*.yaml "$package_dir/"
-          cp README.md LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          cp README.md LICENSE "$package_dir/"
           find "$package_dir" -exec touch -t 198001010000 {} +
           cd dist
           COPYFILE_DISABLE=1 find axis-macos-aarch64 -print | LC_ALL=C sort | \
@@ -270,7 +289,15 @@ jobs:
               -o Acquire::https::Timeout=20 update
           timeout --kill-after=10s 200s sudo -n timeout --kill-after=10s 180s \
             apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y \
-              bubblewrap iproute2 iptables python3
+              bubblewrap iproute2 iptables libcap2-bin python3
+          if ! timeout --kill-after=1s 5s bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(timeout --kill-after=1s 5s sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-netns-helper-apparmor-userns"
+            timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          timeout --kill-after=1s 5s \
+            bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
 
       - name: Build MXC Linux executor
         timeout-minutes: 15
@@ -289,11 +316,11 @@ jobs:
           AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E: "1"
           AXIS_REQUIRE_KMSG_AUDIT_E2E: "1"
           AXIS_PROVISION_KMSG_AUDIT_E2E: "1"
-          AXIS_EXPECT_MXC_EXECUTOR: /usr/local/bin/lxc-exec
+          AXIS_EXPECT_MXC_EXECUTOR: /usr/bin/lxc-exec
           AXIS_MXC_EXECUTOR_BUILD: ${{ github.workspace }}/target/release/lxc-exec
         run: |
           bash e2e/linux/test_netns_helper_launch.sh --self-test
-          executor=/usr/local/bin/lxc-exec
+          executor=/usr/bin/lxc-exec
           ci_bounded_sudo() {
             timeout --kill-after=1s 7s sudo -n \
               timeout --kill-after=1s 5s "$@"
@@ -319,6 +346,16 @@ jobs:
             exit "$status"
           fi
           bash e2e/linux/test_netns_helper_launch.sh
+
+      - name: Restore helper user namespace restriction
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          state="$RUNNER_TEMP/axis-netns-helper-apparmor-userns"
+          if [ -f "$state" ]; then
+            timeout --kill-after=1s 7s sudo -n timeout --kill-after=1s 5s sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi
 
   test-windows:
     name: Test (Windows native)
@@ -354,7 +391,7 @@ jobs:
           New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
           Copy-Item target\release\axis.exe,target\release\axisd.exe $packageRoot
           Copy-Item policies\*.yaml $packageRoot
-          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md,install.ps1 $packageRoot
+          Copy-Item README.md,LICENSE,install.ps1 $packageRoot
 
           $archive = Join-Path $env:RUNNER_TEMP "axis-windows-x86_64.zip"
           $zip = [System.IO.Compression.ZipFile]::Open(

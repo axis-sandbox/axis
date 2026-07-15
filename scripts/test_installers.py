@@ -152,6 +152,8 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertIn("AssignProcessToJobObject", source)
         self.assertIn("TerminateJobObject", source)
         self.assertIn("Task.WhenAll(stdoutTask, stderrTask)", source)
+        self.assertEqual(source.count("FileAccess.Read, 65536, false"), 2)
+        self.assertNotIn("FileAccess.Read, 65536, true", source)
         self.assertNotIn("$Process.Kill", source)
         self.assertNotIn("taskkill.exe", source)
 

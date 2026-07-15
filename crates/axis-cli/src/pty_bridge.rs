@@ -64,6 +64,14 @@ fn open_pty() -> Result<PtyFiles> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    #[cfg(target_vendor = "apple")]
+    let mut size = size;
+
+    #[cfg(target_vendor = "apple")]
+    let size_ptr: *mut libc::winsize = &mut size;
+    #[cfg(not(target_vendor = "apple"))]
+    let size_ptr: *const libc::winsize = &size;
+
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let result = unsafe {
@@ -72,7 +80,7 @@ fn open_pty() -> Result<PtyFiles> {
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &size,
+            size_ptr,
         )
     };
     if result < 0 {

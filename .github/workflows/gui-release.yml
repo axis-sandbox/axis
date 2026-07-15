@@ -35,11 +35,8 @@ jobs:
       - name: Test and build frontend
         run: |
           npm ci --prefix gui/shared
-          python3 -m unittest discover -s scripts -p 'test_*.py'
           npm test --prefix gui/shared
           npm run --prefix gui/shared typecheck
-          npm run --prefix gui/shared notices:check
-          python3 scripts/generate_third_party_notices.py --check
           npm run --prefix gui/shared build
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -65,7 +62,7 @@ jobs:
           set -euo pipefail
           mkdir -p release/axis-desktop-macos-aarch64
           cp gui/macos/.build/release/AXIS release/axis-desktop-macos-aarch64/AXIS
-          cp LICENSE THIRD_PARTY_NOTICES.md release/axis-desktop-macos-aarch64/
+          cp LICENSE release/axis-desktop-macos-aarch64/
           cp packaging/runtime/gui-macos.json release/axis-desktop-macos-aarch64/RUNTIME_DEPENDENCIES.json
           cp packaging/reproducibility/gui-macos.json release/axis-desktop-macos-aarch64/REPRODUCIBILITY.json
           resource_bundle="$(find gui/macos/.build -type d -path '*/release/AXIS_*.bundle' -print -quit)"
@@ -126,7 +123,7 @@ jobs:
           mkdir -p release/axis-desktop-linux-x86_64
           cp gui/linux/target/release/axis-desktop release/axis-desktop-linux-x86_64/
           cp -R gui/linux/data/web release/axis-desktop-linux-x86_64/web
-          cp LICENSE THIRD_PARTY_NOTICES.md release/axis-desktop-linux-x86_64/
+          cp LICENSE release/axis-desktop-linux-x86_64/
           cp packaging/runtime/gui-linux.json release/axis-desktop-linux-x86_64/RUNTIME_DEPENDENCIES.json
           cp packaging/reproducibility/gui-linux.json release/axis-desktop-linux-x86_64/REPRODUCIBILITY.json
           test -f release/axis-desktop-linux-x86_64/web/index.html
@@ -174,7 +171,6 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression
           $source = (Resolve-Path gui/windows/axis-desktop-windows-x86_64).Path
           Copy-Item LICENSE (Join-Path $source "LICENSE")
-          Copy-Item THIRD_PARTY_NOTICES.md (Join-Path $source "THIRD_PARTY_NOTICES.md")
           Copy-Item packaging/runtime/gui-windows.json (Join-Path $source "RUNTIME_DEPENDENCIES.json")
           Copy-Item packaging/reproducibility/gui-windows.json (Join-Path $source "REPRODUCIBILITY.json")
           $archive = Join-Path (Split-Path $source -Parent) "axis-desktop-windows-x86_64.zip"

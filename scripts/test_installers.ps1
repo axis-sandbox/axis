@@ -20,8 +20,18 @@ function Assert-InstallFails {
     $env:AXIS_INSTALL_ARCHIVE = $TestArchive
     $env:AXIS_INSTALL_SHA256 = $TestChecksum
     $env:AXIS_DIR = Join-Path $env:RUNNER_TEMP $InstallName
-    $output = & pwsh -NoLogo -NoProfile -File .\install.ps1 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) {
+    $savedErrorActionPreference = $ErrorActionPreference
+    $savedNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & pwsh -NoLogo -NoProfile -File .\install.ps1 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $savedNativeErrorPreference
+    }
+    if ($exitCode -eq 0) {
         throw "installer unexpectedly accepted $InstallName"
     }
     if ($output -notmatch [regex]::Escape($ExpectedError)) {
@@ -46,3 +56,5 @@ $originalHash = (Get-FileHash -LiteralPath $tampered -Algorithm SHA256).Hash.ToL
 Set-Content -LiteralPath "$tampered.sha256" -NoNewline -Value "$originalHash  $([System.IO.Path]::GetFileName($tampered))`n"
 [System.IO.File]::AppendAllText($tampered, "tampered")
 Assert-InstallFails $tampered "$tampered.sha256" "Checksum verification failed" "axis-tampered"
+
+$global:LASTEXITCODE = 0

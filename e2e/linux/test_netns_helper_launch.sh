@@ -7,7 +7,7 @@
 # This is intentionally an ephemeral-runner harness, not a local developer
 # install path. It mutates /usr/libexec/axis only after an explicit opt-in so
 # ordinary repo tests never depend on a host setuid helper.
-# shellcheck disable=SC2317 # Callback functions are invoked indirectly by name.
+# shellcheck disable=SC2317,SC2329 # Callback functions are invoked indirectly by name.
 set -euo pipefail
 
 run_preflight_namespace_state_machine() {
@@ -27,6 +27,7 @@ run_preflight_namespace_state_machine() {
             return "$status"
         fi
     fi
+    status=0
     "$add_fn" "$namespace" || return $?
     "$configure_fn" "$namespace" || status=$?
     if ! "$delete_fn" "$namespace"; then
@@ -46,6 +47,215 @@ kmsg_gate_status() {
         return 1
     fi
     return 77
+}
+
+install_kmsg_capability_binary() {
+    local source_binary="$1"
+    local installed_binary="$2"
+    local collision_check_fn="$3"
+    local install_fn="$4"
+    local grant_fn="$5"
+    local inspect_fn="$6"
+    local installed_capabilities=""
+    local expected_capabilities="${installed_binary} cap_dac_read_search,cap_syslog=ep"
+
+    "$collision_check_fn" "$installed_binary" || return $?
+    KMSG_AXISD_INSTALL="$installed_binary"
+    "$install_fn" "$source_binary" "$installed_binary"
+    KMSG_CAPABILITY_INSTALLED=1
+    "$grant_fn" "$installed_binary"
+    installed_capabilities="$("$inspect_fn" "$installed_binary")"
+    if [ "$installed_capabilities" != "$expected_capabilities" ]; then
+        echo "ERROR: temporary axisd kmsg capabilities do not match: $installed_capabilities" >&2
+        return 1
+    fi
+}
+
+cleanup_kmsg_capability_binary() {
+    local revoke_fn="$1"
+    local remove_fn="$2"
+    local status=0
+
+    if [ "$KMSG_CAPABILITY_INSTALLED" -eq 1 ]; then
+        if ! "$revoke_fn" "$KMSG_AXISD_INSTALL"; then
+            echo "ERROR: failed to remove temporary axisd kmsg capabilities" >&2
+            status=1
+        fi
+    fi
+    if [ -n "$KMSG_AXISD_INSTALL" ]; then
+        if ! "$remove_fn" "$KMSG_AXISD_INSTALL"; then
+            echo "ERROR: failed to remove temporary axisd kmsg support executables" >&2
+            status=1
+        fi
+    fi
+    return "$status"
+}
+
+reject_kmsg_bundle_collisions() {
+    local axisd_path="$1"
+    local launcher_path="$2"
+    local collision_check_fn="$3"
+
+    "$collision_check_fn" "$axisd_path" "kmsg-enabled axisd" || return $?
+    "$collision_check_fn" "$launcher_path" "axis seccomp launcher" || return $?
+}
+
+audit_log_contains_matching_bypass() {
+    local log_path="$1"
+    local sandbox_id="$2"
+    local destination_port="$3"
+    python3 - "$log_path" "$sandbox_id" "$destination_port" <<'PY'
+import json
+import pathlib
+import sys
+
+log_path = pathlib.Path(sys.argv[1])
+sandbox_id = sys.argv[2]
+destination_port = int(sys.argv[3])
+try:
+    lines = log_path.read_text().splitlines()
+except (FileNotFoundError, OSError):
+    raise SystemExit(1)
+
+for line in lines:
+    try:
+        envelope = json.loads(line)
+        if envelope.get("target") != "axis::audit":
+            continue
+        event = json.loads(envelope.get("fields", {}).get("message", ""))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        continue
+    details = event.get("details")
+    if (
+        event.get("category") == "security_finding"
+        and event.get("sandbox_id") == sandbox_id
+        and isinstance(event.get("message"), str)
+        and event["message"].startswith("network bypass attempt to ")
+        and isinstance(details, dict)
+        and details.get("destination_port") == destination_port
+    ):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+lifecycle_resources_absent() {
+    local state_path="$1"
+    local namespace="$2"
+    local veth_name="$3"
+    local state_exists_fn="${4:-helper_state_exists}"
+    local namespace_exists_fn="${5:-namespace_exists}"
+    local veth_exists_fn="${6:-host_veth_exists}"
+    local status=0
+
+    "$state_exists_fn" "$state_path" || status=$?
+    if [ "$status" -eq 0 ]; then
+        return 1
+    elif [ "$status" -ne 1 ]; then
+        return 2
+    fi
+    status=0
+    "$namespace_exists_fn" "$namespace" || status=$?
+    if [ "$status" -eq 0 ]; then
+        return 1
+    elif [ "$status" -ne 1 ]; then
+        return 2
+    fi
+    status=0
+    "$veth_exists_fn" "$veth_name" || status=$?
+    if [ "$status" -eq 0 ]; then
+        return 1
+    elif [ "$status" -ne 1 ]; then
+        return 2
+    fi
+    return 0
+}
+
+wait_for_lifecycle_resources_absent() {
+    local state_path="$1"
+    local namespace="$2"
+    local veth_name="$3"
+    local attempts="${4:-20}"
+    local status=0
+
+    for _ in $(seq 1 "$attempts"); do
+        status=0
+        lifecycle_resources_absent "$state_path" "$namespace" "$veth_name" || status=$?
+        if [ "$status" -eq 0 ]; then
+            return 0
+        elif [ "$status" -ne 1 ]; then
+            return "$status"
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+read_helper_destroy_token() {
+    # shellcheck disable=SC2016 # The awk field expression is literal.
+    bounded_sudo 2 awk 'NR == 2 { print $1 }' "$1"
+}
+
+destroy_helper_with_token() {
+    bounded 5 "$HELPER_INSTALL" destroy-token "$1" "$2"
+}
+
+cleanup_lifecycle_resources() {
+    local sandbox_id="$1"
+    local namespace="$2"
+    local veth_name="$3"
+    local wait_fn="${4:-wait_for_lifecycle_resources_absent}"
+    local state_exists_fn="${5:-helper_state_exists}"
+    local read_token_fn="${6:-read_helper_destroy_token}"
+    local destroy_fn="${7:-destroy_helper_with_token}"
+    local state_path="/run/axis/netns/${sandbox_id}"
+    local destroy_token=""
+    local status=0
+
+    "$wait_fn" "$state_path" "$namespace" "$veth_name" || status=$?
+    if [ "$status" -eq 0 ]; then
+        return 0
+    elif [ "$status" -ne 1 ]; then
+        return 2
+    fi
+
+    status=0
+    "$state_exists_fn" "$state_path" || status=$?
+    if [ "$status" -eq 1 ]; then
+        status=0
+        "$wait_fn" "$state_path" "$namespace" "$veth_name" || status=$?
+        if [ "$status" -eq 0 ]; then
+            return 0
+        elif [ "$status" -eq 1 ]; then
+            return 3
+        fi
+        return 2
+    elif [ "$status" -ne 0 ]; then
+        return 2
+    fi
+
+    status=0
+    destroy_token="$("$read_token_fn" "$state_path")" || status=$?
+    if [ "$status" -ne 0 ] || [[ ! "$destroy_token" =~ ^[[:xdigit:]]{64}$ ]]; then
+        status=0
+        "$wait_fn" "$state_path" "$namespace" "$veth_name" || status=$?
+        if [ "$status" -eq 0 ]; then
+            return 0
+        elif [ "$status" -eq 1 ]; then
+            return 4
+        fi
+        return 2
+    fi
+
+    "$destroy_fn" "$sandbox_id" "$destroy_token" >/dev/null 2>&1 || true
+    status=0
+    "$wait_fn" "$state_path" "$namespace" "$veth_name" || status=$?
+    if [ "$status" -eq 0 ]; then
+        return 0
+    elif [ "$status" -eq 1 ]; then
+        return 5
+    fi
+    return 2
 }
 
 run_rootless_harness_self_tests() {
@@ -71,6 +281,19 @@ run_rootless_harness_self_tests() {
         fake_configure fake_delete >/dev/null 2>&1 || status=$?
     if [ "$status" -ne 42 ] || [ "$delete_count" -ne 0 ]; then
         echo "ERROR: failed preflight add triggered deletion without ownership"
+        return 1
+    fi
+
+    local success_add_count=0
+    local success_delete_count=0
+    fake_success_add() { success_add_count=$((success_add_count + 1)); }
+    fake_success_delete() { success_delete_count=$((success_delete_count + 1)); }
+    status=0
+    run_preflight_namespace_state_machine success fake_absent fake_success_add \
+        fake_configure fake_success_delete >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 0 ] || [ "$success_add_count" -ne 1 ] ||
+        [ "$success_delete_count" -ne 1 ]; then
+        echo "ERROR: successful preflight retained the expected-absence status"
         return 1
     fi
 
@@ -107,7 +330,289 @@ run_rootless_harness_self_tests() {
         return 1
     fi
     kmsg_gate_status 1 1
-    echo "PASS: rootless preflight ownership and strict kmsg gate self-tests"
+
+    local capability_ops=""
+    local capability_root=""
+    local capability_source="source-axisd"
+    local capability_install="installed-axisd"
+    KMSG_AXISD_INSTALL=""
+    KMSG_CAPABILITY_INSTALLED=0
+    fake_cap_collision() { return 1; }
+    fake_cap_absent() { return 0; }
+    fake_cap_install() { capability_ops+="install:$1:$2 "; }
+    fake_cap_grant() {
+        if [ "$KMSG_AXISD_INSTALL" != "$1" ] || [ "$KMSG_CAPABILITY_INSTALLED" -ne 1 ]; then
+            return 91
+        fi
+        capability_ops+="grant:$1 "
+    }
+    fake_cap_inspect() { printf '%s cap_dac_read_search,cap_syslog=ep\n' "$1"; }
+    fake_cap_inspect_wrong() { printf '%s cap_syslog=ep\n' "$1"; }
+    fake_cap_revoke() { capability_ops+="revoke:$1 "; }
+    fake_cap_revoke_failure() {
+        capability_ops+="revoke:$1 "
+        return 1
+    }
+    fake_cap_remove() { capability_ops+="remove:$1 "; }
+    local bundle_checks=0
+    fake_bundle_collision() {
+        bundle_checks=$((bundle_checks + 1))
+        [ "$1" != "$capability_install" ]
+    }
+
+    status=0
+    reject_kmsg_bundle_collisions \
+        "$capability_install" launcher-install fake_bundle_collision || status=$?
+    if [ "$status" -ne 1 ] || [ "$bundle_checks" -ne 1 ]; then
+        echo "ERROR: kmsg bundle collision self-test discarded the first path failure"
+        return 1
+    fi
+
+    status=0
+    install_kmsg_capability_binary "$capability_source" "$capability_install" \
+        fake_cap_collision fake_cap_install fake_cap_grant fake_cap_inspect \
+        >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 1 ] || [ -n "$capability_ops" ] || [ -n "$KMSG_AXISD_INSTALL" ]; then
+        echo "ERROR: kmsg capability collision self-test modified existing state"
+        return 1
+    fi
+
+    install_kmsg_capability_binary "$capability_source" "$capability_install" \
+        fake_cap_absent fake_cap_install fake_cap_grant fake_cap_inspect
+    if [ "$capability_ops" != \
+        "install:${capability_source}:${capability_install} grant:${capability_install} " ]; then
+        echo "ERROR: kmsg capability install self-test violated operation ordering"
+        return 1
+    fi
+    cleanup_kmsg_capability_binary fake_cap_revoke fake_cap_remove
+    if [ "$capability_ops" != \
+        "install:${capability_source}:${capability_install} grant:${capability_install} revoke:${capability_install} remove:${capability_install} " ]; then
+        echo "ERROR: kmsg capability cleanup self-test did not revoke before removal"
+        return 1
+    fi
+
+    capability_ops=""
+    KMSG_AXISD_INSTALL=""
+    KMSG_CAPABILITY_INSTALLED=0
+    status=0
+    install_kmsg_capability_binary "$capability_source" "$capability_install" \
+        fake_cap_absent fake_cap_install fake_cap_grant fake_cap_inspect_wrong \
+        >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 1 ] || [ "$KMSG_CAPABILITY_INSTALLED" -ne 1 ]; then
+        echo "ERROR: kmsg capability verification self-test accepted an incomplete grant"
+        return 1
+    fi
+    status=0
+    cleanup_kmsg_capability_binary fake_cap_revoke_failure fake_cap_remove \
+        >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 1 ] || [[ "$capability_ops" != *"remove:${capability_install} " ]]; then
+        echo "ERROR: kmsg capability cleanup self-test hid revocation failure or skipped removal"
+        return 1
+    fi
+
+    capability_root="$(mktemp -d)"
+    python3 - "$capability_root/audit.log" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+events = [
+    {
+        "target": "axis::audit",
+        "fields": {"message": json.dumps({
+            "category": "security_finding",
+            "sandbox_id": "wrong-sandbox",
+            "message": "network bypass attempt to 10.0.0.1:443 rejected by firewall",
+            "details": {"destination_port": 443},
+        })},
+    },
+    {
+        "target": "axis::audit",
+        "fields": {"message": json.dumps({
+            "category": "sandbox_lifecycle",
+            "sandbox_id": "expected-sandbox",
+            "message": "sandbox created",
+            "details": {},
+        })},
+    },
+    {"target": "axisd", "fields": {"message": "probe destination port 443"}},
+]
+path.write_text("".join(json.dumps(event) + "\n" for event in events))
+PY
+    if audit_log_contains_matching_bypass \
+        "$capability_root/audit.log" expected-sandbox 443; then
+        echo "ERROR: structured bypass audit matcher combined unrelated log lines"
+        rm -rf "$capability_root"
+        return 1
+    fi
+    python3 - "$capability_root/audit.log" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+event = {
+    "target": "axis::audit",
+    "fields": {"message": json.dumps({
+        "category": "security_finding",
+        "sandbox_id": "expected-sandbox",
+        "message": "network bypass attempt to 10.0.0.1:443 rejected by firewall",
+        "details": {"destination_port": 443},
+    })},
+}
+with path.open("a") as output:
+    output.write(json.dumps(event) + "\n")
+PY
+    if ! audit_log_contains_matching_bypass \
+        "$capability_root/audit.log" expected-sandbox 443; then
+        echo "ERROR: structured bypass audit matcher rejected an exact record"
+        rm -rf "$capability_root"
+        return 1
+    fi
+    rm -rf "$capability_root"
+
+    fake_present() { return 0; }
+    fake_unknown() { return 2; }
+    lifecycle_resources_absent state namespace veth fake_absent fake_absent fake_absent
+    status=0
+    lifecycle_resources_absent state namespace veth fake_present fake_absent fake_absent || status=$?
+    if [ "$status" -ne 1 ]; then
+        echo "ERROR: lifecycle cleanup self-test accepted surviving state"
+        return 1
+    fi
+    status=0
+    lifecycle_resources_absent state namespace veth fake_absent fake_present fake_absent || status=$?
+    if [ "$status" -ne 1 ]; then
+        echo "ERROR: lifecycle cleanup self-test accepted a surviving namespace"
+        return 1
+    fi
+    status=0
+    lifecycle_resources_absent state namespace veth fake_absent fake_absent fake_present || status=$?
+    if [ "$status" -ne 1 ]; then
+        echo "ERROR: lifecycle cleanup self-test accepted a surviving veth"
+        return 1
+    fi
+    status=0
+    lifecycle_resources_absent state namespace veth fake_unknown fake_absent fake_absent || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "ERROR: lifecycle cleanup self-test hid a probe failure"
+        return 1
+    fi
+
+    local -a wait_statuses=()
+    local wait_index=0
+    local destroy_count=0
+    fake_wait() {
+        local result="${wait_statuses[$wait_index]}"
+        wait_index=$((wait_index + 1))
+        return "$result"
+    }
+    fake_token() { printf '%064d\n' 0; }
+    fake_malformed_token() { printf 'invalid\n'; }
+    fake_token_failure() { return 42; }
+    fake_destroy() { destroy_count=$((destroy_count + 1)); }
+    fake_destroy_failure() {
+        destroy_count=$((destroy_count + 1))
+        return 43
+    }
+
+    wait_statuses=(0)
+    wait_index=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_unknown fake_token fake_destroy
+    if [ "$wait_index" -ne 1 ] || [ "$destroy_count" -ne 0 ]; then
+        echo "ERROR: completed lifecycle cleanup performed unnecessary authentication"
+        return 1
+    fi
+    wait_statuses=(2)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_absent fake_token fake_destroy || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "ERROR: lifecycle cleanup hid an initial resource probe failure"
+        return 1
+    fi
+    wait_statuses=(1 0)
+    wait_index=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_absent fake_token fake_destroy
+    wait_statuses=(1 1)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_absent fake_token fake_destroy || status=$?
+    if [ "$status" -ne 3 ]; then
+        echo "ERROR: lifecycle cleanup accepted surviving resources without helper state"
+        return 1
+    fi
+    wait_statuses=(1 2)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_absent fake_token fake_destroy || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "ERROR: lifecycle cleanup hid a missing-state confirmation failure"
+        return 1
+    fi
+    wait_statuses=(1)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_unknown fake_token fake_destroy || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "ERROR: lifecycle cleanup hid a helper state probe failure"
+        return 1
+    fi
+    for token_fn in fake_malformed_token fake_token_failure; do
+        wait_statuses=(1 0)
+        wait_index=0
+        status=0
+        cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_present "$token_fn" fake_destroy || status=$?
+        if [ "$status" -ne 0 ] || [ "$destroy_count" -ne 0 ]; then
+            echo "ERROR: lifecycle cleanup rejected concurrent completion after token read failure"
+            return 1
+        fi
+    done
+    wait_statuses=(1 1)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_present fake_malformed_token fake_destroy || status=$?
+    if [ "$status" -ne 4 ]; then
+        echo "ERROR: lifecycle cleanup accepted a malformed token while resources survived"
+        return 1
+    fi
+    wait_statuses=(1 2)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_present fake_malformed_token fake_destroy || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "ERROR: lifecycle cleanup hid a post-token resource probe failure"
+        return 1
+    fi
+    for destroy_fn in fake_destroy fake_destroy_failure; do
+        wait_statuses=(1 0)
+        wait_index=0
+        destroy_count=0
+        cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_present fake_token "$destroy_fn"
+        if [ "$destroy_count" -ne 1 ]; then
+            echo "ERROR: lifecycle cleanup did not attempt authenticated destruction exactly once"
+            return 1
+        fi
+    done
+    wait_statuses=(1 1)
+    wait_index=0
+    destroy_count=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_present fake_token fake_destroy || status=$?
+    if [ "$status" -ne 5 ] || [ "$destroy_count" -ne 1 ]; then
+        echo "ERROR: lifecycle cleanup accepted resources surviving authenticated destruction"
+        return 1
+    fi
+    wait_statuses=(1 2)
+    wait_index=0
+    status=0
+    cleanup_lifecycle_resources sandbox namespace veth fake_wait fake_present fake_token fake_destroy || status=$?
+    if [ "$status" -ne 2 ]; then
+        echo "ERROR: lifecycle cleanup hid its final resource probe failure"
+        return 1
+    fi
+    echo "PASS: rootless preflight, kmsg capability, and audit matcher self-tests"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -176,10 +681,13 @@ if [ "${AXIS_REQUIRE_NETNS_HELPER_E2E:-}" = "1" ] && [ -z "${AXIS_EXPECT_MXC_EXE
     exit 1
 fi
 expected_executor="${AXIS_EXPECT_MXC_EXECUTOR:-/usr/local/bin/lxc-exec}"
-if [ "$expected_executor" != "/usr/local/bin/lxc-exec" ]; then
-    echo "ERROR: helper proof executor must use /usr/local/bin/lxc-exec"
-    exit 1
-fi
+case "$expected_executor" in
+    /usr/local/bin/lxc-exec | /usr/bin/lxc-exec) ;;
+    *)
+        echo "ERROR: helper proof executor must use an allowed system lxc-exec path"
+        exit 1
+        ;;
+esac
 executor_build="${AXIS_MXC_EXECUTOR_BUILD:-}"
 if [ -z "$executor_build" ] || [ ! -x "$executor_build" ]; then
     echo "ERROR: AXIS_MXC_EXECUTOR_BUILD must name the locally built executable"
@@ -189,31 +697,42 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TMP_ROOT="$(mktemp -d /tmp/axis-netns-helper-e2e-XXXXXX)"
+HOST_PEER_MARKER="${REPO_ROOT}/.axis-host-peer-checked-$$"
 SERVER_PID=""
 DIRECT_SERVER_PID=""
 AXSD_PID=""
 PROXY_PROOF_PID=""
-PROXY_PROOF_START_TIME=""
 PREFLIGHT_NS=""
 PREFLIGHT_NS_CREATED=0
 HELPER_INSTALL="/usr/libexec/axis/axis-netns-helper"
+KMSG_AXISD_PATH="/usr/libexec/axis/axisd-kmsg-e2e"
+KMSG_LAUNCHER_PATH="/usr/libexec/axis/axis-seccomp-launcher"
 INSTALLED_HELPER=0
 INSTALLED_MXC_EXECUTOR=0
 CREATED_HELPER_DIR=0
-KMSG_PROVISIONED=0
-KMSG_ORIGINAL_MODE=""
-KMSG_ORIGINAL_DMESG_RESTRICT=""
+KMSG_AXISD_INSTALL=""
+KMSG_CAPABILITY_INSTALLED=0
+KMSG_LAUNCHER_INSTALL=""
+KMSG_LAUNCHER_SOURCE=""
 # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
 cleanup() {
     local original_status=$?
     local cleanup_failed=0
     set +e
-    stop_background_servers
+    if declare -F stop_background_servers >/dev/null; then
+        stop_background_servers
+    fi
     if [ -n "$AXSD_PID" ]; then
         terminate_background_process "$AXSD_PID" "axisd cleanup"
     fi
     if [ -n "$PROXY_PROOF_PID" ]; then
         terminate_background_process "$PROXY_PROOF_PID" "proxy proof cleanup"
+    fi
+    if declare -F revoke_kmsg_capabilities >/dev/null; then
+        if ! cleanup_kmsg_capability_binary \
+            revoke_kmsg_capabilities remove_kmsg_axisd; then
+            cleanup_failed=1
+        fi
     fi
     if [ "$INSTALLED_HELPER" -eq 1 ]; then
         if ! bounded_sudo 5 rm -f "$HELPER_INSTALL"; then
@@ -239,18 +758,11 @@ cleanup() {
             cleanup_failed=1
         fi
     fi
-    if [ "$KMSG_PROVISIONED" -eq 1 ]; then
-        if ! bounded_sudo 5 chmod "$KMSG_ORIGINAL_MODE" /dev/kmsg; then
-            echo "ERROR: failed to restore /dev/kmsg mode" >&2
-            cleanup_failed=1
-        fi
-        if ! bounded_sudo 5 sysctl -q -w \
-            "kernel.dmesg_restrict=${KMSG_ORIGINAL_DMESG_RESTRICT}"; then
-            echo "ERROR: failed to restore kernel.dmesg_restrict" >&2
-            cleanup_failed=1
-        fi
-    fi
     rm -f /tmp/axis-helper-lifecycle-*"$$".sock
+    if ! rm -f "$HOST_PEER_MARKER"; then
+        echo "ERROR: failed to remove host peer completion marker: $HOST_PEER_MARKER" >&2
+        cleanup_failed=1
+    fi
     if ! rm -rf "$TMP_ROOT"; then
         echo "ERROR: failed to remove helper test directory: $TMP_ROOT" >&2
         cleanup_failed=1
@@ -266,21 +778,67 @@ cleanup() {
 trap cleanup EXIT
 
 provision_kmsg_audit_source() {
-    [ -r /dev/kmsg ] && return 0
+    local axisd_binary="$1"
+    local launcher_binary="$2"
+
     [ "${AXIS_PROVISION_KMSG_AUDIT_E2E:-}" = "1" ] || return 0
-    if [ ! -e /dev/kmsg ]; then
+    if [ ! -c /dev/kmsg ]; then
         echo "ERROR: strict kmsg provisioning requires /dev/kmsg"
         return 1
     fi
-    KMSG_ORIGINAL_MODE="$(bounded_sudo 2 stat -c '%a' /dev/kmsg)"
-    KMSG_ORIGINAL_DMESG_RESTRICT="$(bounded_sudo 2 sysctl -n kernel.dmesg_restrict)"
-    KMSG_PROVISIONED=1
-    bounded_sudo 5 sysctl -q -w kernel.dmesg_restrict=0
-    bounded_sudo 5 chmod o+r /dev/kmsg
-    if [ ! -r /dev/kmsg ]; then
-        echo "ERROR: provisioned /dev/kmsg is still unreadable by the test user"
+    if ! command -v getcap >/dev/null || ! command -v setcap >/dev/null; then
+        echo "ERROR: strict kmsg provisioning requires getcap and setcap"
         return 1
     fi
+    KMSG_LAUNCHER_SOURCE="$launcher_binary"
+    install_kmsg_capability_binary "$axisd_binary" "$KMSG_AXISD_PATH" \
+        reject_kmsg_axisd_collision install_kmsg_axisd grant_kmsg_capabilities \
+        inspect_kmsg_capabilities
+}
+
+reject_kmsg_axisd_collision() {
+    reject_kmsg_bundle_collisions \
+        "$1" "$KMSG_LAUNCHER_PATH" reject_preexisting_privileged_path
+}
+
+install_kmsg_axisd() {
+    bounded_sudo 5 install -o root -g root -m 0755 "$1" "$2"
+    KMSG_LAUNCHER_INSTALL="$KMSG_LAUNCHER_PATH"
+    bounded_sudo 5 install -o root -g root -m 0755 \
+        "$KMSG_LAUNCHER_SOURCE" "$KMSG_LAUNCHER_INSTALL"
+}
+
+grant_kmsg_capabilities() {
+    bounded_sudo 5 setcap cap_dac_read_search,cap_syslog=ep "$1"
+}
+
+inspect_kmsg_capabilities() {
+    bounded 2 getcap "$1"
+}
+
+revoke_kmsg_capabilities() {
+    bounded_sudo 5 setcap -r "$1"
+}
+
+remove_kmsg_axisd() {
+    local status=0
+    bounded_sudo 5 rm -f "$1" || status=$?
+    if [ -n "$KMSG_LAUNCHER_INSTALL" ]; then
+        bounded_sudo 5 rm -f "$KMSG_LAUNCHER_INSTALL" || status=$?
+    fi
+    return "$status"
+}
+
+kmsg_source_available() {
+    if [ "$KMSG_CAPABILITY_INSTALLED" -eq 1 ]; then
+        return 0
+    fi
+    bounded 2 "$PYTHON_BIN" - <<'PY'
+import os
+
+fd = os.open("/dev/kmsg", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+os.close(fd)
+PY
 }
 
 reject_preexisting_privileged_path() {
@@ -335,7 +893,7 @@ validate_privileged_directory() {
     fi
 }
 
-validate_privileged_directory /usr/local/bin "MXC executor parent"
+validate_privileged_directory "$(dirname "$expected_executor")" "MXC executor parent"
 reject_preexisting_privileged_path "$expected_executor" "MXC executor"
 INSTALLED_MXC_EXECUTOR=1
 bounded_sudo 5 install -o root -g root -m 0755 "$executor_build" "$expected_executor"
@@ -406,14 +964,52 @@ namespace_exists() {
     local namespace="$1"
     local listing=""
     local names=""
-    listing="$(bounded_sudo 5 ip netns list)" || return 2
+    local status=0
+    listing="$(bounded_sudo 5 ip netns list 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: failed to list network namespaces (status $status): $listing" >&2
+        return 2
+    fi
     # shellcheck disable=SC2016 # The awk field expression is literal.
-    names="$(bounded 2 awk '{print $1}' <<<"$listing")" || return 2
+    names="$(bounded 2 awk '{print $1}' <<<"$listing")" || {
+        status=$?
+        echo "ERROR: failed to parse network namespaces (status $status)" >&2
+        return 2
+    }
     grep -Fxq "$namespace" <<<"$names"
 }
 
 host_veth_exists() {
-    bounded 5 ip link show "$1" >/dev/null 2>&1
+    local veth_name="$1"
+    local listing=""
+    local names=""
+    local status=0
+    listing="$(bounded 5 ip -o link show 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: failed to list host network links (status $status): $listing" >&2
+        return 2
+    fi
+    # shellcheck disable=SC2016 # The awk field expression is literal.
+    names="$(bounded 2 awk -F ': ' '{ sub(/@.*/, "", $2); print $2 }' <<<"$listing")" || {
+        status=$?
+        echo "ERROR: failed to parse host network links (status $status)" >&2
+        return 2
+    }
+    grep -Fxq "$veth_name" <<<"$names"
+}
+
+helper_state_exists() {
+    local state_path="$1"
+    local state_name="${state_path##*/}"
+    local listing=""
+    local status=0
+    listing="$(bounded_sudo 2 find /run/axis/netns -mindepth 1 -maxdepth 1 \
+        -name "$state_name" -print 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: failed to list helper state (status $status): $listing" >&2
+        return 2
+    fi
+    grep -Fxq "$state_path" <<<"$listing"
 }
 
 stop_background_servers() {
@@ -693,15 +1289,13 @@ cleanup_helper_lifecycle_case() {
     local owner_pid="$1"
     local helper_pid="$2"
     local sandbox_id="$3"
-    local _namespace="$4"
-    local _veth_name="$5"
+    local namespace="$4"
+    local veth_name="$5"
     local socket_path="$6"
     local _before_states="$7"
     local _current_states="$8"
     local owner_start_time="$9"
     local helper_start_time="${10}"
-    local state_path=""
-    local destroy_token=""
     local cleanup_failed=0
     local probe_status=0
     set +e
@@ -729,21 +1323,15 @@ cleanup_helper_lifecycle_case() {
         fi
     fi
     if [ -n "$sandbox_id" ]; then
-        state_path="/run/axis/netns/${sandbox_id}"
-        bounded_sudo 2 test -e "$state_path"
-        probe_status=$?
-        if [ "$probe_status" -eq 0 ]; then
-            # shellcheck disable=SC2016 # The awk field expression is literal.
-            destroy_token="$(bounded_sudo 2 awk 'NR == 2 { print $1 }' "$state_path")"
-            if [[ ! "$destroy_token" =~ ^[[:xdigit:]]{64}$ ]]; then
-                echo "ERROR: refusing lifecycle cleanup with malformed state token: $state_path" >&2
-                cleanup_failed=1
-            elif ! bounded 5 "$HELPER_INSTALL" destroy-token "$sandbox_id" "$destroy_token"; then
-                echo "ERROR: authenticated lifecycle cleanup failed for $sandbox_id" >&2
-                cleanup_failed=1
-            fi
-        elif [ "$probe_status" -ne 1 ]; then
-            echo "ERROR: failed to inspect lifecycle helper state: $state_path" >&2
+        cleanup_lifecycle_resources "$sandbox_id" "$namespace" "$veth_name" || probe_status=$?
+        if [ "$probe_status" -ne 0 ]; then
+            case "$probe_status" in
+                2) echo "ERROR: failed to inspect lifecycle resources for $sandbox_id" >&2 ;;
+                3) echo "ERROR: lifecycle resources survived without authenticated helper state: $sandbox_id" >&2 ;;
+                4) echo "ERROR: refusing lifecycle cleanup with missing or malformed state token: $sandbox_id" >&2 ;;
+                5) echo "ERROR: authenticated lifecycle cleanup left resources for $sandbox_id" >&2 ;;
+                *) echo "ERROR: unexpected lifecycle cleanup status $probe_status for $sandbox_id" >&2 ;;
+            esac
             cleanup_failed=1
         fi
     elif [ "$original_status" -ne 0 ]; then
@@ -822,12 +1410,28 @@ run_helper_lifecycle_case() (
     done
     if [ ! -s "$workspace/lifecycle-ready" ]; then
         echo "ERROR: $case_name payload did not reach its ready marker"
+        if [ -s "$workspace/lifecycle-error" ]; then
+            cat "$workspace/lifecycle-error"
+        fi
+        if [ -s "$workspace/leaked-helper-fds" ]; then
+            echo "Leaked helper descriptors:"
+            cat "$workspace/leaked-helper-fds"
+        fi
+        if [ -s "$workspace/visible-helper-config-fds" ]; then
+            echo "Visible helper config descriptors:"
+            cat "$workspace/visible-helper-config-fds"
+        fi
         cat "$output"
         return 1
     fi
     if [ -s "$workspace/leaked-helper-fds" ]; then
         echo "ERROR: $case_name payload inherited helper-only descriptors"
         cat "$workspace/leaked-helper-fds"
+        return 1
+    fi
+    if [ -s "$workspace/visible-helper-config-fds" ]; then
+        echo "ERROR: $case_name payload can resolve a helper config descriptor"
+        cat "$workspace/visible-helper-config-fds"
         return 1
     fi
     local probe_status=0
@@ -863,9 +1467,27 @@ run_helper_lifecycle_case() (
         fi
         printf '%s %s\n' "$pid" "$start_time" >>"$payload_pids"
     done <"$raw_payload_pids"
-    if [ "$(wc -l <"$payload_pids")" -lt 5 ]; then
+    if [ "$(wc -l <"$payload_pids")" -lt 6 ]; then
         echo "ERROR: $case_name did not create the expected payload descendant tree"
         cat "$payload_pids"
+        cat "$output"
+        return 1
+    fi
+    local churn_before=""
+    local churn_after=""
+    churn_before="$(cat "$workspace/lifecycle-churner")"
+    for _ in $(seq 1 50); do
+        sleep 0.02
+        churn_after="$(cat "$workspace/lifecycle-churner")"
+        if [[ "$churn_before" =~ ^[0-9]+$ ]] && [[ "$churn_after" =~ ^[0-9]+$ ]] &&
+            [ "$churn_after" -gt "$churn_before" ]; then
+            break
+        fi
+    done
+    if [[ ! "$churn_before" =~ ^[0-9]+$ ]] || [[ ! "$churn_after" =~ ^[0-9]+$ ]] ||
+        [ "$churn_after" -le "$churn_before" ]; then
+        echo "ERROR: $case_name did not sustain successful descendant churn"
+        cat "$output"
         return 1
     fi
     if [ "$provider" = "mxc" ]; then
@@ -995,14 +1617,14 @@ preflight_namespace_exists() {
     namespace_exists "$1"
 }
 preflight_namespace_add() {
-    bounded_sudo 5 ip netns add "$1"
+    bounded_sudo 5 ip netns add "$1" || return $?
     PREFLIGHT_NS_CREATED=1
 }
 preflight_namespace_configure() {
     bounded_sudo 5 ip netns exec "$1" iptables -A OUTPUT -o lo -j ACCEPT
 }
 preflight_namespace_delete() {
-    bounded_sudo 5 ip netns del "$1"
+    bounded_sudo 5 ip netns del "$1" || return $?
     PREFLIGHT_NS_CREATED=0
 }
 set +e
@@ -1022,13 +1644,13 @@ if [ "$preflight_status" -ne 0 ]; then
         exit 1
     fi
     if [ "$preflight_status" -eq 125 ]; then
-        echo "ERROR: netns helper preflight exceeded its command deadline"
+        echo "ERROR: netns helper preflight timed out or failed to clean up its namespace"
         echo "$preflight_output"
         exit 1
     fi
     skip_or_require \
         AXIS_REQUIRE_NETNS_HELPER_E2E \
-        "netns helper launch proof requires privileged iptables in network namespaces: ${preflight_output//$'\n'/ }"
+        "netns helper launch proof requires privileged iptables in network namespaces (status $preflight_status): ${preflight_output//$'\n'/ }"
 fi
 
 HELPER_TEST_OUTPUT="${TMP_ROOT}/helper-test.out"
@@ -1088,22 +1710,46 @@ for name in os.listdir("/proc/self/fd"):
 if leaked:
     (workspace / "leaked-helper-fds").write_text("\n".join(leaked) + "\n")
     raise SystemExit(91)
+
+visible_config_fds = []
+for fd_dir in pathlib.Path("/proc").glob("[0-9]*/fd"):
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        continue
+    for entry in entries:
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        if "axis-mxc-config" in target:
+            visible_config_fds.append(f"{entry} {target}")
+
+if visible_config_fds:
+    (workspace / "visible-helper-config-fds").write_text(
+        "\n".join(visible_config_fds) + "\n"
+    )
+    raise SystemExit(92)
 (workspace / "payload-fds").write_text("stdio-only\n")
 
-def hold(mode):
-    if mode == "session":
-        os.setsid()
-    else:
-        os.setpgid(0, 0)
+def mark(name, value="ready"):
+    destination = workspace / f"lifecycle-{name}"
+    temporary = workspace / f".lifecycle-{name}-{os.getpid()}"
+    temporary.write_text(f"{value}\n")
+    os.replace(temporary, destination)
+
+def hold(name):
     descendant = os.fork()
     if descendant == 0:
+        mark(f"{name}-descendant")
         while True:
             time.sleep(1)
+    mark(f"{name}-holder")
     while True:
         time.sleep(1)
 
 def churn():
-    os.setpgid(0, 0)
+    cycles = 0
     while True:
         worker = os.fork()
         if worker == 0:
@@ -1112,20 +1758,36 @@ def churn():
                 time.sleep(0.05)
                 os._exit(0)
             os._exit(0)
-        try:
-            os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            pass
+        _, status = os.waitpid(worker, 0)
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+            raise SystemExit(93)
+        cycles += 1
+        mark("churner", cycles)
         time.sleep(0.005)
 
-for mode in ("session", "process-group"):
+for name in ("first", "second"):
     child = os.fork()
     if child == 0:
-        hold(mode)
+        hold(name)
 
 churner = os.fork()
 if churner == 0:
     churn()
+
+expected = (
+    "lifecycle-first-holder",
+    "lifecycle-first-descendant",
+    "lifecycle-second-holder",
+    "lifecycle-second-descendant",
+    "lifecycle-churner",
+)
+deadline = time.monotonic() + 5
+while not all((workspace / name).is_file() for name in expected):
+    if time.monotonic() >= deadline:
+        missing = [name for name in expected if not (workspace / name).is_file()]
+        (workspace / "lifecycle-error").write_text("missing: " + ", ".join(missing) + "\n")
+        raise SystemExit(92)
+    time.sleep(0.01)
 
 (workspace / "lifecycle-ready").write_text("ready\n")
 while True:
@@ -1160,11 +1822,17 @@ DIRECT_PORT="$(cat "$DIRECT_PORT_FILE")"
 
 PROXY_POLICY="${TMP_ROOT}/proxy-policy.yaml"
 write_proxy_policy "$PROXY_POLICY" "helper-proxy-e2e" "$SERVER_PORT"
+if ! rm -f "$HOST_PEER_MARKER"; then
+    echo "ERROR: failed to initialize host peer completion marker: $HOST_PEER_MARKER"
+    exit 1
+fi
 
 read -r -d '' PROXY_PROBE <<PY || true
 import os
+import pathlib
 import socket
 import sys
+import time
 from urllib.parse import urlparse
 
 proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
@@ -1212,59 +1880,80 @@ else:
     sys.exit(4)
 
 print("proxy allowed/denied/direct-bypass checks passed", flush=True)
-import time
-time.sleep(10)
+host_peer_marker = pathlib.Path("${HOST_PEER_MARKER}")
+deadline = time.monotonic() + 25
+while not host_peer_marker.exists() and time.monotonic() < deadline:
+    time.sleep(0.1)
+if not host_peer_marker.exists():
+    print("host-side strict proxy peer check did not complete")
+    sys.exit(6)
 PY
 
 PROXY_OUTPUT="${TMP_ROOT}/proxy-proof.out"
 AXIS_SOCKET="/tmp/axis-proxy-e2e-$$.sock" \
-    timeout 30 "$AXIS_RELEASE" --socket "/tmp/axis-proxy-e2e-$$.sock" \
+    timeout 45 "$AXIS_RELEASE" --socket "/tmp/axis-proxy-e2e-$$.sock" \
     run --policy "$PROXY_POLICY" -- "$PYTHON_BIN" -c "$PROXY_PROBE" \
     >"$PROXY_OUTPUT" 2>&1 &
 PROXY_PROOF_PID=$!
-PROXY_PROOF_START_TIME="$(process_start_time "$PROXY_PROOF_PID")"
 
-for _ in $(seq 1 100); do
-    grep -Fq "proxy allowed/denied/direct-bypass checks passed" "$PROXY_OUTPUT" && break
-    probe_status=0
-    process_identity_matches "$PROXY_PROOF_PID" "$PROXY_PROOF_START_TIME" || probe_status=$?
-    if [ "$probe_status" -eq 2 ]; then
-        exit 1
-    fi
-    if [ "$probe_status" -ne 0 ]; then
-        break
-    fi
+proxy_address=""
+proxy_address_deadline=$((SECONDS + 20))
+while ((SECONDS < proxy_address_deadline)); do
+    proxy_address="$(sed -n 's/^AXIS: proxy on \([^[:space:]]*\).*$/\1/p' "$PROXY_OUTPUT" | head -n1)"
+    [ -n "$proxy_address" ] && break
     sleep 0.1
 done
 
-if ! grep -Fq "proxy allowed/denied/direct-bypass checks passed" "$PROXY_OUTPUT"; then
-    echo "ERROR: built axis proof did not reach the strict proxy listener marker"
-    cat "$PROXY_OUTPUT"
-    exit 1
-fi
-
-proxy_address="$(sed -n 's/^AXIS: proxy on \([^[:space:]]*\).*$/\1/p' "$PROXY_OUTPUT" | head -n1)"
 if [ -z "$proxy_address" ]; then
     echo "ERROR: built axis proof did not advertise its strict proxy address"
     cat "$PROXY_OUTPUT"
     exit 1
 fi
-bounded 10 "$PYTHON_BIN" - "$proxy_address" "$SERVER_PORT" <<'PY'
+bounded 20 "$PYTHON_BIN" - "$proxy_address" "$SERVER_PORT" "$HOST_PEER_MARKER" <<'PY'
+import pathlib
 import socket
 import sys
+import time
 
 host, port = sys.argv[1].rsplit(":", 1)
 target_port = int(sys.argv[2])
-with socket.create_connection((host, int(port)), timeout=3) as connection:
+completion_marker = pathlib.Path(sys.argv[3])
+deadline = time.monotonic() + 10
+last_error = None
+while True:
+    try:
+        connection = socket.create_connection((host, int(port)), timeout=1)
+        break
+    except OSError as error:
+        last_error = error
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"strict proxy at {host}:{port} did not accept a host connection"
+            ) from last_error
+        time.sleep(0.1)
+with connection:
+    connection.settimeout(3)
     request = f"CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n\r\n"
     connection.sendall(request.encode())
-    response = connection.recv(256)
-if b"403" not in response.splitlines()[0]:
+    response = b""
+    while len(response) < 8192:
+        chunk = connection.recv(min(1024, 8192 - len(response)))
+        if not chunk:
+            break
+        response += chunk
+        if b"\r\n\r\n" in response and b"unauthenticated sandbox peer" in response:
+            break
+if b"\r\n\r\n" not in response:
+    print(f"host-side strict proxy returned incomplete headers: {response!r}")
+    sys.exit(3)
+status_fields = response.split(b"\r\n", 1)[0].split()
+if len(status_fields) < 2 or status_fields[1] != b"403":
     print(f"host-side strict proxy connection was not rejected: {response!r}")
     sys.exit(1)
 if b"unauthenticated sandbox peer" not in response:
     print(f"host-side request was not rejected by peer authentication: {response!r}")
     sys.exit(2)
+completion_marker.touch()
 print("host-side strict proxy peer rejected")
 PY
 
@@ -1273,7 +1962,6 @@ wait "$PROXY_PROOF_PID"
 proxy_status=$?
 set -e
 PROXY_PROOF_PID=""
-PROXY_PROOF_START_TIME=""
 proxy_output="$(cat "$PROXY_OUTPUT")"
 if [ "$proxy_status" -ne 0 ]; then
     if [ "$proxy_status" -eq 124 ] || [ "$proxy_status" -eq 125 ] || [ "$proxy_status" -eq 137 ]; then
@@ -1289,6 +1977,11 @@ if [ "$proxy_status" -ne 0 ]; then
     echo "$proxy_output"
     exit "$proxy_status"
 fi
+if ! grep -Fq "proxy allowed/denied/direct-bypass checks passed" <<<"$proxy_output"; then
+    echo "ERROR: built axis proof did not complete its proxy checks"
+    echo "$proxy_output"
+    exit 1
+fi
 echo "$proxy_output"
 
 stop_background_servers
@@ -1296,21 +1989,29 @@ stop_background_servers
 echo ""
 echo "=== Kmsg bypass audit proof ==="
 
-provision_kmsg_audit_source
-kmsg_status=0
-kmsg_gate_status "${AXIS_REQUIRE_KMSG_AUDIT_E2E:-0}" "$([ -r /dev/kmsg ] && echo 1 || echo 0)" || kmsg_status=$?
-if [ "$kmsg_status" -eq 1 ]; then
-    echo "ERROR: AXIS_REQUIRE_KMSG_AUDIT_E2E=1 requires a readable /dev/kmsg audit source"
-    exit 1
-elif [ "$kmsg_status" -eq 77 ]; then
-    skip_or_require AXIS_REQUIRE_KMSG_AUDIT_E2E "bypass audit proof requires non-root readable /dev/kmsg"
-fi
-
 cargo build --locked --release -p axis-daemon
 AXISD_RELEASE="${TARGET_DIR}/release/axisd"
 if [ ! -x "$AXISD_RELEASE" ]; then
     echo "ERROR: release axisd binary missing: $AXISD_RELEASE"
     exit 1
+fi
+AXISD_AUDIT_BINARY="$AXISD_RELEASE"
+provision_kmsg_audit_source \
+    "$AXISD_RELEASE" "${TARGET_DIR}/release/axis-seccomp-launcher"
+if [ -n "$KMSG_AXISD_INSTALL" ]; then
+    AXISD_AUDIT_BINARY="$KMSG_AXISD_INSTALL"
+fi
+kmsg_status=0
+kmsg_available=0
+if kmsg_source_available; then
+    kmsg_available=1
+fi
+kmsg_gate_status "${AXIS_REQUIRE_KMSG_AUDIT_E2E:-0}" "$kmsg_available" || kmsg_status=$?
+if [ "$kmsg_status" -eq 1 ]; then
+    echo "ERROR: AXIS_REQUIRE_KMSG_AUDIT_E2E=1 requires a usable /dev/kmsg audit source"
+    exit 1
+elif [ "$kmsg_status" -eq 77 ]; then
+    skip_or_require AXIS_REQUIRE_KMSG_AUDIT_E2E "bypass audit proof requires a usable /dev/kmsg source"
 fi
 
 AUDIT_SOCKET="${TMP_ROOT}/axisd-audit.sock"
@@ -1337,7 +2038,7 @@ AXIS_LOG_LEVEL="axis=info,axis::audit=info" \
 AXIS_LOG_DIR="$AUDIT_LOG_DIR" \
 XDG_DATA_HOME="${TMP_ROOT}/xdg-audit" \
 AXIS_SOCKET="$AUDIT_SOCKET" \
-    "$AXISD_RELEASE" >"${TMP_ROOT}/axisd-audit.stderr" 2>&1 &
+    "$AXISD_AUDIT_BINARY" >"${TMP_ROOT}/axisd-audit.stderr" 2>&1 &
 AXSD_PID=$!
 
 if ! wait_for_socket_path "$AUDIT_SOCKET"; then
@@ -1395,9 +2096,8 @@ fi
 audit_sandbox_id="$(grep -oE '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$create_output" | head -n1)"
 
 for _ in $(seq 1 40); do
-    if grep -q "network bypass attempt" "${AUDIT_LOG_DIR}/axisd.log" 2>/dev/null &&
-        grep -q "$audit_sandbox_id" "${AUDIT_LOG_DIR}/axisd.log" 2>/dev/null &&
-        grep -q ":${AUDIT_DIRECT_PORT}" "${AUDIT_LOG_DIR}/axisd.log" 2>/dev/null; then
+    if audit_log_contains_matching_bypass \
+        "${AUDIT_LOG_DIR}/axisd.log" "$audit_sandbox_id" "$AUDIT_DIRECT_PORT"; then
         echo "PASS: bypass audit event recorded"
         if ! bounded 10 "$AXIS_RELEASE" --socket "$AUDIT_SOCKET" destroy "$audit_sandbox_id"; then
             echo "ERROR: failed to destroy audited sandbox: $audit_sandbox_id"

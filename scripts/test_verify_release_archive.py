@@ -60,7 +60,6 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         (self.root / "LICENSE").write_bytes(b"project license\n")
-        (self.root / "THIRD_PARTY_NOTICES.md").write_bytes(b"notices\n")
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -68,7 +67,6 @@ class ReleaseArchiveTests(unittest.TestCase):
     def members(self):
         return {
             "axis-test/LICENSE": b"project license\n",
-            "axis-test/THIRD_PARTY_NOTICES.md": b"notices\n",
             "axis-test/axis": b"binary",
         }
 
@@ -341,7 +339,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                 lambda path: path.stat().st_size - 1,
                 "compressed",
             ),
-            ("MAX_ARCHIVE_MEMBERS", lambda _path: 2, "too many"),
+            ("MAX_ARCHIVE_MEMBERS", lambda _path: 1, "too many"),
             ("MAX_ARCHIVE_MEMBER_SIZE", lambda _path: 5, r"member (?:size )?exceeds"),
             ("MAX_ARCHIVE_CONTENT_SIZE", lambda _path: 10, "aggregate"),
         ]
@@ -706,6 +704,119 @@ class SafeExtractionTests(unittest.TestCase):
             finally:
                 for patcher in reversed(patches):
                     patcher.stop()
+
+    def test_converter_main_resolves_an_allowlisted_system_tool(self):
+        trusted = Path("/trusted/usr/bin/rpm2archive")
+        destination = self.root / "converter-output"
+        with mock.patch.object(
+            verifier, "trusted_package_tool", return_value=trusted
+        ) as resolve, mock.patch.object(verifier, "extract_converter_output") as extract:
+            self.assertEqual(
+                verifier.converter_main(
+                    [
+                        "--extract-command-tar",
+                        str(destination),
+                        "rpm2archive",
+                        "-n",
+                        "package.rpm",
+                    ]
+                ),
+                0,
+            )
+        resolve.assert_called_once_with("rpm2archive")
+        extract.assert_called_once_with(
+            "tar", destination, [str(trusted), "-n", "package.rpm"]
+        )
+
+    def test_trusted_package_tool_accepts_only_root_owned_nonwritable_paths(self):
+        resolved = Path("/trusted/usr/bin/rpm2archive")
+        regular = mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        directory = mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+        def metadata(path):
+            return regular if path == resolved else directory
+
+        with mock.patch.object(
+            verifier, "TRUSTED_PACKAGE_TOOL_DIRS", (Path("/candidate"),)
+        ), mock.patch.object(
+            Path, "resolve", autospec=True, return_value=resolved
+        ), mock.patch.object(
+            Path, "stat", autospec=True, side_effect=metadata
+        ), mock.patch.object(verifier.os, "access", return_value=True):
+            self.assertEqual(verifier.trusted_package_tool("rpm2archive"), resolved)
+
+    def test_trusted_package_tool_rejects_every_unsafe_metadata_case(self):
+        resolved = Path("/trusted/usr/bin/rpm2archive")
+        safe_file = mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        safe_directory = mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        unsafe_cases = [
+            (mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0), safe_directory, True),
+            (mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=1000), safe_directory, True),
+            (mock.Mock(st_mode=stat.S_IFREG | 0o775, st_uid=0), safe_directory, True),
+            (safe_file, safe_directory, False),
+            (safe_file, mock.Mock(st_mode=stat.S_IFDIR | 0o777, st_uid=0), True),
+            (safe_file, mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=1000), True),
+        ]
+        for file_metadata, parent_metadata, executable in unsafe_cases:
+            with self.subTest(
+                file_mode=file_metadata.st_mode,
+                file_uid=file_metadata.st_uid,
+                parent_mode=parent_metadata.st_mode,
+                parent_uid=parent_metadata.st_uid,
+                executable=executable,
+            ), mock.patch.object(
+                verifier, "TRUSTED_PACKAGE_TOOL_DIRS", (Path("/candidate"),)
+            ), mock.patch.object(
+                Path, "resolve", autospec=True, return_value=resolved
+            ), mock.patch.object(
+                Path,
+                "stat",
+                autospec=True,
+                side_effect=lambda path: (
+                    file_metadata if path == resolved else parent_metadata
+                ),
+            ), mock.patch.object(verifier.os, "access", return_value=executable):
+                with self.assertRaisesRegex(
+                    verifier.ArchiveError, "trusted system package converter"
+                ):
+                    verifier.trusted_package_tool("rpm2archive")
+
+    def test_trusted_package_tool_rejects_unknown_and_missing_tools(self):
+        with self.assertRaisesRegex(verifier.ArchiveError, "unsupported"):
+            verifier.trusted_package_tool("attacker-controlled")
+        with mock.patch.object(
+            verifier, "TRUSTED_PACKAGE_TOOL_DIRS", (Path("/missing"),)
+        ), mock.patch.object(Path, "resolve", autospec=True, side_effect=OSError):
+            with self.assertRaisesRegex(
+                verifier.ArchiveError, "trusted system package converter"
+            ):
+                verifier.trusted_package_tool("rpm2archive")
+
+    def test_trusted_package_tool_rejects_an_unsafe_candidate_symlink_directory(self):
+        candidate_directory = Path("/candidate")
+        resolved = Path("/trusted/usr/bin/rpm2archive")
+        safe_file = mock.Mock(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        safe_directory = mock.Mock(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        unsafe_directory = mock.Mock(st_mode=stat.S_IFDIR | 0o777, st_uid=0)
+
+        def metadata(path):
+            if path == resolved:
+                return safe_file
+            if path == candidate_directory:
+                return unsafe_directory
+            return safe_directory
+
+        with mock.patch.object(
+            verifier, "TRUSTED_PACKAGE_TOOL_DIRS", (candidate_directory,)
+        ), mock.patch.object(
+            Path, "resolve", autospec=True, return_value=resolved
+        ), mock.patch.object(
+            Path, "stat", autospec=True, side_effect=metadata
+        ), mock.patch.object(verifier.os, "access", return_value=True):
+            with self.assertRaisesRegex(
+                verifier.ArchiveError, "trusted system package converter"
+            ):
+                verifier.trusted_package_tool("rpm2archive")
 
 
 if __name__ == "__main__":

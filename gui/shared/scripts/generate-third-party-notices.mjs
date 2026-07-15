@@ -195,7 +195,10 @@ async function main() {
       if (mode === "--print") {
         process.stdout.write(`${generated}\n`);
       } else {
-        const current = await readFile(noticesPath, "utf8");
+      const current = await readFile(noticesPath, "utf8").catch((error) => {
+        if (mode === "--write" && error?.code === "ENOENT") return "";
+        throw error;
+      });
         const expected = withGeneratedSection(current, generated);
         if (mode === "--write") {
           await writeFile(noticesPath, expected);

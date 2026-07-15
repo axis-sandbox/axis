@@ -229,9 +229,9 @@ namespace AxisInstaller
                 Stopwatch timer = Stopwatch.StartNew();
                 byte[][] output;
                 using (FileStream stdout = new FileStream(
-                    new SafeFileHandle(stdoutRead, true), FileAccess.Read, 65536, true))
+                    new SafeFileHandle(stdoutRead, true), FileAccess.Read, 65536, false))
                 using (FileStream stderr = new FileStream(
-                    new SafeFileHandle(stderrRead, true), FileAccess.Read, 65536, true))
+                    new SafeFileHandle(stderrRead, true), FileAccess.Read, 65536, false))
                 {
                     stdoutRead = IntPtr.Zero;
                     stderrRead = IntPtr.Zero;

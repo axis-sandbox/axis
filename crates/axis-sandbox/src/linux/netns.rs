@@ -151,9 +151,13 @@ trait CommandRunner {
 
 struct ProcessCommandRunner;
 
+impl ProcessCommandRunner {
+    const COMMAND_UID: PrivilegedCommandUid = PrivilegedCommandUid::Preserve;
+}
+
 impl CommandRunner for ProcessCommandRunner {
     fn run(&mut self, command: &NetnsCommand, owner_guard_fd: Option<RawFd>) -> Result<(), String> {
-        run_netns_command(command, owner_guard_fd)
+        run_netns_command(command, owner_guard_fd, Self::COMMAND_UID)
     }
 }
 
@@ -162,6 +166,8 @@ struct PrivilegedCommandRunner {
 }
 
 impl PrivilegedCommandRunner {
+    const COMMAND_UID: PrivilegedCommandUid = PrivilegedCommandUid::NormalizeRoot;
+
     fn new() -> Result<Self, String> {
         ensure_helper_privileged()?;
         set_no_new_privs()?;
@@ -173,16 +179,27 @@ impl PrivilegedCommandRunner {
 
 impl CommandRunner for PrivilegedCommandRunner {
     fn run(&mut self, command: &NetnsCommand, owner_guard_fd: Option<RawFd>) -> Result<(), String> {
-        run_netns_command(command, owner_guard_fd)
+        run_netns_command(command, owner_guard_fd, Self::COMMAND_UID)
     }
 }
 
-fn run_netns_command(command: &NetnsCommand, owner_guard_fd: Option<RawFd>) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivilegedCommandUid {
+    Preserve,
+    NormalizeRoot,
+}
+
+fn run_netns_command(
+    command: &NetnsCommand,
+    owner_guard_fd: Option<RawFd>,
+    command_uid: PrivilegedCommandUid,
+) -> Result<(), String> {
     match run_privileged_command_in_namespace(
         &command.program,
         &command.args,
         owner_guard_fd,
         HELPER_COMMAND_TIMEOUT,
+        command_uid,
     ) {
         Err(_) if command.ignore_missing_link && command_host_link_is_absent(command) => Ok(()),
         result => result,
@@ -663,14 +680,10 @@ fn run_privileged_command_in_namespace(
     args: &[String],
     owner_guard_fd: Option<RawFd>,
     timeout: Duration,
+    command_uid: PrivilegedCommandUid,
 ) -> Result<(), String> {
-    run_privileged_command_in_namespace_with(
-        program,
-        args,
-        owner_guard_fd,
-        timeout,
-        &mut Clone3CommandNamespaceLauncher,
-    )
+    let mut launcher = Clone3CommandNamespaceLauncher { command_uid };
+    run_privileged_command_in_namespace_with(program, args, owner_guard_fd, timeout, &mut launcher)
 }
 
 trait CommandNamespaceLauncher {
@@ -681,7 +694,9 @@ trait CommandNamespaceLauncher {
     fn terminate(&mut self, pid: libc::pid_t) -> Result<(), String>;
 }
 
-struct Clone3CommandNamespaceLauncher;
+struct Clone3CommandNamespaceLauncher {
+    command_uid: PrivilegedCommandUid,
+}
 
 impl CommandNamespaceLauncher for Clone3CommandNamespaceLauncher {
     fn launch(&mut self, program: &str, args: &[String]) -> Result<libc::pid_t, String> {
@@ -694,7 +709,13 @@ impl CommandNamespaceLauncher for Clone3CommandNamespaceLauncher {
             }
         };
         if init_pid == 0 {
-            run_command_namespace_init(program, args, helper_guard_fd);
+            run_command_namespace_init_with(
+                program,
+                args,
+                helper_guard_fd,
+                true,
+                self.command_uid == PrivilegedCommandUid::NormalizeRoot,
+            );
         }
         close_fds(&[helper_guard_fd]);
         Ok(init_pid)
@@ -716,6 +737,7 @@ fn run_privileged_command_in_namespace_with<L: CommandNamespaceLauncher>(
     timeout: Duration,
     launcher: &mut L,
 ) -> Result<(), String> {
+    let command = format_privileged_command(program, args);
     let init_pid = launcher.launch(program, args)?;
 
     let deadline = Instant::now() + timeout;
@@ -726,7 +748,7 @@ fn run_privileged_command_in_namespace_with<L: CommandNamespaceLauncher>(
             }
             Ok(Some(status)) => {
                 return Err(format!(
-                    "privileged command '{program}' failed with status {}",
+                    "privileged command '{command}' failed with status {}",
                     helper_wait_status_code(status)
                 ));
             }
@@ -753,7 +775,7 @@ fn run_privileged_command_in_namespace_with<L: CommandNamespaceLauncher>(
         if Instant::now() >= deadline {
             let termination = launcher.terminate(init_pid);
             let timeout_error = format!(
-                "privileged command '{program}' exceeded its {} ms deadline",
+                "privileged command '{command}' exceeded its {} ms deadline",
                 timeout.as_millis()
             );
             return Err(match termination {
@@ -767,8 +789,11 @@ fn run_privileged_command_in_namespace_with<L: CommandNamespaceLauncher>(
     }
 }
 
-fn run_command_namespace_init(program: &str, args: &[String], helper_guard_fd: RawFd) -> ! {
-    run_command_namespace_init_with(program, args, helper_guard_fd, true)
+fn format_privileged_command(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn run_command_namespace_init_with(
@@ -776,6 +801,7 @@ fn run_command_namespace_init_with(
     args: &[String],
     helper_guard_fd: RawFd,
     terminate_after_primary: bool,
+    normalize_root_uid: bool,
 ) -> ! {
     if arm_parent_death_signal(helper_guard_fd).is_err() {
         unsafe { libc::_exit(126) };
@@ -799,7 +825,12 @@ fn run_command_namespace_init_with(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            if normalize_root_uid {
+                // Netfilter rejects setuid callers (exit 111), so trusted
+                // system tools must not inherit the helper's mixed UID state.
+                normalize_privileged_command_uid().map_err(std::io::Error::from_raw_os_error)?;
+            }
             super::mark_unexpected_child_fds_close_on_exec()
                 .map_err(std::io::Error::from_raw_os_error)
         });
@@ -810,6 +841,27 @@ fn run_command_namespace_init_with(
     };
     let result = reap_namespace_children_with(primary, terminate_after_primary);
     unsafe { libc::_exit(result.exit_code) };
+}
+
+fn normalize_privileged_command_uid() -> Result<(), i32> {
+    normalize_privileged_command_uid_with(unsafe { libc::geteuid() }, || {
+        let result = unsafe { libc::setresuid(0, 0, 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(super::current_errno())
+        }
+    })
+}
+
+fn normalize_privileged_command_uid_with<F>(effective_uid: u32, set_root_ids: F) -> Result<(), i32>
+where
+    F: FnOnce() -> Result<(), i32>,
+{
+    if effective_uid != 0 {
+        return Err(libc::EPERM);
+    }
+    set_root_ids()
 }
 
 fn try_wait_for_child(pid: libc::pid_t) -> Result<Option<libc::c_int>, std::io::Error> {
@@ -1897,7 +1949,9 @@ fn run_payload_namespace_init(
         write_helper_error(sync_fd, &error);
         unsafe { libc::_exit(126) };
     }
-    close_fds(&[helper_guard_fd]);
+    if spec.launch_kind == HelperLaunchKind::DirectProcess {
+        close_fds(&[helper_guard_fd]);
+    }
     if unsafe { libc::setsid() } < 0 {
         write_helper_error(sync_fd, &errno_message("create payload session"));
         unsafe { libc::_exit(126) };
@@ -1909,21 +1963,73 @@ fn run_payload_namespace_init(
     }
     close_fds(&[start_fd]);
 
+    let config_holder_pid = match spec.launch_kind {
+        HelperLaunchKind::DirectProcess => None,
+        HelperLaunchKind::MxcExecutor => match host_pid_from_proc_status() {
+            Ok(pid) => Some(pid),
+            Err(error) => {
+                close_fds(&[helper_guard_fd]);
+                write_helper_error(sync_fd, &error);
+                unsafe { libc::_exit(126) };
+            }
+        },
+    };
+    let config_ready = match config_holder_pid {
+        Some(_) => match cloexec_pipe() {
+            Ok(fds) => Some(fds),
+            Err(error) => {
+                close_fds(&[helper_guard_fd]);
+                write_helper_error(sync_fd, &error);
+                unsafe { libc::_exit(126) };
+            }
+        },
+        None => None,
+    };
     let payload = unsafe { libc::fork() };
     if payload < 0 {
+        if spec.launch_kind == HelperLaunchKind::MxcExecutor {
+            close_fds(&[helper_guard_fd]);
+        }
+        if let Some((read_fd, write_fd)) = config_ready {
+            close_fds(&[read_fd, write_fd]);
+        }
         write_helper_error(sync_fd, &errno_message("fork helper payload"));
         unsafe { libc::_exit(126) };
     }
     if payload == 0 {
-        let setup_result = match spec.launch_kind {
-            HelperLaunchKind::DirectProcess => {
-                apply_helper_launch_isolation(&allocation.namespace, owner, cgroup_procs_fd, spec)
+        if spec.launch_kind == HelperLaunchKind::MxcExecutor {
+            close_fds(&[helper_guard_fd]);
+        }
+        let mut exec_spec = spec.clone();
+        if let Some((read_fd, write_fd)) = config_ready {
+            close_fds(&[write_fd]);
+            if let Err(error) = wait_for_payload_start(read_fd) {
+                close_fds(&[read_fd]);
+                write_helper_error(sync_fd, &format!("MXC config holder setup: {error}"));
+                unsafe { libc::_exit(126) };
             }
+            close_fds(&[read_fd]);
+            let Some(holder_pid) = config_holder_pid else {
+                write_helper_error(sync_fd, "MXC config holder PID is missing");
+                unsafe { libc::_exit(126) };
+            };
+            if let Err(error) = point_mxc_config_at_holder(&mut exec_spec, holder_pid) {
+                write_helper_error(sync_fd, &error);
+                unsafe { libc::_exit(126) };
+            }
+        }
+        let setup_result = match exec_spec.launch_kind {
+            HelperLaunchKind::DirectProcess => apply_helper_launch_isolation(
+                &allocation.namespace,
+                owner,
+                cgroup_procs_fd,
+                &exec_spec,
+            ),
             HelperLaunchKind::MxcExecutor => apply_mxc_helper_launch_isolation(
                 &allocation.namespace,
                 owner,
                 cgroup_procs_fd,
-                spec,
+                &exec_spec,
             ),
         };
         if let Err(error) = setup_result {
@@ -1934,20 +2040,100 @@ fn run_payload_namespace_init(
             eprintln!("axis-netns-helper: {error}");
             unsafe { libc::_exit(126) };
         }
-        let error = exec_helper_target(spec).unwrap_err();
+        let error = exec_helper_target(&exec_spec).unwrap_err();
         eprintln!("axis-netns-helper: {error}");
         unsafe { libc::_exit(127) };
     }
 
-    close_fds(&[sync_fd]);
-    if let Some(fd) = spec.mxc_config_fd {
-        close_fds(&[fd]);
+    if let Some((read_fd, write_fd)) = config_ready {
+        close_fds(&[read_fd]);
+        if let Err(error) = prepare_mxc_config_holder(owner, helper_guard_fd) {
+            close_fds(&[helper_guard_fd]);
+            close_fds(&[write_fd]);
+            write_helper_error(sync_fd, &error);
+            unsafe { libc::_exit(126) };
+        }
+        close_fds(&[helper_guard_fd]);
+        if let Err(errno) = super::write_all_fd(write_fd, &[1]) {
+            close_fds(&[write_fd]);
+            write_helper_error(
+                sync_fd,
+                &format!(
+                    "release MXC config reader failed: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ),
+            );
+            unsafe { libc::_exit(126) };
+        }
+        close_fds(&[write_fd]);
     }
+    close_fds(&[sync_fd]);
     if let Some(fd) = cgroup_procs_fd {
         close_fds(&[fd]);
     }
     let result = reap_namespace_children(payload);
+    if let Some(fd) = spec.mxc_config_fd {
+        close_fds(&[fd]);
+    }
     unsafe { libc::_exit(result.exit_code) };
+}
+
+fn host_pid_from_proc_status() -> Result<libc::pid_t, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("read payload namespace process status: {error}"))?;
+    parse_host_pid_from_proc_status(&status)
+}
+
+fn parse_host_pid_from_proc_status(status: &str) -> Result<libc::pid_t, String> {
+    let nspid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .ok_or_else(|| "payload namespace process status is missing NSpid".to_string())?;
+    let pid = nspid
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "payload namespace process status has an empty NSpid".to_string())?
+        .parse::<libc::pid_t>()
+        .map_err(|_| "payload namespace process status has a malformed NSpid".to_string())?;
+    if pid <= 0 {
+        return Err("payload namespace process status has a non-positive NSpid".into());
+    }
+    Ok(pid)
+}
+
+fn point_mxc_config_at_holder(
+    spec: &mut HelperLaunchSpec,
+    holder_pid: libc::pid_t,
+) -> Result<(), String> {
+    if holder_pid <= 0 {
+        return Err("MXC config holder PID must be positive".into());
+    }
+    let config_fd = spec
+        .mxc_config_fd
+        .ok_or_else(|| "MXC helper launch is missing its config fd".to_string())?;
+    if spec.args.len() != 3 || spec.args[2] != format!("/proc/self/fd/{config_fd}") {
+        return Err("MXC helper launch config fd path changed after validation".into());
+    }
+    spec.args[2] = format!("/proc/{holder_pid}/fd/{config_fd}");
+    Ok(())
+}
+
+fn prepare_mxc_config_holder(owner: HelperOwner, parent_guard_fd: RawFd) -> Result<(), String> {
+    drop_to_owner(owner)?;
+    set_no_new_privs()?;
+    if let Err(errno) = super::drop_process_capabilities() {
+        return Err(format!(
+            "drop MXC config holder capabilities failed: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    // MXC reads this sealed descriptor before Bubblewrap replaces /proc. The
+    // same-UID supervisor is already inside the sandbox PID namespace.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } < 0 {
+        return Err(errno_message("make MXC config holder readable by executor"));
+    }
+    arm_parent_death_signal(parent_guard_fd)
+        .map_err(|error| format!("rearm MXC config holder parent-death signal: {error}"))
 }
 
 fn wait_for_payload_start(fd: RawFd) -> Result<(), String> {
@@ -2669,14 +2855,6 @@ fn apply_mxc_helper_launch_isolation(
     if let Err(errno) = super::mark_unexpected_child_fds_close_on_exec() {
         return Err(format!(
             "mark inherited fds close-on-exec failed: {}",
-            std::io::Error::from_raw_os_error(errno)
-        ));
-    }
-    if let Some(fd) = spec.mxc_config_fd
-        && let Err(errno) = super::clear_fd_cloexec(fd)
-    {
-        return Err(format!(
-            "preserve MXC config fd for exec failed: {}",
             std::io::Error::from_raw_os_error(errno)
         ));
     }
@@ -4003,7 +4181,7 @@ mod tests {
                 return Err(errno_message("fork rootless command namespace init"));
             }
             if init == 0 {
-                run_command_namespace_init_with(program, args, helper_guard_fd, false);
+                run_command_namespace_init_with(program, args, helper_guard_fd, false, false);
             }
             close_fds(&[helper_guard_fd]);
 
@@ -4467,6 +4645,26 @@ mod tests {
         assert!(error.contains("No child processes"), "{error}");
         assert_eq!(wait_failure.terminate_calls, 1);
 
+        let mut command_failure = ScriptedCommandNamespaceLauncher {
+            launch: Some(Ok(4242)),
+            waits: VecDeque::from([Ok(Some(test_exit_wait_status(19)))]),
+            terminate_error: None,
+            terminate_calls: 0,
+        };
+        let error = run_privileged_command_in_namespace_with(
+            "/usr/sbin/ip",
+            &["netns".into(), "add".into(), "axis-test".into()],
+            None,
+            Duration::from_secs(1),
+            &mut command_failure,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "privileged command '/usr/sbin/ip netns add axis-test' failed with status 19"
+        );
+        assert_eq!(command_failure.terminate_calls, 0);
+
         let mut timeout_cleanup_failure = ScriptedCommandNamespaceLauncher {
             launch: Some(Ok(4242)),
             waits: VecDeque::from([Ok(None)]),
@@ -4484,6 +4682,36 @@ mod tests {
         assert!(error.contains("exceeded its 0 ms deadline"), "{error}");
         assert!(error.contains("bounded cleanup failed"), "{error}");
         assert_eq!(timeout_cleanup_failure.terminate_calls, 1);
+    }
+
+    #[test]
+    fn privileged_command_uid_normalization_requires_root_and_propagates_errors() {
+        assert_eq!(
+            ProcessCommandRunner::COMMAND_UID,
+            PrivilegedCommandUid::Preserve
+        );
+        assert_eq!(
+            PrivilegedCommandRunner::COMMAND_UID,
+            PrivilegedCommandUid::NormalizeRoot
+        );
+
+        let mut calls = 0;
+        let denied = normalize_privileged_command_uid_with(1000, || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(denied, Err(libc::EPERM));
+        assert_eq!(calls, 0);
+
+        let success = normalize_privileged_command_uid_with(0, || {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(success, Ok(()));
+        assert_eq!(calls, 1);
+
+        let failure = normalize_privileged_command_uid_with(0, || Err(libc::EIO));
+        assert_eq!(failure, Err(libc::EIO));
     }
 
     #[test]
@@ -4959,6 +5187,76 @@ mod tests {
     }
 
     #[test]
+    fn namespace_status_parser_returns_host_pid() {
+        assert_eq!(
+            parse_host_pid_from_proc_status("Name:\taxis\nNSpid:\t4321\t1\n").unwrap(),
+            4321
+        );
+        for status in [
+            "Name:\taxis\n",
+            "NSpid:\t\n",
+            "NSpid:\tnot-a-pid\n",
+            "NSpid:\t0\n",
+        ] {
+            assert!(parse_host_pid_from_proc_status(status).is_err());
+        }
+    }
+
+    #[test]
+    fn mxc_config_holder_path_does_not_inherit_config_fd() {
+        let config_fd = create_mxc_config_fd(b"{\"process\":{}}").unwrap();
+        let mut spec = helper_launch_spec();
+        spec.launch_kind = HelperLaunchKind::MxcExecutor;
+        spec.mxc_config_fd = Some(config_fd);
+        spec.args = vec![
+            "--experimental".into(),
+            "--config".into(),
+            format!("/proc/self/fd/{config_fd}"),
+        ];
+        point_mxc_config_at_holder(&mut spec, unsafe { libc::getpid() }).unwrap();
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "test \"$(cat '{}')\" = '{{\"process\":{{}}}}' && test ! -e /proc/self/fd/{config_fd}",
+                spec.args[2]
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                super::super::mark_unexpected_child_fds_close_on_exec()
+                    .map_err(std::io::Error::from_raw_os_error)
+            });
+        }
+        assert!(command.status().unwrap().success());
+
+        let mut changed = spec.clone();
+        changed.args[2] = "/proc/self/fd/999".into();
+        assert!(
+            point_mxc_config_at_holder(&mut changed, 123)
+                .unwrap_err()
+                .contains("changed after validation")
+        );
+        assert!(
+            point_mxc_config_at_holder(&mut spec, 0)
+                .unwrap_err()
+                .contains("must be positive")
+        );
+        let mut missing_fd = spec.clone();
+        missing_fd.mxc_config_fd = None;
+        assert!(
+            point_mxc_config_at_holder(&mut missing_fd, 123)
+                .unwrap_err()
+                .contains("missing its config fd")
+        );
+        close_fds(&[config_fd]);
+    }
+
+    #[test]
     fn parent_death_signal_rejects_an_exited_parent_guard() {
         let owner = unsafe { libc::fork() };
         assert!(
@@ -5360,8 +5658,12 @@ mod tests {
             "AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E: \"1\"",
             "AXIS_REQUIRE_KMSG_AUDIT_E2E: \"1\"",
             "AXIS_PROVISION_KMSG_AUDIT_E2E: \"1\"",
-            "AXIS_EXPECT_MXC_EXECUTOR: /usr/local/bin/lxc-exec",
+            "libcap2-bin",
+            "AXIS_EXPECT_MXC_EXECUTOR: /usr/bin/lxc-exec",
             "AXIS_MXC_EXECUTOR_BUILD: ${{ github.workspace }}/target/release/lxc-exec",
+            "Restore helper user namespace restriction",
+            "axis-netns-helper-apparmor-userns",
+            "kernel.apparmor_restrict_unprivileged_userns=0",
             "bash e2e/linux/test_netns_helper_launch.sh --self-test",
             "ci_bounded_sudo test -e \"$executor\"",
             "ci_bounded_sudo test -L \"$executor\"",
@@ -5385,6 +5687,12 @@ mod tests {
             "failure_mode in owner-death helper-sigkill",
             "os.listdir(\"/proc/self/fd\")",
             "cleanup_helper_lifecycle_case",
+            "lifecycle_resources_absent",
+            "lifecycle-first-descendant",
+            "lifecycle-second-descendant",
+            "lifecycle-churner",
+            "os.waitpid(worker, 0)",
+            "did not sustain successful descendant churn",
             "did not execute trusted MXC binary",
             "bounded_sudo 2 test -e \"$path\"",
             "bounded_sudo 2 test -L \"$path\"",
@@ -5397,12 +5705,39 @@ mod tests {
             "run_preflight_namespace_state_machine",
             "refusing to use preexisting preflight namespace",
             "provision_kmsg_audit_source",
+            "install_kmsg_capability_binary",
+            "cleanup_kmsg_capability_binary",
+            "reject_kmsg_bundle_collisions",
+            "\"$collision_check_fn\" \"$axisd_path\" \"kmsg-enabled axisd\" || return $?",
+            "\"$collision_check_fn\" \"$launcher_path\" \"axis seccomp launcher\" || return $?",
+            "bounded_sudo 5 install -o root -g root -m 0755 \"$1\" \"$2\"",
+            "\"$KMSG_LAUNCHER_SOURCE\" \"$KMSG_LAUNCHER_INSTALL\"",
+            "bounded_sudo 5 setcap cap_dac_read_search,cap_syslog=ep \"$1\"",
+            "bounded_sudo 5 setcap -r \"$1\"",
+            "os.open(\"/dev/kmsg\", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)",
+            "audit_log_contains_matching_bypass",
             "strict kmsg gate accepted an unavailable audit source",
             "-name \".tmp-u$(id -u)-*\" -print -quit",
         ] {
             assert!(
                 harness.contains(required),
                 "helper harness missing {required:?}"
+            );
+        }
+        for forbidden in ["os.setsid()", "os.setpgid("] {
+            assert!(
+                !harness.contains(forbidden),
+                "helper harness cannot exercise seccomp-blocked syscall {forbidden:?}"
+            );
+        }
+        assert!(
+            !harness.contains("grep -q \"network bypass attempt\""),
+            "bypass proof must match one structured audit record"
+        );
+        for forbidden in ["kernel.dmesg_restrict=0", "chmod o+r /dev/kmsg"] {
+            assert!(
+                !harness.contains(forbidden),
+                "helper harness must not relax host-wide kmsg access with {forbidden:?}"
             );
         }
         assert!(
@@ -5458,7 +5793,7 @@ mod tests {
         );
         assert!(
             String::from_utf8_lossy(&output.stdout)
-                .contains("rootless preflight ownership and strict kmsg gate self-tests")
+                .contains("rootless preflight, kmsg capability, and audit matcher self-tests")
         );
     }
 
@@ -5562,6 +5897,7 @@ mod tests {
                 "/bin/sh",
                 &["-c".into(), checks],
                 helper_guard_fd,
+                false,
                 false,
             );
         }

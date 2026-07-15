@@ -3661,7 +3661,7 @@ mod tests {
             "host-veth denied listener observed direct non-proxy egress"
         );
         assert!(workspace.path().join("helper-launch-ok").exists());
-        assert_background_probe_process_exited(&workspace.path().join("helper-background-pid"));
+        assert_background_probe_was_terminated(workspace.path());
         assert!(sandbox.netns_name.is_none());
         assert!(sandbox.netns_helper_destroy_token.is_none());
         let stale_destroy = netns::destroy_netns_with_helper_token(id, &helper_token);
@@ -3920,18 +3920,23 @@ mod tests {
         }
     }
 
-    fn assert_background_probe_process_exited(pid_path: &Path) {
-        let pid = std::fs::read_to_string(pid_path)
-            .expect("helper background probe pid should be recorded")
-            .trim()
-            .parse::<libc::pid_t>()
-            .expect("helper background probe pid should be numeric");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while process_exists(pid) {
-            if std::time::Instant::now() >= deadline {
-                panic!("helper background probe process {pid} survived cleanup");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    fn assert_background_probe_was_terminated(workspace: &Path) {
+        verify_background_probe_terminated(workspace, std::time::Duration::from_secs(3))
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn verify_background_probe_terminated(
+        workspace: &Path,
+        observation_delay: std::time::Duration,
+    ) -> Result<(), &'static str> {
+        if !workspace.join("helper-background-started").exists() {
+            return Err("helper background probe did not start");
+        }
+        std::thread::sleep(observation_delay);
+        if workspace.join("helper-background-survived").exists() {
+            Err("helper background probe survived payload cleanup")
+        } else {
+            Ok(())
         }
     }
 
@@ -4113,18 +4118,60 @@ mod tests {
     }
 
     fn runtime_read_only_paths_for(binary: &Path) -> Vec<String> {
-        let mut paths = vec![
-            "/bin".into(),
-            "/usr".into(),
-            "/lib".into(),
-            "/lib64".into(),
-            "/nix/store".into(),
-            "/etc".into(),
-        ];
-        if let Some(parent) = binary.parent() {
-            paths.push(parent.to_string_lossy().into_owned());
-        }
+        existing_runtime_read_only_paths(
+            ["/bin", "/usr", "/lib", "/lib64", "/nix/store", "/etc"]
+                .into_iter()
+                .map(Path::new)
+                .chain(binary.parent()),
+        )
+    }
+
+    fn existing_runtime_read_only_paths<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Vec<String> {
         paths
+            .into_iter()
+            .filter(|path| path.exists())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn runtime_read_only_fixture_uses_only_present_paths() {
+        let runtime = tempfile::tempdir().unwrap();
+        let missing = runtime.path().join("missing");
+        let paths = existing_runtime_read_only_paths([runtime.path(), missing.as_path()]);
+        assert_eq!(paths, [runtime.path().to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn background_probe_termination_verifier_covers_all_marker_states() {
+        let workspace = tempfile::tempdir().unwrap();
+        let no_delay = std::time::Duration::ZERO;
+        assert_eq!(
+            verify_background_probe_terminated(workspace.path(), no_delay),
+            Err("helper background probe did not start")
+        );
+
+        std::fs::write(
+            workspace.path().join("helper-background-started"),
+            "started",
+        )
+        .unwrap();
+        assert_eq!(
+            verify_background_probe_terminated(workspace.path(), no_delay),
+            Ok(())
+        );
+
+        std::fs::write(
+            workspace.path().join("helper-background-survived"),
+            "survived",
+        )
+        .unwrap();
+        assert_eq!(
+            verify_background_probe_terminated(workspace.path(), no_delay),
+            Err("helper background probe survived payload cleanup")
+        );
     }
 
     fn helper_launch_probe_python() -> &'static str {
@@ -4144,13 +4191,25 @@ for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
 for key in ("NO_PROXY", "no_proxy"):
     assert os.environ.get(key) == "localhost,127.0.0.1,::1", (key, os.environ.get(key))
 
+started = pathlib.Path("helper-background-started")
+survived = pathlib.Path("helper-background-survived")
+foreground_done = pathlib.Path("helper-foreground-done")
 pid = os.fork()
 if pid == 0:
-    pathlib.Path("helper-background-pid").write_text(str(os.getpid()))
-    time.sleep(60)
+    started.write_text("started")
+    while not foreground_done.exists():
+        time.sleep(0.01)
+    time.sleep(2)
+    survived.write_text("survived")
     os._exit(0)
 
-time.sleep(0.5)
+for _ in range(100):
+    if started.exists():
+        break
+    time.sleep(0.01)
+else:
+    print("background process did not start", file=sys.stderr)
+    sys.exit(39)
 sock = socket.create_connection((host, port), 3)
 sock.sendall(b"axis-helper-probe")
 sock.close()
@@ -4173,6 +4232,7 @@ else:
     print("IPv6 connection unexpectedly succeeded", file=sys.stderr)
     sys.exit(41)
 pathlib.Path("helper-launch-ok").write_text("ok")
+foreground_done.write_text("done")
 "#
     }
 

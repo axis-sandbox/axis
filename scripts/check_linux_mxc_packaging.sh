@@ -265,7 +265,6 @@ assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'dest = "/usr/bin/lxc
 for policy in minimal coding-agent gpu-agent; do
     assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" "dest = \"/etc/axis/policies/$policy.yaml\""
 done
-assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'THIRD_PARTY_NOTICES.md'
 assert_contains "$REPO_ROOT/crates/axis-daemon/Cargo.toml" 'usr/share/doc/axis/LICENSE'
 if grep -Fq 'axis-netns-helper", "usr/libexec/axis/", "4755"' "$REPO_ROOT/crates/axis-daemon/Cargo.toml"; then
     fail "base deb package must not install axis-netns-helper setuid content"
@@ -277,7 +276,6 @@ fi
 PYTHONPATH="$REPO_ROOT/scripts" python3 -m unittest \
     scripts.test_verify_release_archive.ReleaseArchiveTests.test_rejects_forged_zip_size_and_prefix_crc_after_full_decompression \
     scripts.test_verify_release_archive.ReleaseArchiveTests.test_rejects_windows_components_changed_by_unicode_normalization \
-    scripts.test_generate_third_party_notices.NoticeGeneratorTests.test_sealed_crate_descriptor_is_immune_to_post_authentication_replacement \
     scripts.test_verify_workflow_structure.WorkflowStructureTests.test_rejects_unrecognized_jobs_in_every_reviewed_workflow \
     scripts.test_verify_workflow_structure.WorkflowStructureTests.test_rejects_echoed_unreachable_and_conditionally_wrapped_controls \
     >/dev/null || fail "publication security regression tests failed"
@@ -301,8 +299,7 @@ for entry in \
     "0755 usr/bin/axisd" \
     "0755 usr/bin/lxc-exec" \
     "0755 usr/libexec/axis/axis-seccomp-launcher" \
-    "0644 usr/share/doc/axis/LICENSE" \
-    "0644 usr/share/doc/axis/THIRD_PARTY_NOTICES.md"; do
+    "0644 usr/share/doc/axis/LICENSE"; do
     mode="${entry%% *}"
     relative="${entry#* }"
     mkdir -p "$PACKAGE_ROOT/$(dirname "$relative")"
@@ -311,8 +308,6 @@ for entry in \
 done
 find "$PACKAGE_ROOT" -type d -exec chmod 0755 {} +
 cp "$REPO_ROOT/LICENSE" "$PACKAGE_ROOT/usr/share/doc/axis/LICENSE"
-cp "$REPO_ROOT/THIRD_PARTY_NOTICES.md" \
-    "$PACKAGE_ROOT/usr/share/doc/axis/THIRD_PARTY_NOTICES.md"
 
 if command -v dpkg-deb >/dev/null; then
     DEB_FIXTURE_ROOT="$TMP_ROOT/deb-fixture"
@@ -376,15 +371,6 @@ fi
 assert_contains "$TMP_ROOT/package-license.log" \
     "LICENSE differs from the repository source"
 cp "$REPO_ROOT/LICENSE" "$PACKAGE_ROOT/usr/share/doc/axis/LICENSE"
-printf '%s\n' tampered >>"$PACKAGE_ROOT/usr/share/doc/axis/THIRD_PARTY_NOTICES.md"
-if "$REPO_ROOT/scripts/verify_linux_package_manifest.sh" root "$PACKAGE_ROOT" \
-    >"$TMP_ROOT/package-notices.log" 2>&1; then
-    fail "package manifest verifier accepted tampered third-party notices"
-fi
-assert_contains "$TMP_ROOT/package-notices.log" \
-    "THIRD_PARTY_NOTICES.md differs from the repository source"
-cp "$REPO_ROOT/THIRD_PARTY_NOTICES.md" \
-    "$PACKAGE_ROOT/usr/share/doc/axis/THIRD_PARTY_NOTICES.md"
 
 assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'const MXC_EXECUTOR_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];'
 assert_contains "$REPO_ROOT/crates/axis-sandbox/src/linux/mxc.rs" 'dir.join(AXIS_SECCOMP_LAUNCHER_NAME)'

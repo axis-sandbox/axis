@@ -32,17 +32,15 @@ trap cleanup EXIT
 
 case "$package_type" in
     deb)
-        command -v dpkg-deb >/dev/null || fail "dpkg-deb is required"
         payload_root="$tmp_root/payload"
         python3 "$ARCHIVE_HELPER" --extract-command-tar "$payload_root" \
             dpkg-deb --fsys-tarfile "$package_path"
         ;;
     rpm)
-        command -v rpm2cpio >/dev/null || fail "rpm2cpio is required"
         payload_root="$tmp_root/payload"
         package_path="$(realpath "$package_path")"
-        python3 "$ARCHIVE_HELPER" --extract-command-newc "$payload_root" \
-            rpm2cpio "$package_path"
+        python3 "$ARCHIVE_HELPER" --extract-command-tar "$payload_root" \
+            rpm2archive -n "$package_path"
         ;;
     root)
         payload_root="$(realpath "$package_path")"
@@ -76,7 +74,6 @@ f 0755 /usr/bin/axisd
 f 0755 /usr/bin/lxc-exec
 f 0755 /usr/libexec/axis/axis-seccomp-launcher
 f 0644 /usr/share/doc/axis/LICENSE
-f 0644 /usr/share/doc/axis/THIRD_PARTY_NOTICES.md
 EOF
 
 # cargo-deb emits the Debian copyright file from package metadata. RPM does not.
@@ -103,7 +100,7 @@ if ! diff -u "$expected" "$actual"; then
     fail "$package_type payload does not match the expected path-and-mode manifest"
 fi
 
-for legal_file in LICENSE THIRD_PARTY_NOTICES.md; do
+for legal_file in LICENSE; do
     packaged="$payload_root/usr/share/doc/axis/$legal_file"
     if ! cmp -s "$REPO_ROOT/$legal_file" "$packaged"; then
         fail "$package_type payload $legal_file differs from the repository source"
