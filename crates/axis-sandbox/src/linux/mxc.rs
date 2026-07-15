@@ -158,11 +158,18 @@ pub struct MxcExecutionSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxcExecutor {
     path: PathBuf,
+    #[cfg(test)]
+    injected_script: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MxcSeccompLauncher {
     path: PathBuf,
+}
+
+#[cfg(test)]
+fn injected_executor_script_path(path: &Path) -> PathBuf {
+    path.with_extension("axis-test-script")
 }
 
 impl MxcExecutor {
@@ -190,7 +197,11 @@ impl MxcExecutor {
     {
         let path = path.into();
         validate_executor_path(&path, ExecutorPathMode::Production)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            #[cfg(test)]
+            injected_script: None,
+        })
     }
 
     #[cfg(test)]
@@ -200,7 +211,12 @@ impl MxcExecutor {
     {
         let path = path.into();
         validate_executor_path(&path, ExecutorPathMode::TestInjected)?;
-        Ok(Self { path })
+        let script = injected_executor_script_path(&path);
+        let injected_script = script.is_file().then_some(script);
+        Ok(Self {
+            path,
+            injected_script,
+        })
     }
 
     #[cfg(test)]
@@ -220,6 +236,21 @@ impl MxcExecutor {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn command(&self) -> Command {
+        #[cfg(test)]
+        {
+            let mut command = Command::new(&self.path);
+            if let Some(script) = &self.injected_script {
+                command.arg(script);
+            }
+            command
+        }
+        #[cfg(not(test))]
+        {
+            Command::new(&self.path)
+        }
     }
 
     pub fn dry_run(
@@ -249,7 +280,7 @@ impl MxcExecutor {
             .try_clone()
             .map_err(|err| MxcExecutorError::ConfigIo(err.to_string()))?;
 
-        let mut command = Command::new(&self.path);
+        let mut command = self.command();
         command
             .arg("--experimental")
             .arg("--dry-run")
@@ -1683,7 +1714,7 @@ impl SandboxImpl for MxcLinuxSandbox {
             None
         };
 
-        let mut command = Command::new(self.executor.path());
+        let mut command = self.executor.command();
         command
             .arg("--experimental")
             .arg("--config")
@@ -5008,6 +5039,12 @@ mod tests {
         let executor = MxcExecutor::from_injected_path(&executable).unwrap();
 
         assert_eq!(executor.path(), executable);
+        let command = executor.command();
+        assert_eq!(command.get_program(), &*executable);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [&*injected_executor_script_path(&executable)]
+        );
     }
 
     #[test]
@@ -8409,15 +8446,29 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
     }
 
     fn write_executable(path: &Path, script: &str, mode: u32) {
-        let parent = path.parent().expect("test executable should have a parent");
-        let mut file = tempfile::NamedTempFile::new_in(parent).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        file.flush().unwrap();
-        file.as_file()
-            .set_permissions(fs::Permissions::from_mode(mode))
+        if path.file_name() == Some(OsStr::new("lxc-exec"))
+            && script.starts_with("#!/bin/sh\n")
+            && mode & 0o111 != 0
+            && mode & 0o022 == 0
+        {
+            write_file(&injected_executor_script_path(path), script, 0o600);
+            fs::copy("/bin/sh", path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            return;
+        }
+        write_file(path, script, mode);
+    }
+
+    fn write_file(path: &Path, contents: &str, mode: u32) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
             .unwrap();
-        let persisted = file.persist(path).unwrap();
-        drop(persisted);
+        file.write_all(contents.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn fake_seccomp_launcher(root: &tempfile::TempDir) -> MxcSeccompLauncher {

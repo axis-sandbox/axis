@@ -51,6 +51,13 @@ pub fn create_pty_unix(size: WinSize) -> Result<PtySession, PtyError> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    #[cfg(target_vendor = "apple")]
+    let mut ws = ws;
+
+    #[cfg(target_vendor = "apple")]
+    let ws_ptr: *mut libc::winsize = &mut ws;
+    #[cfg(not(target_vendor = "apple"))]
+    let ws_ptr: *const libc::winsize = &ws;
 
     let mut master_fd: RawFd = -1;
     let mut slave_fd: RawFd = -1;
@@ -61,7 +68,7 @@ pub fn create_pty_unix(size: WinSize) -> Result<PtySession, PtyError> {
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &ws,
+            ws_ptr,
         )
     };
 

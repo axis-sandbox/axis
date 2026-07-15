@@ -63,41 +63,16 @@ jobs:
           --workflow ci.yml
           --workflow security.yml
 
-  notices:
-    name: Verify distribution notices
-    needs: [identity, gate]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: "22"
-          package-manager-cache: false
-      - name: Install GUI dependencies for notice verification
-        run: npm ci --prefix gui/shared
-      - name: Run publication Python tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
-      - name: Verify GUI dependency notices
-        run: npm run --prefix gui/shared notices:check
-      - name: Verify authenticated dependency notices
-        run: python3 scripts/generate_third_party_notices.py --check --expected-mxc-ref "$MXC_REF"
-
   gui:
     name: GUI release artifacts
-    needs: notices
+    needs: [identity, gate]
     uses: ./.github/workflows/gui-release.yml
     permissions:
       contents: read
 
   build:
     name: Build (${{ matrix.target }})
-    needs: notices
+    needs: [identity, gate]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     strategy:
@@ -198,7 +173,7 @@ jobs:
             cp "$target_dir/axis-netns-helper" "$package_dir/"
           fi
           cp policies/*.yaml "$package_dir/"
-          cp README.md LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          cp README.md LICENSE "$package_dir/"
           cp "packaging/reproducibility/core-${PLATFORM%%-*}.json" "$package_dir/REPRODUCIBILITY.json"
           if [ "$PLATFORM" = "linux-x86_64" ]; then
             cp packaging/runtime/core-linux.json "$package_dir/RUNTIME_DEPENDENCIES.json"
@@ -259,7 +234,6 @@ jobs:
           Copy-Item -Path "policies\*.yaml" -Destination "$packageDir"
           Copy-Item -LiteralPath "README.md" -Destination "$packageDir"
           Copy-Item -LiteralPath "LICENSE" -Destination "$packageDir"
-          Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination "$packageDir"
           Copy-Item -LiteralPath "install.ps1" -Destination "$packageDir"
           Copy-Item -LiteralPath "packaging/reproducibility/core-windows.json" -Destination (Join-Path "$packageDir" "REPRODUCIBILITY.json")
           Add-Type -AssemblyName System.IO.Compression

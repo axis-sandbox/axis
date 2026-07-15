@@ -5360,7 +5360,7 @@ mod tests {
             "AXIS_REQUIRE_BUILT_AXIS_PROXY_E2E: \"1\"",
             "AXIS_REQUIRE_KMSG_AUDIT_E2E: \"1\"",
             "AXIS_PROVISION_KMSG_AUDIT_E2E: \"1\"",
-            "AXIS_EXPECT_MXC_EXECUTOR: /usr/local/bin/lxc-exec",
+            "AXIS_EXPECT_MXC_EXECUTOR: /usr/bin/lxc-exec",
             "AXIS_MXC_EXECUTOR_BUILD: ${{ github.workspace }}/target/release/lxc-exec",
             "bash e2e/linux/test_netns_helper_launch.sh --self-test",
             "ci_bounded_sudo test -e \"$executor\"",

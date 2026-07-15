@@ -23,7 +23,6 @@ assets = [
     ["../../policies/coding-agent.yaml", "etc/axis/policies/", "644"],
     ["../../policies/gpu-agent.yaml", "etc/axis/policies/", "644"],
     ["../../LICENSE", "usr/share/doc/axis/", "644"],
-    ["../../THIRD_PARTY_NOTICES.md", "usr/share/doc/axis/", "644"],
 ]
 conf-files = ["/etc/axis/policies/"]
 
@@ -38,7 +37,6 @@ assets = [
     { source = "policies/coding-agent.yaml", dest = "/etc/axis/policies/coding-agent.yaml", mode = "644" },
     { source = "policies/gpu-agent.yaml", dest = "/etc/axis/policies/gpu-agent.yaml", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/doc/axis/LICENSE", mode = "644" },
-    { source = "THIRD_PARTY_NOTICES.md", dest = "/usr/share/doc/axis/THIRD_PARTY_NOTICES.md", mode = "644" },
 ]
 
 [package.metadata.generate-rpm.requires]

@@ -176,10 +176,13 @@ if [ "${AXIS_REQUIRE_NETNS_HELPER_E2E:-}" = "1" ] && [ -z "${AXIS_EXPECT_MXC_EXE
     exit 1
 fi
 expected_executor="${AXIS_EXPECT_MXC_EXECUTOR:-/usr/local/bin/lxc-exec}"
-if [ "$expected_executor" != "/usr/local/bin/lxc-exec" ]; then
-    echo "ERROR: helper proof executor must use /usr/local/bin/lxc-exec"
-    exit 1
-fi
+case "$expected_executor" in
+    /usr/local/bin/lxc-exec | /usr/bin/lxc-exec) ;;
+    *)
+        echo "ERROR: helper proof executor must use an allowed system lxc-exec path"
+        exit 1
+        ;;
+esac
 executor_build="${AXIS_MXC_EXECUTOR_BUILD:-}"
 if [ -z "$executor_build" ] || [ ! -x "$executor_build" ]; then
     echo "ERROR: AXIS_MXC_EXECUTOR_BUILD must name the locally built executable"
@@ -208,7 +211,9 @@ cleanup() {
     local original_status=$?
     local cleanup_failed=0
     set +e
-    stop_background_servers
+    if declare -F stop_background_servers >/dev/null; then
+        stop_background_servers
+    fi
     if [ -n "$AXSD_PID" ]; then
         terminate_background_process "$AXSD_PID" "axisd cleanup"
     fi
@@ -335,7 +340,7 @@ validate_privileged_directory() {
     fi
 }
 
-validate_privileged_directory /usr/local/bin "MXC executor parent"
+validate_privileged_directory "$(dirname "$expected_executor")" "MXC executor parent"
 reject_preexisting_privileged_path "$expected_executor" "MXC executor"
 INSTALLED_MXC_EXECUTOR=1
 bounded_sudo 5 install -o root -g root -m 0755 "$executor_build" "$expected_executor"

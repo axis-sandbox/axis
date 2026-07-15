@@ -696,6 +696,11 @@ class NoticeGeneratorTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b"expected")
         self.assertEqual(path.stat().st_mtime_ns, modified)
 
+    def test_write_mode_creates_an_absent_notice_file(self):
+        path = self.root / "THIRD_PARTY_NOTICES.md"
+        notices.apply_generated_document(b"expected", check=False, path=path)
+        self.assertEqual(path.read_bytes(), b"expected")
+
 
 if __name__ == "__main__":
     unittest.main()

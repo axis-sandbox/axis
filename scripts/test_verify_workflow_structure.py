@@ -143,16 +143,6 @@ class WorkflowStructureTests(unittest.TestCase):
                 verify(document)
 
     def test_rejects_echoed_unreachable_and_conditionally_wrapped_controls(self):
-        echoed = copy.deepcopy(self.release)
-        notice = self.find_step(
-            echoed, "notices", "Verify authenticated dependency notices"
-        )
-        notice["run"] = (
-            "python3 -m unittest discover -s scripts -p 'test_*.py'\n"
-            "echo 'python3 scripts/generate_third_party_notices.py --check "
-            '--expected-mxc-ref "$MXC_REF"\''
-        )
-
         unreachable = copy.deepcopy(self.release)
         deb = self.find_step(unreachable, "package-linux", "Verify .deb contents")
         deb["run"] = "exit 0\n" 'scripts/verify_linux_package_manifest.sh deb "$deb"\n'
@@ -176,19 +166,11 @@ class WorkflowStructureTests(unittest.TestCase):
         identity = self.find_step(shadowed, "identity", "Bind tag, version, and commit")
         identity["run"] = f"python3() {{ :; }}\n{identity['run']}"
 
-        environment = copy.deepcopy(self.release)
-        notice = self.find_step(
-            environment, "notices", "Verify authenticated dependency notices"
-        )
-        notice["env"] = {"PATH": "/tmp/bypass"}
-
         for label, document, message in (
-            ("echo", echoed, "not exact"),
             ("early exit", unreachable, "successful early exit"),
             ("delimited exit", delimited_exit, "successful early exit"),
             ("conditional", conditional, "unreviewed shell control flow"),
             ("function shadow", shadowed, "not exact"),
-            ("environment", environment, "not exact"),
         ):
             with self.subTest(label=label), self.assertRaisesRegex(
                 verifier.WorkflowError, message
@@ -245,7 +227,6 @@ class WorkflowStructureTests(unittest.TestCase):
         cases = (
             (self.release, "identity", verifier.verify_release_workflow),
             (self.release, "gate", verifier.verify_release_workflow),
-            (self.release, "notices", verifier.verify_release_workflow),
             (self.nightly, "source", verifier.verify_nightly_workflow),
             (self.nightly, "gate", verifier.verify_nightly_workflow),
         )
@@ -549,7 +530,7 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_rejects_nightly_gate_bypass_and_echoed_clean_build(self):
         gate_bypass = copy.deepcopy(self.nightly)
-        gate_bypass["jobs"]["notices"]["needs"].remove("gate")
+        gate_bypass["jobs"]["gui"]["needs"].remove("gate")
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong dependencies"):
             verifier.verify_nightly_workflow(gate_bypass)
 

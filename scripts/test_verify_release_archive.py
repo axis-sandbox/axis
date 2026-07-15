@@ -60,7 +60,6 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         (self.root / "LICENSE").write_bytes(b"project license\n")
-        (self.root / "THIRD_PARTY_NOTICES.md").write_bytes(b"notices\n")
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -68,7 +67,6 @@ class ReleaseArchiveTests(unittest.TestCase):
     def members(self):
         return {
             "axis-test/LICENSE": b"project license\n",
-            "axis-test/THIRD_PARTY_NOTICES.md": b"notices\n",
             "axis-test/axis": b"binary",
         }
 
@@ -341,7 +339,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                 lambda path: path.stat().st_size - 1,
                 "compressed",
             ),
-            ("MAX_ARCHIVE_MEMBERS", lambda _path: 2, "too many"),
+            ("MAX_ARCHIVE_MEMBERS", lambda _path: 1, "too many"),
             ("MAX_ARCHIVE_MEMBER_SIZE", lambda _path: 5, r"member (?:size )?exceeds"),
             ("MAX_ARCHIVE_CONTENT_SIZE", lambda _path: 10, "aggregate"),
         ]

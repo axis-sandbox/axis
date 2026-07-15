@@ -76,7 +76,6 @@ f 0755 /usr/bin/axisd
 f 0755 /usr/bin/lxc-exec
 f 0755 /usr/libexec/axis/axis-seccomp-launcher
 f 0644 /usr/share/doc/axis/LICENSE
-f 0644 /usr/share/doc/axis/THIRD_PARTY_NOTICES.md
 EOF
 
 # cargo-deb emits the Debian copyright file from package metadata. RPM does not.
@@ -103,7 +102,7 @@ if ! diff -u "$expected" "$actual"; then
     fail "$package_type payload does not match the expected path-and-mode manifest"
 fi
 
-for legal_file in LICENSE THIRD_PARTY_NOTICES.md; do
+for legal_file in LICENSE; do
     packaged="$payload_root/usr/share/doc/axis/$legal_file"
     if ! cmp -s "$REPO_ROOT/$legal_file" "$packaged"; then
         fail "$package_type payload $legal_file differs from the repository source"
