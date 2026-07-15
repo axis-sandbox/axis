@@ -45,7 +45,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 
 # Policy engine
-regorus = "0.2"
+regorus = "0.10"
 
 # Logging / tracing
 tracing = "0.1"
@@ -56,7 +56,7 @@ anyhow = "1"
 thiserror = "2"
 
 # Crypto
-sha2 = "0.10"
+sha2 = "0.11"
 
 # HTTP
 hyper = { version = "1", features = ["full"] }
@@ -81,17 +81,17 @@ url = "2"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Linux syscalls
-nix = { version = "0.29", features = ["process", "sched", "signal", "user", "net", "mount"] }
+nix = { version = "0.31", features = ["process", "sched", "signal", "user", "net", "mount"] }
 libc = "0.2"
 
 # Temp directories
 tempfile = "3"
 
 # WebSocket
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 
 # Crypto (for WebSocket handshake)
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.22"
 
 # LLM inference (llama.cpp via Rust bindings)
