@@ -49,7 +49,7 @@ network:
           access: read-write
         - host: "featureassets.org"
           port: 443
-          access: read-only
+          access: read-write
 
     - name: github
       endpoints:
@@ -64,13 +64,13 @@ network:
       endpoints:
         - host: "registry.npmjs.org"
           port: 443
-          access: read-only
+          access: read-write
 
     - name: pypi
       endpoints:
         - host: "pypi.org"
           port: 443
-          access: read-only
+          access: read-write
         - host: "files.pythonhosted.org"
           port: 443
-          access: read-only
+          access: read-write

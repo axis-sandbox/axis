@@ -1,0 +1,73 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /gui/shared
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      gui-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /gui/linux
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      linux-gui-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: nuget
+    directory: /gui/windows/AXIS
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      windows-gui-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      security-tools:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      workflow-actions:
+        patterns:
+          - "*"

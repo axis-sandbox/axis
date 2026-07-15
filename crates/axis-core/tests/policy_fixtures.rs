@@ -126,6 +126,36 @@ fn bundled_agent_policy_fixtures_parse_and_cover_expected_targets() {
 }
 
 #[test]
+fn bundled_agent_policies_grant_only_their_own_state_roots() {
+    for fixture in AGENT_FIXTURES {
+        let policy = load_policy(fixture.path);
+        let expected_state_root = format!("~/.axis/agents/{}", policy.name);
+        let axis_grants = policy
+            .filesystem
+            .read_only
+            .iter()
+            .map(|path| ("read_only", path.as_str()))
+            .chain(
+                policy
+                    .filesystem
+                    .read_write
+                    .iter()
+                    .map(|path| ("read_write", path.as_str())),
+            )
+            .filter(|(_, path)| *path == "~/.axis" || path.starts_with("~/.axis/"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            axis_grants,
+            [("read_write", expected_state_root.as_str())],
+            "{} fixture {} must grant exactly its policy-owned state root and no broader ~/.axis path",
+            fixture.target,
+            fixture.path
+        );
+    }
+}
+
+#[test]
 fn committed_agent_policy_directory_contains_only_tested_fixtures() {
     let policy_dir = repo_root().join("policies/agents");
     let mut actual = std::fs::read_dir(&policy_dir)
@@ -157,7 +187,7 @@ fn committed_agent_policy_directory_contains_only_tested_fixtures() {
 }
 
 #[test]
-fn coding_agent_inference_policy_declares_local_and_cloud_routes_without_raw_secrets() {
+fn coding_agent_inference_policy_uses_supported_local_route_without_raw_secrets() {
     let policy = load_policy("policies/coding-agent.yaml");
     let local = policy
         .inference
@@ -172,22 +202,20 @@ fn coding_agent_inference_policy_declares_local_and_cloud_routes_without_raw_sec
     );
     assert!(local.api_key_env.is_none());
 
-    let cloud = policy
-        .inference
-        .routes
-        .iter()
-        .find(|route| route.name == "cloud-fallback")
-        .expect("coding-agent policy must keep a cloud fallback route");
-    assert_eq!(cloud.provider.as_deref(), Some("anthropic"));
-    assert_eq!(cloud.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
     assert!(
         policy
             .inference
             .routes
             .iter()
-            .all(|route| route.endpoint.as_deref() != Some("ANTHROPIC_API_KEY")),
-        "provider secrets must remain placeholders, not endpoint values"
+            .all(|route| route.api_key_env.is_none()),
+        "the bundled policy must not advertise unsupported HTTPS credential injection"
     );
+    let budget = policy.inference.token_budget.as_ref().unwrap();
+    assert!(matches!(
+        budget.action_on_exhaust,
+        axis_core::policy::ExhaustAction::Reject
+    ));
+    assert!(budget.fallback_route.is_none());
 }
 
 #[test]

@@ -139,21 +139,27 @@ mod tests {
     #[test]
     fn detect_openai_key() {
         let detector = LeakDetector::new().unwrap();
-        let data = concat!("Authorization: Bearer ", "sk", "-abcdefghijklmnopqrstuvwxyz1234567890").as_bytes();
-        let findings = detector.scan(data);
+        let data = [
+            "Authorization: Bearer ",
+            "sk",
+            "-abcdefghijklmnopqrstuvwxyz1234567890",
+        ]
+        .concat();
+        let findings = detector.scan(data.as_bytes());
         assert!(!findings.is_empty(), "should detect OpenAI key");
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.pattern_name == "openai_api_key" || f.pattern_name == "bearer_token")
-        );
+        assert!(findings.iter().any(|f| f.pattern_name == "openai_api_key"));
     }
 
     #[test]
     fn detect_anthropic_key() {
         let detector = LeakDetector::new().unwrap();
-        let data = concat!("key: ", "sk", "-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").as_bytes();
-        let findings = detector.scan(data);
+        let data = [
+            "key: ",
+            "sk",
+            "-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ]
+        .concat();
+        let findings = detector.scan(data.as_bytes());
         assert!(
             findings
                 .iter()
@@ -164,16 +170,16 @@ mod tests {
     #[test]
     fn detect_github_pat() {
         let detector = LeakDetector::new().unwrap();
-        let data = concat!("token: gh", "p_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij").as_bytes();
-        let findings = detector.scan(data);
+        let data = ["token: gh", "p_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let findings = detector.scan(data.as_bytes());
         assert!(findings.iter().any(|f| f.pattern_name == "github_pat"));
     }
 
     #[test]
     fn detect_pem_key() {
         let detector = LeakDetector::new().unwrap();
-        let data = concat!("-----BEGIN RSA ", "PRIVATE KEY-----\nMIIE...").as_bytes();
-        let findings = detector.scan(data);
+        let data = ["-----BEGIN RSA ", "PRIVATE KEY-----\nMIIE..."].concat();
+        let findings = detector.scan(data.as_bytes());
         assert!(findings.iter().any(|f| f.pattern_name == "pem_private_key"));
     }
 
@@ -187,7 +193,8 @@ mod tests {
 
     #[test]
     fn redact_hides_credential() {
-        let redacted = LeakDetector::redact_match(concat!("sk", "-ant-api03-AAAAAAAAAAAAAAAA"));
+        let fixture = ["sk", "-ant-api03-AAAAAAAAAAAAAAAA"].concat();
+        let redacted = LeakDetector::redact_match(&fixture);
         assert!(redacted.starts_with("sk-ant-a"));
         assert!(redacted.ends_with("...REDACTED"));
     }

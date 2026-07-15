@@ -540,7 +540,7 @@ fn startup_pty_bridge_helper(profile: RuntimeProfileCase) -> Result<Option<PathB
     }
     axis_cli_helper_path()
         .map(Some)
-        .ok_or_else(|| "interactive profile requires an axis CLI binary beside runtime-metrics; run `cargo build -p axis-cli` before collecting this profile".into())
+        .ok_or_else(|| "interactive profile requires an axis CLI binary beside runtime-metrics; run `cargo build --locked -p axis-cli` before collecting this profile".into())
 }
 
 fn axis_cli_helper_path() -> Option<PathBuf> {
@@ -721,9 +721,7 @@ async fn benchmark_cold_proxy_deny_inner(
         sandbox_id,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
-        enable_l7: false,
         enable_leak_detection: false,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: connect_attribution.clone(),
         enable_identity_diagnostics: false,

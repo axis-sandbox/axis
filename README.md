@@ -1,6 +1,6 @@
 # AXIS: Agent eXecution Isolation Substrate
 
-A high-performance agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default installed Linux path uses the MXC Bubblewrap process backend with AXIS-owned policy layers and does not require admin privileges; stricter native Linux proxy networking may require host capabilities or the optional AXIS helper.
+A high-performance agent sandbox runtime — secure, policy-governed execution for autonomous AI agents on your local hardware. The default installed Linux path uses the MXC Bubblewrap process backend with AXIS-owned policy layers and does not require admin privileges; strict Linux proxy networking may require host capabilities or the optional AXIS helper.
 
 <p align="center">
   <img src="docs/architecture.svg" alt="AXIS Architecture" width="800">
@@ -8,15 +8,16 @@ A high-performance agent sandbox runtime — secure, policy-governed execution f
 
 ## What It Does
 
-AXIS isolates AI agent processes using OS-native primitives:
+AXIS isolates AI agent processes using OS-native primitives where the selected
+platform backend is available:
 
 | Layer | Linux | Windows | macOS |
 |---|---|---|---|
-| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | Restricted Token + Job Object | Seatbelt (sandbox-exec) |
-| Filesystem | MXC Bubblewrap mounts or native Landlock LSM | NTFS ACLs + Low Integrity | Seatbelt profile (subpath rules) |
-| Network | block mode, MXC cooperative proxy, or strict native netns proxy | AppContainer + loopback proxy | Seatbelt network deny + proxy |
-| GPU | Optional HIP Remote artifacts | Optional HIP Remote artifacts | Optional HIP Remote artifacts |
-| Inference | Local LLM via llama.cpp or vLLM | Same | Same |
+| Process | MXC Bubblewrap process backend with AXIS seccomp; native Landlock/seccomp retained | Launch blocked; Restricted Token + Job Object are containment targets | Seatbelt (sandbox-exec) |
+| Filesystem | MXC Bubblewrap mounts or native Landlock LSM | Launch blocked; NTFS ACLs + Low Integrity are containment targets | Seatbelt profile (subpath rules) |
+| Network | block mode or strict netns proxy | Launch blocked; AppContainer + loopback proxy are containment targets | Seatbelt network deny + proxy |
+| GPU | Optional HIP Remote artifacts | Unavailable while native launch is blocked | Optional HIP Remote artifacts |
+| Inference | Local LLM via llama.cpp or vLLM | Unavailable while native launch is blocked | Same |
 
 In proxy mode, allowed network requests go through a policy-evaluated proxy.
 HIP Remote policies route GPU API calls to a worker process when the optional
@@ -24,26 +25,37 @@ client and worker artifacts are present.
 
 ## Install
 
+Prebuilt archives are available for Linux x86-64, macOS Apple silicon, and
+Windows x86-64. Other targets can be built from source.
+
 ```bash
 # Linux / macOS
-curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh
 
 # Linux proxy-mode helper, optional and privileged
-curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh -s -- --with-netns-helper
+curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh -s -- --with-netns-helper
 ```
 
+Windows installation requires [PowerShell 7 or later](https://aka.ms/powershell-release),
+invoked as `pwsh`.
+
 ```powershell
-# Windows (PowerShell)
-irm 'https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1' | iex
+# Windows
+irm 'https://raw.githubusercontent.com/ROCm/axis/main/install.ps1' | iex
 ```
+
+Windows artifacts can be installed, but the native Windows process backend
+currently rejects every user-command launch before process creation. It will
+remain disabled until the containment target described below is implemented and
+proven.
 
 ```bash
 # Nightly builds
-curl -sSf .../install.sh | sh -s -- --nightly    # Linux/macOS
+curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh -s -- --nightly
 
 # Build from source
 rustup toolchain install 1.95.0 --profile minimal
-cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
+cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 
 # Linux packages
 sudo dpkg -i axis_0.3.5_amd64.deb    # Debian/Ubuntu
@@ -63,7 +75,7 @@ The Linux default MXC process backend also needs the host `bubblewrap` runtime
 and unprivileged user namespaces enabled. Those are host runtime prerequisites,
 not AXIS privileged install steps.
 
-When developing from a checkout, `cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins`
+When developing from a checkout, `cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins`
 builds the AXIS binaries and Linux helper binaries. Source-tree tests that
 exercise the real MXC runtime also need an `lxc-exec` binary built from the
 pinned MXC revision and placed on `PATH` from a safe, non-writable executable
@@ -88,21 +100,20 @@ require sudo, a setuid helper, or a VM when installed from packaged artifacts.
 
 ```bash
 # Run a resource-limited or proxy policy when the host can enforce it
-axis run --policy policies/coding-agent.yaml -- python3 my_agent.py
+axis run --policy coding-agent -- python3 my_agent.py
 
 # Or use the daemon for multi-sandbox management
 axisd &
-axis create --policy policies/minimal.yaml -- python3 my_agent.py
+axis create --policy minimal -- python3 my_agent.py
 axis list
 axis destroy <sandbox-id>
 ```
 
 On Linux, policies that request CPU, memory, or process limits require writable
-cgroups v2 or a documented fallback. `network.mode: proxy` uses MXC cooperative
-proxy configuration for policies that do not require binary attribution; stricter
-native proxy enforcement additionally needs native `CAP_NET_ADMIN` support or
-the optional AXIS netns helper. Missing capabilities are fatal for the requested
-policy rather than silently weakening the sandbox. See
+cgroups v2 or a documented fallback. `network.mode: proxy` uses an AXIS-owned
+strict proxy boundary and needs native `CAP_NET_ADMIN` support or the optional
+AXIS netns helper. Missing capabilities are fatal for the requested policy rather
+than silently weakening the sandbox. See
 [Setup And Install](docs/setup-and-install.md) for setup commands,
 [Linux Setup](docs/linux-setup.md) for the mode matrix, and
 [Install And Runtime Dependencies](docs/install-and-runtime-dependencies.md)
@@ -131,20 +142,20 @@ fails closed when the selected provider cannot enforce the policy:
 1. MXC Bubblewrap or native Landlock — filesystem allowlist enforced by the selected backend
 2. AXIS seccomp default-deny — policy-aware syscall and socket-domain filtering
 3. block-mode networking — IP socket domains denied without proxy env injection
-4. proxy-mode networking — MXC cooperative proxy for host/port policies, or
-   netns + veth + firewall rules for stricter native proxy policies through
-   the AXIS proxy when native `CAP_NET_ADMIN` or the optional AXIS helper is
-   available
+4. proxy-mode networking — netns + veth + firewall rules route permitted
+   traffic through the AXIS proxy and reject direct egress when native
+   `CAP_NET_ADMIN` or the optional AXIS helper is available
 5. bubblewrap fallback — block-mode fallback when Landlock is unavailable and a
    safe system `bwrap` can preserve the requested semantics
 
-### Windows (AppContainer + Job Object)
+### Windows (Launch Blocked)
 
-Windows uses Win32 APIs available on Windows 11 Home (no Pro/Enterprise required):
-- **Restricted Token** with Low Integrity Level — strips all privileges
-- **Job Object** — process count, memory, CPU rate limits with `KILL_ON_JOB_CLOSE`
-- **AppContainer** with zero capabilities — kernel-level network deny
-- **ETW bypass detection** — monitors for non-proxy network connections
+The native Windows backend fails closed before creating a user process. Its
+current code does not apply a Job Object, AppContainer, restricted token, NTFS
+ACL boundary, proxy boundary, or isolated environment to the initial process.
+Those controls remain implementation targets, and no Windows native containment
+or bypass-detection claim should be treated as proven until the complete launch
+path and negative tests land.
 
 ## GPU Sandbox
 
@@ -155,7 +166,7 @@ Agents can use AMD GPUs without direct hardware access:
 axis model pull TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
 # Run with GPU policy (requires hip-worker on GPU host)
-axis run --policy policies/gpu-agent.yaml -- python gpu_agent.py
+axis run --policy gpu-agent -- python gpu_agent.py
 ```
 
 The sandbox sees the GPU through a HIP Remote client library proxied over TCP
@@ -234,24 +245,18 @@ axis/
 
 ## Performance
 
-| Metric | Linux | Windows | Target |
-|---|---|---|---|
-| Sandbox startup | 0.6ms | 1.6ms | <200ms / <500ms |
-| OPA eval throughput | 59K/sec | 42K/sec | >10K/sec |
-| OPA per-request | 17µs | 24µs | <5ms |
-| Memory per sandbox | 1.6MB | — | <50MB |
-
-The single synthetic OPA throughput number comes from release-mode
-`success-metrics`. For policy-specific proxy request timing, and MXC Bubblewrap
-proxy-mode timing when a safe MXC executor is available, run
-`cargo run -p axis-bench --bin opa-scenarios`; see
+Performance depends on the selected containment backend, policy, and host. The
+repository includes benchmark programs for reproducible comparisons. For
+policy-specific proxy request timing, and MXC Bubblewrap proxy-mode timing when
+a safe MXC executor is available, run
+`cargo run --locked -p axis-bench --bin opa-scenarios`; see
 [OPA Proxy Benchmarks](docs/opa-proxy-benchmarks.md). For phase-level startup,
 cold proxy deny, and synthetic OPA comparisons across named runtime profiles,
-run `cargo run -p axis-bench --bin runtime-metrics`; see
+run `cargo run --locked -p axis-bench --bin runtime-metrics`; see
 [Runtime Performance Benchmarks](docs/runtime-performance-benchmarks.md).
 For side-by-side MXC backend and network-mode runtime checks, plus the AXIS
 native filesystem boundary comparison, run
-`cargo run -p axis-bench --bin mxc-isolation-matrix`; see
+`cargo run --locked -p axis-bench --bin mxc-isolation-matrix`; see
 [MXC Isolation Matrix](docs/mxc-isolation-matrix.md).
 
 ## Status

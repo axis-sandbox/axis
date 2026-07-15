@@ -10,21 +10,21 @@ The machine-readable source of truth for this matrix is
 `axis_core::backend_defaults`. To inspect it as JSON:
 
 ```bash
-cargo run -p axis-bench --bin backend-defaults
+cargo run --locked -p axis-bench --bin backend-defaults
 ```
 
 Security coverage and unsupported-policy counts are emitted from the shared
 capability planner with:
 
 ```bash
-cargo run -p axis-bench --bin backend-evidence
+cargo run --locked -p axis-bench --bin backend-evidence
 ```
 
 Policy-specific proxy request throughput, with optional MXC Bubblewrap
 proxy-mode runs when a safe MXC executor is available, is emitted with:
 
 ```bash
-cargo run -p axis-bench --bin opa-scenarios
+cargo run --locked -p axis-bench --bin opa-scenarios
 ```
 
 See [OPA Proxy Benchmarks](opa-proxy-benchmarks.md) for the inputs and
@@ -34,7 +34,7 @@ Current-host MXC backend/network-mode runtime checks, plus the AXIS native
 filesystem-boundary comparison, are emitted with:
 
 ```bash
-cargo run -p axis-bench --bin mxc-isolation-matrix
+cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 See [MXC Isolation Matrix](mxc-isolation-matrix.md) for row definitions,
@@ -46,16 +46,16 @@ dependency gates, and status meanings.
 | --- | --- | --- |
 | Linux | `mxc-linux-bubblewrap` | Use the MXC process backend by default while AXIS supplies seccomp, resource, credential, proxy policy, and cleanup layers around it. |
 | macOS | `axis-native-macos-seatbelt` | Retain native default while direct Seatbelt profile generation remains the proven no-extra-runtime path. |
-| Windows | `axis-native-windows` | Retain native default while Job Object, Low Integrity, and AXIS-owned process lifecycle behavior remain the proven baseline. |
+| Windows | None (`axis-native-windows` disabled) | Reject native user-command launches before process creation until Job Object, AppContainer/token, ACL, proxy, environment, lifecycle, and cleanup enforcement are implemented and proven together. |
 
 Non-default MXC process backends are candidates. They can become defaults only
 after they match AXIS policy semantics and have benchmark evidence for startup,
 teardown, maximum RSS, file descriptors, process count, density, host dependency
 cost, security coverage, unsupported-policy counts, and cleanup failures.
-The historical README smoke benchmark command is:
+The synthetic smoke benchmark command is:
 
 ```bash
-cargo run --release -p axis-bench --bin success-metrics
+cargo run --locked --release -p axis-bench --bin success-metrics
 ```
 
 Default-backend evidence should use the phase-level runtime benchmark so
@@ -65,14 +65,15 @@ provider and policy profile:
 ```bash
 AXIS_RUNTIME_METRICS_PROVIDERS=mxc \
 AXIS_RUNTIME_METRICS_PROFILES=mxc_process \
-  cargo run --release -p axis-bench --bin runtime-metrics
+  cargo run --locked --release -p axis-bench --bin runtime-metrics
 ```
 
 ## Candidate And Experimental Backends
 
 | Backend | Class | Status | Benchmark gate |
 | --- | --- | --- | --- |
-| `axis-native-linux` | Process | Retained | `AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run --release -p axis-bench --bin runtime-metrics` |
+| `axis-native-linux` | Process | Retained | `AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run --locked --release -p axis-bench --bin runtime-metrics` |
+| `axis-native-windows` | Process | Blocked containment target | No benchmark gate until the pre-execution containment path is implemented |
 | `mxc-macos-seatbelt` | Process | Candidate | `AXIS_BENCH_MXC_MACOS_SEATBELT=1` |
 | `mxc-windows-processcontainer` | Process | Candidate | `AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1` |
 | `mxc-linux-lxc` | Container | Candidate | `AXIS_BENCH_MXC_LXC=1` |

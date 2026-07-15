@@ -65,15 +65,6 @@ pub struct PolicyDecision {
     pub reason: Option<String>,
 }
 
-/// An HTTP request being evaluated for L7 policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpAction {
-    pub method: String,
-    pub path: String,
-    pub query: Option<String>,
-    pub matched_network_policy: String,
-}
-
 /// An inference request being routed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceAction {

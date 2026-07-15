@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Gated MXC VM-style runtime smoke tests.
 #
 # These tests intentionally do not install MXC, change host VM/container

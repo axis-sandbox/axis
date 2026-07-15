@@ -16,7 +16,7 @@ filesystem:
     - /Library
   read_write:
     - "{workspace}"
-    - "~/.axis"
+    - "~/.axis/agents/agent-zeroclaw"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

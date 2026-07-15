@@ -1,3 +1,6 @@
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # AXIS Agent Installer for Windows (PowerShell)
 #
 # Installs agent runtimes into %LOCALAPPDATA%\axis\tools\.

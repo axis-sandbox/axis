@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Test HIP program that runs inside an AXIS sandbox.
 Uses the hip-remote client library to talk to a remote hip-worker.

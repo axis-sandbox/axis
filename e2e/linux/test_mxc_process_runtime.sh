@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Gated Linux MXC process-runtime proofs.
 #
 # This wrapper exposes the existing Rust real-runtime MXC process tests as a
@@ -72,7 +75,7 @@ echo "=== AXIS MXC Process Runtime ==="
 echo "executor: $EXECUTOR"
 echo "cargo: $CARGO_BIN"
 
-"$CARGO_BIN" build -p axis-sandbox --bin axis-seccomp-launcher
+"$CARGO_BIN" build --locked -p axis-sandbox --bin axis-seccomp-launcher
 
 if [ -n "${AXIS_TEST_AXIS_SECCOMP_LAUNCHER:-}" ]; then
     if [ ! -x "$AXIS_TEST_AXIS_SECCOMP_LAUNCHER" ]; then
@@ -90,12 +93,17 @@ export AXIS_TEST_MXC_EXECUTOR="$EXECUTOR"
 export AXIS_TEST_AXIS_SECCOMP_LAUNCHER="$LAUNCHER"
 
 run_test() {
-    "$CARGO_BIN" test -p axis-sandbox "$1" -- --nocapture
+    "$CARGO_BIN" test --locked -p axis-sandbox "$1" -- --nocapture
 }
 
-run_test gated_real_mxc_allow_and_block_runtime_parity
-run_test gated_real_mxc_payload_cannot_read_axis_config_fd
-run_test gated_real_mxc_timeout_cleans_tmpdir
+run_process_test() {
+    AXIS_REAL_MXC_PROCESS_TESTS=1 \
+        "$CARGO_BIN" test --locked -p axis-sandbox "$1" -- --nocapture
+}
+
+run_process_test gated_real_mxc_allow_and_block_runtime_parity
+run_process_test gated_real_mxc_payload_cannot_read_axis_config_fd
+run_process_test gated_real_mxc_timeout_cleans_tmpdir
 
 if [ "${AXIS_REAL_MXC_PROXY_TESTS:-}" = "1" ]; then
     run_test gated_real_mxc_native_proxy_reaches_only_axis_proxy_address

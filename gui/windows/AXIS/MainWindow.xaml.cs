@@ -1,3 +1,6 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 using Microsoft.Web.WebView2.Core;
 using System;
 using System.IO;

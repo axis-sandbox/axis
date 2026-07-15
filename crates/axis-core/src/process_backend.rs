@@ -41,6 +41,7 @@ pub struct ProcessBackendDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum NativeBackendRetentionDecision {
     Retain,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -230,18 +231,17 @@ pub const NATIVE_PROCESS_BACKEND_RETENTION: &[NativeProcessBackendRetention] = &
     NativeProcessBackendRetention {
         id: BackendCapabilityMapId::AxisNativeWindows,
         platform: BackendPlatform::Windows,
-        decision: NativeBackendRetentionDecision::Retain,
-        rationale: "Retain the native Windows path while Job Object, Low Integrity, and process-container primitives provide the current process sandbox vocabulary and until MXC ProcessContainer proves equivalent AXIS-owned lifecycle and resource behavior.",
+        decision: NativeBackendRetentionDecision::Disabled,
+        rationale: "Disable the native Windows launch path until Job Object, restricted-token/AppContainer, ACL, proxy, environment, lifecycle, and cleanup controls are applied before user code executes.",
         advantages: &[
-            "Job Object resource controls",
-            "Low Integrity process boundary",
-            "platform-native process containment",
-            "AXIS-owned credential and lifecycle handling",
+            "Job Object implementation asset",
+            "restricted-token and AppContainer implementation assets",
+            "NTFS ACL implementation asset",
         ],
         replacement_requirements: &[
             "matching AXIS policy semantics",
-            "equivalent native backend tests",
-            "benchmark evidence for startup, teardown, memory, and density",
+            "complete pre-execution native backend tests",
+            "benchmark evidence after the containment boundary is enabled",
         ],
     },
 ];
@@ -530,7 +530,14 @@ mod tests {
             assert!(descriptor.native_axis_backend);
             assert_eq!(descriptor.platform, retention.platform);
             assert_eq!(backend.platform, retention.platform);
-            assert_eq!(retention.decision, NativeBackendRetentionDecision::Retain);
+            if retention.decision == NativeBackendRetentionDecision::Disabled {
+                assert!(matches!(
+                    backend.process.command,
+                    CapabilitySupport::Unsupported { .. }
+                ));
+            } else {
+                assert_eq!(retention.decision, NativeBackendRetentionDecision::Retain);
+            }
             assert!(!retention.rationale.trim().is_empty());
             assert!(!retention.advantages.is_empty());
             assert!(!retention.replacement_requirements.is_empty());
@@ -595,14 +602,19 @@ mod tests {
         for descriptor in process_backend_descriptors() {
             let policy = process_policy(NetworkMode::Allow);
             let runtime = present_runtime_for_backend(descriptor.id);
-            let spec = build_process_backend_execution_spec(
+            let result = build_process_backend_execution_spec(
                 &policy,
                 descriptor.id,
                 launch_options(),
                 &runtime,
                 &PlannerOptions::new(),
-            )
-            .unwrap_or_else(|err| {
+            );
+            if descriptor.id == BackendCapabilityMapId::AxisNativeWindows {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("native Windows containment is disabled"));
+                continue;
+            }
+            let spec = result.unwrap_or_else(|err| {
                 panic!("{} rejected unexpectedly: {err}", descriptor.id.as_str())
             });
 
@@ -765,7 +777,6 @@ mod tests {
             match descriptor.id {
                 BackendCapabilityMapId::AxisNativeLinux
                 | BackendCapabilityMapId::MxcLinuxBubblewrap
-                | BackendCapabilityMapId::AxisNativeWindows
                 | BackendCapabilityMapId::MxcWindowsProcessContainer => {
                     assert!(
                         plan.spawn_allowed(),
@@ -785,6 +796,14 @@ mod tests {
                     assert!(error.contains("resources.memory"), "{error}");
                     assert!(error.contains("resources.cpu"), "{error}");
                 }
+                BackendCapabilityMapId::AxisNativeWindows => {
+                    assert!(!plan.spawn_allowed());
+                    assert!(
+                        plan.pre_spawn_error()
+                            .unwrap()
+                            .contains("native Windows containment is disabled")
+                    );
+                }
                 other => panic!("unexpected process backend descriptor {other:?}"),
             }
         }
@@ -797,31 +816,27 @@ mod tests {
         policy.process.max_memory_mb = 256;
         policy.process.cpu_rate_percent = 50;
 
-        for id in [
-            BackendCapabilityMapId::AxisNativeWindows,
-            BackendCapabilityMapId::MxcWindowsProcessContainer,
-        ] {
-            let runtime = RuntimeProbeSnapshot::new()
-                .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
-                .with_dependency(
-                    host_dependency::WINDOWS_PROCESS_CONTAINER,
-                    DependencyState::Present,
-                )
-                .with_dependency(
-                    host_dependency::WINDOWS_LOW_INTEGRITY,
-                    DependencyState::Present,
-                );
-            let plan =
-                plan_process_backend_policy(&policy, id, &runtime, &PlannerOptions::new()).unwrap();
-
-            assert!(!plan.spawn_allowed(), "{id:?}");
-            let error = plan.pre_spawn_error().unwrap();
-            assert!(error.contains("resources.process_count"), "{error}");
-            assert!(
-                error.contains(host_dependency::WINDOWS_JOBOBJECT),
-                "{error}"
+        let runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
+            .with_dependency(
+                host_dependency::WINDOWS_PROCESS_CONTAINER,
+                DependencyState::Present,
             );
-        }
+        let plan = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcWindowsProcessContainer,
+            &runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+
+        assert!(!plan.spawn_allowed());
+        let error = plan.pre_spawn_error().unwrap();
+        assert!(error.contains("resources.process_count"), "{error}");
+        assert!(
+            error.contains(host_dependency::WINDOWS_JOBOBJECT),
+            "{error}"
+        );
     }
 
     #[test]
@@ -882,8 +897,8 @@ mod tests {
     }
 
     #[test]
-    fn strict_proxy_is_axis_owned_for_mxc_linux_process_backend() {
-        let runtime = RuntimeProbeSnapshot::new()
+    fn strict_proxy_requires_selected_axis_boundary_for_mxc_linux_process_backend() {
+        let base_runtime = RuntimeProbeSnapshot::new()
             .with_dependency(host_dependency::MXC_EXECUTOR, DependencyState::Present)
             .with_dependency(host_dependency::LINUX_BUBBLEWRAP, DependencyState::Present)
             .with_dependency(host_dependency::LINUX_USERNS, DependencyState::Present)
@@ -893,6 +908,25 @@ mod tests {
             );
         let policy = process_policy(NetworkMode::Proxy);
 
+        let rejected = plan_process_backend_policy(
+            &policy,
+            BackendCapabilityMapId::MxcLinuxBubblewrap,
+            &base_runtime,
+            &PlannerOptions::new(),
+        )
+        .unwrap();
+        assert!(!rejected.spawn_allowed());
+        assert!(
+            rejected
+                .pre_spawn_error()
+                .unwrap()
+                .contains(host_dependency::LINUX_STRICT_PROXY)
+        );
+
+        let runtime = base_runtime.with_dependency(
+            host_dependency::LINUX_STRICT_PROXY,
+            DependencyState::Present,
+        );
         let plan = plan_process_backend_policy(
             &policy,
             BackendCapabilityMapId::MxcLinuxBubblewrap,
@@ -908,7 +942,10 @@ mod tests {
             .iter()
             .find(|decision| decision.requirement == "network.strict_proxy")
             .unwrap();
-        assert_eq!(strict_proxy.support, CapabilitySupport::AxisOwned);
+        assert_eq!(
+            strict_proxy.support,
+            CapabilitySupport::with_dependency(host_dependency::LINUX_STRICT_PROXY)
+        );
     }
 
     #[test]
@@ -1142,8 +1179,8 @@ mod tests {
             endpoints: vec![Endpoint {
                 host: "api.github.com".into(),
                 port: 443,
-                access: Access::ReadOnly,
-                protocol: Some("https".into()),
+                access: Access::ReadWrite,
+                protocol: None,
                 rules: Vec::new(),
             }],
             binaries: vec![BinaryMatch {

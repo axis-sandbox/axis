@@ -38,34 +38,6 @@ _binary_matches(pol, binary_path) if {
     glob.match(bin.path, ["/"], binary_path)
 }
 
-# ─── L7 HTTP layer ──────────────────────────────────────────────────────────
-
-http.decision := result if {
-    input.method
-    input.path
-    result := _http_eval
-}
-
-default _http_eval := {"allowed": false, "matched_policy": null, "reason": "no matching L7 rule"}
-
-# Allow if any L7 rule in the matched network policy allows this method+path.
-_http_eval := {"allowed": true, "matched_policy": input.matched_network_policy, "reason": null} if {
-    some pol in data.network.policies
-    pol.name == input.matched_network_policy
-    some ep in pol.endpoints
-    some rule in ep.rules
-    rule.allow.method == input.method
-    glob.match(rule.allow.path, ["/"], input.path)
-}
-
-# If a network policy has no L7 rules, allow all HTTP through it.
-_http_eval := {"allowed": true, "matched_policy": input.matched_network_policy, "reason": "no L7 rules, default allow"} if {
-    some pol in data.network.policies
-    pol.name == input.matched_network_policy
-    some ep in pol.endpoints
-    count(ep.rules) == 0
-}
-
 # ─── Inference layer ─────────────────────────────────────────────────────────
 
 inference.decision := result if {

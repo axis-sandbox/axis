@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "profile": "gui-windows",
+  "requirements": [
+    {
+      "name": "dotnet-desktop-runtime",
+      "version": "8.0",
+      "purl": "pkg:generic/dotnet-desktop-runtime@8.0",
+      "sourceInfo": "Host-provided Microsoft .NET Desktop Runtime 8.0"
+    },
+    {
+      "name": "webview2-runtime",
+      "version": "evergreen",
+      "purl": "pkg:generic/webview2-runtime@evergreen",
+      "sourceInfo": "Host-provided Microsoft Edge WebView2 Evergreen Runtime"
+    }
+  ]
+}

@@ -14,7 +14,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis"
+    - "~/.axis/agents/agent-openclaw"
     - "~/.openclaw"
     - "~/.config"
   deny:

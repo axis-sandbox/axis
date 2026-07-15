@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Gated MXC VM-style runtime benchmarks.
 #
 # This harness does not install MXC, mutate host VM/container settings, or

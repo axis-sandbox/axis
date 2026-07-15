@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Build script for AXIS GUI native apps.
 # Builds the shared frontend, then copies dist/ into each platform app.
 set -e
@@ -9,6 +12,7 @@ SHARED_DIR="$SCRIPT_DIR/shared"
 echo "=== Building shared frontend ==="
 cd "$SHARED_DIR"
 npm ci
+npm run typecheck
 npm run build
 echo "Frontend built: $(du -sh dist/ | cut -f1)"
 
@@ -34,5 +38,5 @@ echo ""
 echo "=== Done ==="
 echo "Next steps:"
 echo "  macOS:   cd gui/macos && swift build"
-echo "  Linux:   cd gui/linux && cargo build --release"
+echo "  Linux:   cd gui/linux && cargo build --locked --release"
 echo "  Windows: cd gui/windows/AXIS && dotnet build"

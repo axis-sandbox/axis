@@ -923,7 +923,7 @@ impl MxcLinuxSandbox {
             tmpdir_active = true;
         }
 
-        let network_translation = mxc_network_translation_mode(&config.policy, &network_strategy);
+        let network_translation = mxc_network_translation_mode(&network_strategy);
         let spec =
             crate::sandbox::record_startup_result(&trace, "backend.preflight.mxc_spec", || {
                 build_spec(config, network_translation)
@@ -1125,16 +1125,14 @@ impl MxcLinuxSandbox {
 
     fn cleanup_netns_with_helper_token<F>(&mut self, ns_name: &str, destroy: F) -> Option<String>
     where
-        F: FnOnce(SandboxId, &str) -> Result<(), String>,
+        F: FnOnce(SandboxId, &str) -> Result<super::netns::HelperCleanupOutcome, String>,
     {
         let token = self.netns_helper_destroy_token.clone()?;
         match destroy(self.id, &token) {
-            Ok(()) => {
-                self.netns_name = None;
-                self.netns_helper_destroy_token = None;
-                None
-            }
-            Err(error) if super::netns::helper_cleanup_already_done(&error) => {
+            Ok(
+                super::netns::HelperCleanupOutcome::Destroyed
+                | super::netns::HelperCleanupOutcome::AlreadyCompleted,
+            ) => {
                 self.netns_name = None;
                 self.netns_helper_destroy_token = None;
                 None
@@ -1243,6 +1241,39 @@ fn resolve_mxc_network_strategy(
     ),
     SandboxError,
 > {
+    resolve_mxc_network_strategy_with_strict_proxy(
+        config,
+        |policy, sandbox_id, proxy_port, proxy_addr| {
+            super::strategy::build_strict_proxy_strategy(policy, sandbox_id, proxy_port, proxy_addr)
+                .map_err(|err| SandboxError::IsolationFailed(format!("MXC Linux network: {err}")))
+        },
+    )
+}
+
+fn resolve_mxc_network_strategy_with_strict_proxy<F>(
+    config: &SandboxConfig,
+    resolve_strict_proxy: F,
+) -> Result<
+    (
+        super::strategy::NetworkStrategy,
+        super::strategy::ProxyStrategy,
+    ),
+    SandboxError,
+>
+where
+    F: FnOnce(
+        &Policy,
+        SandboxId,
+        u16,
+        Option<SocketAddr>,
+    ) -> Result<
+        (
+            super::strategy::NetworkStrategy,
+            super::strategy::ProxyStrategy,
+        ),
+        SandboxError,
+    >,
+{
     let (network, proxy) = match config.policy.network.mode {
         NetworkMode::Allow => {
             reject_endpoint_policies(&config.policy, "allow").map_err(|err| {
@@ -1262,24 +1293,12 @@ fn resolve_mxc_network_strategy(
                 super::strategy::ProxyStrategy::None,
             )
         }
-        NetworkMode::Proxy if !policy_requires_connect_attribution(&config.policy) => {
-            if config.proxy_port == 0 || config.proxy_addr.is_none() {
-                return Err(SandboxError::IsolationFailed(
-                    "MXC Linux cooperative proxy mode requires an AXIS proxy bind address".into(),
-                ));
-            }
-            (
-                super::strategy::NetworkStrategy::AllowHost,
-                super::strategy::ProxyStrategy::None,
-            )
-        }
-        NetworkMode::Proxy => super::strategy::build_strict_proxy_strategy(
+        NetworkMode::Proxy => resolve_strict_proxy(
             &config.policy,
             config.id,
             config.proxy_port,
             config.proxy_addr,
-        )
-        .map_err(|err| SandboxError::IsolationFailed(format!("MXC Linux network: {err}")))?,
+        )?,
     };
 
     validate_mxc_network_strategy(config, &network)?;
@@ -1352,6 +1371,13 @@ fn mxc_linux_runtime_snapshot(
     if notify_connect {
         snapshot = snapshot.with_dependency(
             host_dependency::LINUX_SECCOMP_NOTIFY,
+            DependencyState::Present,
+        );
+    }
+
+    if matches!(network, super::strategy::NetworkStrategy::Proxy { .. }) {
+        snapshot = snapshot.with_dependency(
+            host_dependency::LINUX_STRICT_PROXY,
             DependencyState::Present,
         );
     }
@@ -2141,6 +2167,20 @@ impl MxcLinuxSandbox {
                     )));
                 }
             };
+        let mut owner_guard =
+            match super::NetnsHelperOwnerPidFd::new() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    super::close_fd(Some(spec_fd));
+                    super::close_fd(Some(config_fd));
+                    super::close_fd(Some(sync_read_fd));
+                    super::close_fd(Some(sync_write_fd));
+                    super::close_fd(cgroup_procs_fd);
+                    return Err(self.cleanup_for_start_failure(SandboxError::SpawnFailed(
+                        format!("MXC helper owner pidfd: {err}"),
+                    )));
+                }
+            };
 
         let allocation = super::netns::proxy_netns_allocation(self.id, proxy_port);
         let mut command = Command::new(super::netns::helper_path());
@@ -2153,6 +2193,7 @@ impl MxcLinuxSandbox {
             cgroup_procs_fd
                 .map(|fd| fd.to_string())
                 .unwrap_or_else(|| "-1".into()),
+            owner_guard.fd().to_string(),
         ];
         command.args(helper_args);
         command.current_dir(&self.workspace_dir);
@@ -2210,6 +2251,7 @@ impl MxcLinuxSandbox {
                 mxc_config_fd: Some(config_fd),
             },
         );
+        owner_guard.configure_command(&mut command);
 
         let mut child =
             match command.spawn() {
@@ -2226,6 +2268,8 @@ impl MxcLinuxSandbox {
                 }
             };
 
+        owner_guard.spawned();
+
         super::close_fd(Some(spec_fd));
         super::close_fd(Some(config_fd));
         super::close_fd(Some(sync_write_fd));
@@ -2235,12 +2279,16 @@ impl MxcLinuxSandbox {
         self.netns_helper_destroy_token = Some(destroy_token);
 
         if let Err(err) = super::netns::read_helper_sync(sync_read_fd) {
-            let _ = child.wait();
-            return Err(
-                self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
-                    "MXC netns helper setup failed: {err}"
-                ))),
-            );
+            let termination_error = super::terminate_netns_helper_startup(&mut child)
+                .err()
+                .map(|error| format!("helper termination failed: {error}"));
+            let error = self.cleanup_for_start_failure(SandboxError::IsolationFailed(format!(
+                "MXC netns helper setup failed: {err}"
+            )));
+            return Err(match termination_error {
+                Some(cleanup) => append_cleanup_failure(error, Some(cleanup)),
+                None => error,
+            });
         }
 
         let pid = child.id();
@@ -2391,7 +2439,6 @@ struct MxcTranslatedConfig {
 enum MxcNetworkTranslationMode {
     Standalone,
     StrictProxyEnforcedByAxis,
-    CooperativeProxyViaMxc,
 }
 
 struct MxcTranslatedFilesystem {
@@ -2404,7 +2451,7 @@ fn translate_sandbox_config_with_metadata(
     network_mode: MxcNetworkTranslationMode,
 ) -> Result<MxcTranslatedConfig, MxcTranslationError> {
     let process = translate_process(config)?;
-    let network = translate_network(&config.policy, network_mode, config.proxy_addr)?;
+    let network = translate_network(&config.policy, network_mode)?;
     let filesystem = translate_filesystem(&config.policy.filesystem, &config.workspace_dir)?;
     let mut spec = build_process_backend_execution_spec(
         &config.policy,
@@ -2423,8 +2470,7 @@ fn translate_sandbox_config_with_metadata(
         shared_mxc::MxcProcessConfigOptions {
             strict_proxy_enforced_by_axis: network_mode
                 == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis,
-            cooperative_proxy_configured_by_mxc: network_mode
-                == MxcNetworkTranslationMode::CooperativeProxyViaMxc,
+            cooperative_proxy_configured_by_mxc: false,
             resource_limits_enforced_by_axis: true,
             ..Default::default()
         },
@@ -2575,6 +2621,10 @@ fn mxc_process_config_runtime_snapshot(
 
     if network_mode == MxcNetworkTranslationMode::StrictProxyEnforcedByAxis {
         runtime = runtime
+            .with_dependency(
+                host_dependency::LINUX_STRICT_PROXY,
+                DependencyState::Present,
+            )
             .with_dependency(host_dependency::LINUX_NETNS, DependencyState::Present)
             .with_dependency(
                 host_dependency::LINUX_SECCOMP_NOTIFY,
@@ -3239,13 +3289,10 @@ fn seccomp_launcher_command_line(
 }
 
 fn mxc_network_translation_mode(
-    policy: &Policy,
     network: &super::strategy::NetworkStrategy,
 ) -> MxcNetworkTranslationMode {
     if matches!(network, super::strategy::NetworkStrategy::Proxy { .. }) {
         MxcNetworkTranslationMode::StrictProxyEnforcedByAxis
-    } else if matches!(policy.network.mode, NetworkMode::Proxy) {
-        MxcNetworkTranslationMode::CooperativeProxyViaMxc
     } else {
         MxcNetworkTranslationMode::Standalone
     }
@@ -3254,7 +3301,6 @@ fn mxc_network_translation_mode(
 fn translate_network(
     policy: &Policy,
     mode: MxcNetworkTranslationMode,
-    proxy_addr: Option<SocketAddr>,
 ) -> Result<MxcNetwork, MxcTranslationError> {
     let (default_policy, proxy) = match policy.network.mode {
         NetworkMode::Allow => {
@@ -3269,19 +3315,6 @@ fn translate_network(
             return Err(MxcTranslationError::ProxyModeUnsupported(
                 "MXC Bubblewrap proxy mode is cooperative env-var routing and does not preserve AXIS strict proxy isolation".into(),
             ));
-        }
-        NetworkMode::Proxy if mode == MxcNetworkTranslationMode::CooperativeProxyViaMxc => {
-            let proxy_addr = proxy_addr.ok_or_else(|| {
-                MxcTranslationError::ProxyModeUnsupported(
-                    "MXC cooperative proxy mode requires an AXIS proxy bind address".into(),
-                )
-            })?;
-            (
-                MxcNetworkDefaultPolicy::Allow,
-                Some(MxcNetworkProxy {
-                    url: format!("http://{proxy_addr}"),
-                }),
-            )
         }
         NetworkMode::Proxy => (MxcNetworkDefaultPolicy::Allow, None),
     };
@@ -3810,6 +3843,23 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn netns_helper_owner_pidfd_is_inherited_only_by_the_helper() {
+        let mut guard = super::super::NetnsHelperOwnerPidFd::new().unwrap();
+        let fd = guard.fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!("test -e /proc/self/fd/{fd}"));
+        guard.configure_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        guard.spawned();
+
+        assert!(child.wait().unwrap().success());
+        assert_eq!(guard.fd, -1);
+    }
+
     fn policy(network_mode: NetworkMode) -> Policy {
         Policy {
             version: 1,
@@ -3971,45 +4021,128 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_maps_to_mxc_external_proxy_when_cooperative_proxy_is_selected() {
+    fn production_network_resolution_keeps_allow_and_block_out_of_strict_planning() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut config = config(
-            mxc_representable_policy(NetworkMode::Proxy),
+        let allow_config = config(
+            mxc_representable_policy(NetworkMode::Allow),
             workspace.path().into(),
         );
-        config.proxy_addr = Some("127.0.0.1:31".parse().unwrap());
+        let block_config = config(
+            mxc_representable_policy(NetworkMode::Block),
+            workspace.path().into(),
+        );
 
-        let spec = MxcExecutionSpec::from_sandbox_config_with_network_mode(
-            &config,
-            MxcNetworkTranslationMode::CooperativeProxyViaMxc,
-        )
+        let allow = resolve_mxc_network_strategy_with_strict_proxy(&allow_config, |_, _, _, _| {
+            panic!("allow mode must not invoke strict proxy planning")
+        })
+        .unwrap();
+        let block = resolve_mxc_network_strategy_with_strict_proxy(&block_config, |_, _, _, _| {
+            panic!("block mode must not invoke strict proxy planning")
+        })
         .unwrap();
 
-        assert_eq!(spec.network.default_policy, MxcNetworkDefaultPolicy::Allow);
         assert_eq!(
-            spec.network.proxy,
-            Some(MxcNetworkProxy {
-                url: "http://127.0.0.1:31".into(),
-            })
+            allow,
+            (
+                strategy::NetworkStrategy::AllowHost,
+                strategy::ProxyStrategy::None,
+            )
+        );
+        assert_eq!(
+            block,
+            (
+                strategy::NetworkStrategy::BlockedBySeccomp,
+                strategy::ProxyStrategy::None,
+            )
         );
     }
 
     #[test]
-    fn cooperative_proxy_mode_requires_axis_proxy_bind_address() {
+    fn production_proxy_resolution_uses_strict_planning_without_binary_restrictions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let proxy_port = 31_280;
+        let proxy_addr = super::super::netns::proxy_bind_addr(id, proxy_port);
+        let expected = native_mxc_proxy_strategies(id, proxy_port);
+        let mut config = config(
+            mxc_representable_policy(NetworkMode::Proxy),
+            workspace.path().into(),
+        );
+        config.id = id;
+        config.proxy_port = proxy_port;
+        config.proxy_addr = Some(proxy_addr);
+
+        let resolved = resolve_mxc_network_strategy_with_strict_proxy(
+            &config,
+            |policy, resolved_id, resolved_port, resolved_addr| {
+                assert!(!policy_requires_connect_attribution(policy));
+                assert_eq!(resolved_id, id);
+                assert_eq!(resolved_port, proxy_port);
+                assert_eq!(resolved_addr, Some(proxy_addr));
+                Ok(expected.clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(
+            mxc_network_translation_mode(&resolved.0),
+            MxcNetworkTranslationMode::StrictProxyEnforcedByAxis
+        );
+    }
+
+    #[test]
+    fn production_proxy_resolution_fails_closed_when_strict_planning_fails() {
         let workspace = tempfile::tempdir().unwrap();
         let config = config(
             mxc_representable_policy(NetworkMode::Proxy),
             workspace.path().into(),
         );
 
-        let err = MxcExecutionSpec::from_sandbox_config_with_network_mode(
-            &config,
-            MxcNetworkTranslationMode::CooperativeProxyViaMxc,
-        )
-        .unwrap_err();
+        let err = resolve_mxc_network_strategy(&config).unwrap_err();
+        let message = err.to_string();
 
-        assert!(matches!(err, MxcTranslationError::ProxyModeUnsupported(_)));
-        assert!(err.to_string().contains("proxy bind address"));
+        assert!(matches!(err, SandboxError::IsolationFailed(_)));
+        assert!(message.contains("proxy mode requires a non-zero proxy port"));
+        assert!(!message.contains("cooperative"));
+    }
+
+    #[test]
+    fn production_proxy_resolution_uses_strict_planning_with_binary_restrictions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let proxy_port = 31_281;
+        let proxy_addr = super::super::netns::proxy_bind_addr(id, proxy_port);
+        let expected = native_mxc_proxy_strategies(id, proxy_port);
+        let mut policy = mxc_representable_policy(NetworkMode::Proxy);
+        let mut endpoint = endpoint_policy();
+        endpoint.binaries = vec![BinaryMatch {
+            path: "/usr/bin/curl".into(),
+        }];
+        policy.network.policies.push(endpoint);
+        let mut config = config(policy, workspace.path().into());
+        config.id = id;
+        config.proxy_port = proxy_port;
+        config.proxy_addr = Some(proxy_addr);
+        config.connect_attribution = Some(ConnectAttributionStore::default());
+
+        let resolved = resolve_mxc_network_strategy_with_strict_proxy(
+            &config,
+            |policy, resolved_id, resolved_port, resolved_addr| {
+                assert!(policy_requires_connect_attribution(policy));
+                assert_eq!(resolved_id, id);
+                assert_eq!(resolved_port, proxy_port);
+                assert_eq!(resolved_addr, Some(proxy_addr));
+                Ok(expected.clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(
+            mxc_network_translation_mode(&resolved.0),
+            MxcNetworkTranslationMode::StrictProxyEnforcedByAxis
+        );
     }
 
     #[test]
@@ -5448,7 +5581,7 @@ mod tests {
             .push(axis_core::policy::InferenceRoute {
                 name: "mock-provider".into(),
                 provider: Some("openai".into()),
-                endpoint: Some("https://api.openai.com/v1/chat/completions".into()),
+                endpoint: Some("http://inference.local/v1/chat/completions".into()),
                 model: None,
                 api_key_env: Some("OPENAI_API_KEY".into()),
                 protocols: Vec::new(),
@@ -6622,7 +6755,7 @@ mod tests {
             sandbox.cleanup_netns_with_helper_token("axis-test-helper-netns", |id, token| {
                 assert_eq!(id, sandbox_id);
                 assert_eq!(token, helper_test_token());
-                Ok(())
+                Ok(super::super::netns::HelperCleanupOutcome::Destroyed)
             });
 
         assert!(cleanup.is_none());
@@ -6631,7 +6764,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_token_cleanup_accepts_mxc_helper_already_removed_state() {
+    fn helper_token_cleanup_accepts_mxc_authenticated_completed_outcome() {
         let root = secure_tempdir();
         let executor = fake_mxc_runtime_executor(&root, "exit 0");
         let workspace = tempfile::tempdir().unwrap();
@@ -6645,7 +6778,7 @@ mod tests {
         sandbox.netns_helper_destroy_token = Some(helper_test_token());
 
         let cleanup = sandbox.cleanup_netns_with_helper_token("axis-test-helper-netns", |_, _| {
-            Err("read helper state: No such file or directory".into())
+            Ok(super::super::netns::HelperCleanupOutcome::AlreadyCompleted)
         });
 
         assert!(cleanup.is_none());
@@ -7263,6 +7396,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_allow_and_block_runtime_parity() {
+        if !real_mxc_process_tests_enabled() {
+            eprintln!("AXIS_REAL_MXC_PROCESS_TESTS=1 not set (test skipped)");
+            return;
+        }
         if test_mxc_executor().is_err() {
             eprintln!(
                 "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
@@ -7416,6 +7553,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_payload_cannot_read_axis_config_fd() {
+        if !real_mxc_process_tests_enabled() {
+            eprintln!("AXIS_REAL_MXC_PROCESS_TESTS=1 not set (test skipped)");
+            return;
+        }
         if test_mxc_executor().is_err() {
             eprintln!(
                 "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
@@ -7470,6 +7611,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn gated_real_mxc_timeout_cleans_tmpdir() {
+        if !real_mxc_process_tests_enabled() {
+            eprintln!("AXIS_REAL_MXC_PROCESS_TESTS=1 not set (test skipped)");
+            return;
+        }
         if test_mxc_executor().is_err() {
             eprintln!(
                 "safe lxc-exec unavailable; set AXIS_TEST_MXC_EXECUTOR for a test helper (test skipped)"
@@ -7709,12 +7854,7 @@ mod tests {
         assert!(sandbox.netns_name.is_none());
         assert!(sandbox.netns_helper_destroy_token.is_none());
         let stale_destroy = super::super::netns::destroy_netns_with_helper_token(id, &helper_token);
-        assert!(
-            stale_destroy
-                .as_ref()
-                .is_err_and(|e| super::super::netns::helper_cleanup_already_done(e)),
-            "helper state should be gone after wait, got {stale_destroy:?}"
-        );
+        assert!(stale_destroy.is_err(), "helper state survived wait");
         sandbox.destroy().unwrap();
     }
 
@@ -7904,7 +8044,7 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             endpoints: vec![Endpoint {
                 host: "github.com".into(),
                 port: 443,
-                access: Access::ReadOnly,
+                access: Access::ReadWrite,
                 protocol: None,
                 rules: Vec::new(),
             }],
@@ -8064,6 +8204,22 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
         test_mxc_executor_from_env(std::env::var_os("AXIS_TEST_MXC_EXECUTOR"))
     }
 
+    fn exact_opt_in_enabled(value: Option<&OsStr>) -> bool {
+        value == Some(OsStr::new("1"))
+    }
+
+    fn real_mxc_process_tests_enabled() -> bool {
+        exact_opt_in_enabled(std::env::var_os("AXIS_REAL_MXC_PROCESS_TESTS").as_deref())
+    }
+
+    #[test]
+    fn real_mxc_process_test_gate_requires_exact_opt_in() {
+        assert!(exact_opt_in_enabled(Some(OsStr::new("1"))));
+        assert!(!exact_opt_in_enabled(None));
+        assert!(!exact_opt_in_enabled(Some(OsStr::new("0"))));
+        assert!(!exact_opt_in_enabled(Some(OsStr::new("true"))));
+    }
+
     fn test_mxc_seccomp_launcher_from_env(
         path: Option<OsString>,
     ) -> Result<MxcSeccompLauncher, MxcSeccompLauncherError> {
@@ -8121,9 +8277,7 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             sandbox_id,
             bind_addr,
             policy,
-            enable_l7: false,
             enable_leak_detection: false,
-            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: Some(inference_endpoint),
             connect_attribution: Some(connect_attribution),
             enable_identity_diagnostics: false,

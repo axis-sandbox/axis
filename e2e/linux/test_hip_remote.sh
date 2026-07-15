@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 echo "=== HIP Remote Integration Tests ==="
@@ -50,7 +53,7 @@ fi
 
 # ── Test 4: Protocol connection ──
 echo "--- Test 4: Protocol connection ---"
-python3 -c "
+if python3 -c "
 import socket, struct, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)
@@ -81,9 +84,7 @@ except Exception as e:
     sys.exit(1)
 finally:
     s.close()
-" 2>&1
-
-if [ $? -eq 0 ]; then
+" 2>&1; then
     pass "Protocol connection works (worker resets without GPU as expected)"
 else
     fail "Protocol connection"
@@ -91,7 +92,7 @@ fi
 
 # ── Test 5: Client library loads ──
 echo "--- Test 5: Client library loads ---"
-TF_WORKER_HOST=127.0.0.1 TF_WORKER_PORT=18525 \
+if TF_WORKER_HOST=127.0.0.1 TF_WORKER_PORT=18525 \
 python3 -c "
 import ctypes, os
 lib = ctypes.CDLL(os.environ['AXIS_HIP_CLIENT_LIB'])
@@ -104,9 +105,7 @@ try:
 except Exception as e:
     print('hipGetDeviceCount: exception (no GPU expected): %s' % e)
 print('CLIENT: OK')
-" 2>&1
-
-if [ $? -eq 0 ]; then
+" 2>&1; then
     pass "Client library loads and resolves HIP symbols"
 else
     fail "Client library"

@@ -17,7 +17,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis"
+    - "~/.axis/agents/agent-opencode"
     - "~/.opencode"
     - "~/.config"
     - "~/.local/share/opencode"

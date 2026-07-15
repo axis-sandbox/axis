@@ -20,7 +20,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis"
+    - "~/.axis/agents/agent-base-deny"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

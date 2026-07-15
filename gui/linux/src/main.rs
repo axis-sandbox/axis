@@ -1,10 +1,13 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // AXIS Desktop — Linux native app with GTK4 + libadwaita + WebKitGTK
 // Provides desktop integration, system tray, and hosts the shared frontend.
 
-use gtk4::prelude::*;
-use gtk4::Application;
-use libadwaita as adw;
 use adw::prelude::*;
+use gtk4::Application;
+use gtk4::prelude::*;
+use libadwaita as adw;
 use webkit6::prelude::*;
 
 const APP_ID: &str = "org.axis.Desktop";
@@ -14,9 +17,7 @@ fn main() {
     // Initialize libadwaita.
     adw::init().expect("failed to initialize libadwaita");
 
-    let app = Application::builder()
-        .application_id(APP_ID)
-        .build();
+    let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_activate(build_ui);
     app.run();
@@ -54,9 +55,7 @@ fn create_webview() -> webkit6::WebView {
     settings.set_enable_developer_extras(cfg!(debug_assertions));
     settings.set_javascript_can_access_clipboard(true);
 
-    let webview = webkit6::WebView::builder()
-        .settings(&settings)
-        .build();
+    let webview = webkit6::WebView::builder().settings(&settings).build();
 
     // Inject AXIS configuration via user script.
     let user_content_manager = webview.user_content_manager().unwrap();
@@ -90,12 +89,19 @@ fn create_webview() -> webkit6::WebView {
     user_content_manager.add_script(&script);
 
     // Load the frontend.
-    let web_dir = std::path::PathBuf::from("/usr/share/axis/web/index.html");
+    let adjacent_web = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("web/index.html")));
+    let system_web = std::path::PathBuf::from("/usr/share/axis/web/index.html");
     let dev_url = "http://localhost:3000";
 
-    if web_dir.exists() {
-        // Production: load from installed path.
+    if let Some(web_dir) = adjacent_web.filter(|path| path.exists()) {
+        // Portable release archive: load resources beside the executable.
         let uri = format!("file://{}", web_dir.display());
+        webview.load_uri(&uri);
+    } else if system_web.exists() {
+        // System package: load from the shared data directory.
+        let uri = format!("file://{}", system_web.display());
         webview.load_uri(&uri);
     } else {
         // Try local build.

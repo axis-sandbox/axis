@@ -1030,9 +1030,7 @@ fn proxy_config_for_sandbox(
         sandbox_id: id,
         bind_addr: proxy_bind_addr_for_sandbox(id, proxy_port, policy),
         policy: policy.clone(),
-        enable_l7: false,
         enable_leak_detection: true,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint,
         connect_attribution,
         enable_identity_diagnostics: false,
@@ -1572,7 +1570,6 @@ mod tests {
             config.bind_addr,
             proxy_bind_addr_for_sandbox(id, 3128, &policy)
         );
-        assert!(!config.enable_l7);
         assert!(config.enable_leak_detection);
         assert_eq!(config.inference_endpoint, inference_endpoint);
     }

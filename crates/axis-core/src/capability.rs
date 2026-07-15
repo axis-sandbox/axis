@@ -682,7 +682,7 @@ fn requirements_for_policy(
         .inference
         .routes
         .iter()
-        .any(|route| route.api_key_env.is_some())
+        .any(|route| route.has_host_boundary_credentials())
     {
         push(
             &mut requirements,
@@ -695,6 +695,21 @@ fn requirements_for_policy(
             PolicySurface::Credentials,
             "credentials.placeholder_projection",
             &backend.credentials.placeholder_projection,
+        );
+    }
+    if policy
+        .inference
+        .routes
+        .iter()
+        .any(|route| route.uses_https_credentials())
+    {
+        push(
+            &mut requirements,
+            PolicySurface::Credentials,
+            "credentials.https_host_boundary_injection",
+            &CapabilitySupport::unsupported(
+                "HTTPS credential injection requires a per-sandbox CA trust path",
+            ),
         );
     }
 
@@ -1152,6 +1167,11 @@ mod tests {
                 && decision.requirement == "credentials.placeholder_projection"
         }));
         assert!(plan.decisions.iter().any(|decision| {
+            decision.surface == PolicySurface::Credentials
+                && decision.requirement == "credentials.https_host_boundary_injection"
+                && matches!(decision.support, CapabilitySupport::Unsupported { .. })
+        }));
+        assert!(plan.decisions.iter().any(|decision| {
             decision.surface == PolicySurface::Inference
                 && decision.requirement == "inference.streaming"
         }));
@@ -1164,6 +1184,35 @@ mod tests {
                 .unwrap()
                 .contains("credentials.host_boundary_injection")
         );
+        assert!(
+            plan.pre_spawn_error()
+                .unwrap()
+                .contains("credentials.https_host_boundary_injection")
+        );
+    }
+
+    #[test]
+    fn https_query_placeholder_is_an_unsupported_credential_requirement() {
+        let backend = exact_backend();
+        let mut policy = minimal_policy(NetworkMode::Proxy);
+        policy.inference.routes.push(InferenceRoute {
+            name: "query-key".into(),
+            endpoint: Some("https://api.example.com/v1?key=axis:resolve:env:EXTERNAL_KEY".into()),
+            provider: None,
+            model: None,
+            api_key_env: None,
+            protocols: Vec::new(),
+        });
+
+        let plan = plan(&policy, &backend);
+
+        assert!(!plan.spawn_allowed());
+        let error = plan.pre_spawn_error().unwrap();
+        assert!(error.contains("credentials.https_host_boundary_injection"));
+        assert!(plan.decisions.iter().any(|decision| {
+            decision.requirement == "credentials.host_boundary_injection"
+                && matches!(decision.support, CapabilitySupport::AxisOwned)
+        }));
     }
 
     #[test]
@@ -1197,8 +1246,8 @@ mod tests {
             endpoints: vec![Endpoint {
                 host: "api.github.com".into(),
                 port: 443,
-                access: Access::ReadOnly,
-                protocol: Some("https".into()),
+                access: Access::ReadWrite,
+                protocol: None,
                 rules: Vec::new(),
             }],
             binaries: vec![BinaryMatch {

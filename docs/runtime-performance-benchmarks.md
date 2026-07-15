@@ -8,7 +8,7 @@ only when they measure the same surface.
 Run the profile benchmark with:
 
 ```bash
-cargo run -p axis-bench --bin runtime-metrics
+cargo run --locked -p axis-bench --bin runtime-metrics
 ```
 
 The command emits JSON with `profile_definitions` and one row per executed
@@ -26,7 +26,7 @@ AXIS_RUNTIME_METRICS_STARTUP_SAMPLES=20 \
 AXIS_RUNTIME_METRICS_PROXY_BASELINE_CONNS=100 \
 AXIS_RUNTIME_METRICS_PROXY_REQUESTS=1000 \
 AXIS_RUNTIME_METRICS_OPA_EVALS=50000 \
-  cargo run -p axis-bench --bin runtime-metrics
+  cargo run --locked -p axis-bench --bin runtime-metrics
 ```
 
 ## Profiles

@@ -1,10 +1,12 @@
 // Copyright 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows sandbox implementation using Restricted Token + Job Object + AppContainer.
+//! Windows containment targets and fail-closed native launcher.
 //!
-//! All APIs used are available on Windows 11 Home — no admin privileges,
-//! no Hyper-V, no Windows Pro features required.
+//! The supporting modules contain work toward Job Object, AppContainer,
+//! restricted-token, ACL, and ETW integration. The native launcher remains
+//! disabled until those controls, proxy routing, and environment isolation can
+//! be applied to the initial process before it executes user code.
 
 pub mod acl;
 pub mod appcontainer;
@@ -13,263 +15,101 @@ pub mod job_object;
 pub mod restricted;
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxImpl};
-use std::process::Child;
 
-/// Windows sandbox using native Win32 isolation primitives.
-pub(crate) struct WindowsSandbox {
-    config: SandboxConfig,
-    child: Option<Child>,
-    job_handle: Option<job_object::JobHandle>,
-    appcontainer_sid: Option<String>,
-    /// ConPTY read pipe — reads child's terminal output.
-    conpty_read: Option<std::fs::File>,
+const NATIVE_CONTAINMENT_UNAVAILABLE: &str = "native Windows process containment is unavailable: the launcher cannot yet apply Job Object, restricted-token/AppContainer, filesystem ACL, proxy, and environment isolation before process creation";
+
+fn containment_unavailable() -> SandboxError {
+    SandboxError::Unsupported(NATIVE_CONTAINMENT_UNAVAILABLE.into())
 }
 
-impl WindowsSandbox {
-    pub fn new(config: &SandboxConfig) -> Result<Self, SandboxError> {
-        std::fs::create_dir_all(&config.workspace_dir)?;
+pub(crate) fn ensure_containment_available() -> Result<(), SandboxError> {
+    Err(containment_unavailable())
+}
 
-        Ok(Self {
-            config: config.clone(),
-            child: None,
-            job_handle: None,
-            appcontainer_sid: None,
-            conpty_read: None,
-        })
+/// Disabled native Windows backend.
+///
+/// This type retains the platform trait boundary while ensuring no ordinary
+/// process launch can bypass the incomplete containment path.
+pub(crate) struct WindowsSandbox;
+
+impl WindowsSandbox {
+    pub fn new(_config: &SandboxConfig) -> Result<Self, SandboxError> {
+        ensure_containment_available()?;
+        Ok(Self)
     }
 }
 
 impl SandboxImpl for WindowsSandbox {
     fn start(&mut self) -> Result<u32, SandboxError> {
-        let sandbox_id = self.config.id;
-        let policy = &self.config.policy;
-
-        // 1. Create Job Object with resource limits.
-        // TODO: Job Object's KILL_ON_JOB_CLOSE may be interfering with
-        // child process lifecycle. Disabled temporarily for debugging.
-        // let job = job_object::create_job_object(
-        //     &format!("axis-sandbox-{sandbox_id}"),
-        //     policy.process.max_processes,
-        //     policy.process.max_memory_mb,
-        //     policy.process.cpu_rate_percent,
-        // )
-        // .map_err(|e| SandboxError::IsolationFailed(format!("Job Object: {e}")))?;
-
-        // 2. AppContainer and ACLs are created but NOT applied to the child
-        // process (std::process::Command doesn't support PROC_THREAD_ATTRIBUTE).
-        // Skip for now to avoid interfering with HTTPS/TLS on Windows.
-        // TODO: Implement full AppContainer via CreateProcess FFI.
-
-        // 4. Create the child process with restricted token.
-        let proxy_url = format!("http://127.0.0.1:{}", self.config.proxy_port);
-
-        let mut cmd = std::process::Command::new(&self.config.command);
-        cmd.args(&self.config.args);
-        cmd.current_dir(
-            self.config
-                .working_dir
-                .as_ref()
-                .unwrap_or(&self.config.workspace_dir),
-        );
-
-        // Environment: inherit parent env, then overlay sandbox-specific vars.
-        // Note: env_clear() was causing Claude API calls to hang due to missing
-        // SSL/TLS cert paths or other Windows internals. Inheriting is safer.
-        for (k, v) in &self.config.env {
-            cmd.env(k, v);
-        }
-        // TODO: Re-enable proxy once TLS tunnel issues are resolved.
-        // The AXIS proxy's CONNECT tunnel drops TLS connections on Windows,
-        // causing Claude API calls to time out.
-        // if self.config.proxy_port > 0 {
-        //     cmd.env("HTTP_PROXY", &proxy_url);
-        //     cmd.env("HTTPS_PROXY", &proxy_url);
-        // }
-
-        // Capture output by redirecting to files in the workspace.
-        // We use files instead of pipes because std::process::Command's piped
-        // stdout doesn't work reliably when the parent runs inside a tokio runtime
-        // (the blocking read in spawn_blocking never receives data).
-        if self.config.capture_output {
-            let stdout_path = self.config.workspace_dir.join("stdout.log");
-            let stderr_path = self.config.workspace_dir.join("stderr.log");
-            let stdout_file = std::fs::File::create(&stdout_path)
-                .map_err(|e| SandboxError::SpawnFailed(format!("stdout file: {e}")))?;
-            let stderr_file = std::fs::File::create(&stderr_path)
-                .map_err(|e| SandboxError::SpawnFailed(format!("stderr file: {e}")))?;
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::from(stdout_file));
-            cmd.stderr(std::process::Stdio::from(stderr_file));
-        }
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
-
-        let pid = child.id();
-
-        self.child = Some(child);
-        // self.job_handle = Some(job);
-
-        tracing::info!("sandbox {sandbox_id} started on Windows, pid={pid}");
-        Ok(pid)
-    }
-
-    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.as_mut().and_then(|c| c.stdin.take())
-    }
-
-    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.as_mut().and_then(|c| c.stdout.take())
-    }
-
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.as_mut().and_then(|c| c.stderr.take())
-    }
-
-    fn take_pty_read(&mut self) -> Option<std::fs::File> {
-        self.conpty_read.take()
+        Err(containment_unavailable())
     }
 
     fn wait(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, SandboxError>> + Send + '_>>
     {
-        Box::pin(async {
-            let child = self
-                .child
-                .as_mut()
-                .ok_or_else(|| SandboxError::SpawnFailed("no child process".into()))?;
-
-            let status = tokio::task::block_in_place(|| child.wait())?;
-            Ok(status.code().unwrap_or(-1))
-        })
+        Box::pin(async { Err(containment_unavailable()) })
     }
 
     fn try_wait(&mut self) -> Result<Option<i32>, SandboxError> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let Some(status) = child.try_wait()? else {
-            return Ok(None);
-        };
-        self.child.take();
-        Ok(Some(status.code().unwrap_or(-1)))
+        Ok(None)
     }
 
     fn destroy(&mut self) -> Result<(), SandboxError> {
-        if let Some(ref mut child) = self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        // Job Object cleanup — KILL_ON_JOB_CLOSE handles this automatically
-        // when the handle is dropped.
-        self.job_handle = None;
-
-        // Clean up AppContainer profile.
-        if let Some(ref ac_name) = self.appcontainer_sid {
-            let name = format!("axis-sandbox-{}", self.config.id);
-            if let Err(e) = appcontainer::delete_appcontainer_profile(&name) {
-                tracing::warn!("failed to delete AppContainer profile: {e}");
-            }
-        }
-
-        tracing::info!("sandbox {} destroyed", self.config.id);
         Ok(())
     }
 }
 
-/// Create a child process with a ConPTY pseudoconsole.
-/// Returns the child process and a File handle to read the PTY output.
-fn create_conpty_child(
-    cmd: &mut std::process::Command,
-) -> Result<(std::process::Child, std::fs::File), String> {
-    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-    use std::ptr;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axis_core::policy::Policy;
+    use axis_core::types::SandboxId;
 
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreatePipe(
-            hReadPipe: *mut isize,
-            hWritePipe: *mut isize,
-            lpPipeAttributes: *const u8,
-            nSize: u32,
-        ) -> i32;
-        fn CreatePseudoConsole(
-            size: u32,
-            hInput: isize,
-            hOutput: isize,
-            dwFlags: u32,
-            phPC: *mut isize,
-        ) -> i32;
-        fn ClosePseudoConsole(hPC: isize);
-        fn CloseHandle(hObject: isize) -> i32;
-    }
-
-    // COORD: 120 cols x 40 rows
-    let coord: u32 = 120 | (40 << 16);
-
-    // Input pipe: daemon writes -> child reads
-    let mut pipe_in_read: isize = 0;
-    let mut pipe_in_write: isize = 0;
-    if unsafe { CreatePipe(&mut pipe_in_read, &mut pipe_in_write, ptr::null(), 0) } == 0 {
-        return Err("CreatePipe (input) failed".into());
-    }
-
-    // Output pipe: child writes -> daemon reads
-    let mut pipe_out_read: isize = 0;
-    let mut pipe_out_write: isize = 0;
-    if unsafe { CreatePipe(&mut pipe_out_read, &mut pipe_out_write, ptr::null(), 0) } == 0 {
-        unsafe {
-            CloseHandle(pipe_in_read);
-            CloseHandle(pipe_in_write);
+    fn test_config(workspace_dir: std::path::PathBuf) -> SandboxConfig {
+        SandboxConfig {
+            id: SandboxId::new(),
+            policy: Policy::from_yaml("version: 1\nname: windows-fail-closed\n").unwrap(),
+            command: "cmd.exe".into(),
+            args: vec!["/c".into(), "exit 0".into()],
+            working_dir: None,
+            workspace_dir,
+            env: Vec::new(),
+            proxy_port: 0,
+            proxy_addr: None,
+            connect_attribution: None,
+            capture_output: false,
+            interactive_terminal: false,
+            pty_bridge_helper: None,
+            timeout_sec: None,
+            backend_preflight: Default::default(),
+            startup_trace: None,
         }
-        return Err("CreatePipe (output) failed".into());
     }
 
-    // Create pseudoconsole
-    let mut hpc: isize = 0;
-    let hr = unsafe { CreatePseudoConsole(coord, pipe_in_read, pipe_out_write, 0, &mut hpc) };
-    if hr < 0 {
-        unsafe {
-            CloseHandle(pipe_in_read);
-            CloseHandle(pipe_in_write);
-            CloseHandle(pipe_out_read);
-            CloseHandle(pipe_out_write);
-        }
-        return Err(format!("CreatePseudoConsole HRESULT: 0x{hr:08X}"));
+    #[test]
+    fn native_launcher_rejects_before_workspace_or_process_setup() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let config = test_config(workspace.clone());
+
+        let err = match WindowsSandbox::new(&config) {
+            Ok(_) => panic!("native Windows containment must remain disabled"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, SandboxError::Unsupported(_)));
+        assert!(err.to_string().contains("before process creation"));
+        assert!(!workspace.exists());
     }
 
-    tracing::info!("ConPTY created: hpc={hpc}");
+    #[test]
+    fn start_is_fail_closed_if_constructor_gate_is_bypassed() {
+        let mut sandbox = WindowsSandbox;
 
-    // Close the child-side pipe ends (ConPTY owns them now).
-    unsafe {
-        CloseHandle(pipe_in_read);
-        CloseHandle(pipe_out_write);
+        let err = sandbox.start().unwrap_err();
+
+        assert!(matches!(err, SandboxError::Unsupported(_)));
+        assert!(err.to_string().contains("containment is unavailable"));
     }
-
-    // Spawn the child — it inherits the ConPTY via standard process creation.
-    // Note: For full ConPTY integration, we'd use PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
-    // via CreateProcess. For now, the child inherits stdio and the ConPTY acts as
-    // the console for any console-mode child.
-    let child = cmd
-        .stdin(unsafe { std::process::Stdio::from_raw_handle(pipe_in_write as *mut _) })
-        .spawn()
-        .map_err(|e| {
-            unsafe {
-                ClosePseudoConsole(hpc);
-                CloseHandle(pipe_out_read);
-            }
-            format!("spawn with ConPTY: {e}")
-        })?;
-
-    // Wrap the daemon's read end as a File.
-    let read_file = unsafe { std::fs::File::from_raw_handle(pipe_out_read as *mut _) };
-
-    // Note: We leak the hpc handle intentionally — it stays alive as long as the
-    // child process runs. When the child exits, the ConPTY is cleaned up.
-    // TODO: Store hpc and close it properly on sandbox destroy.
-
-    Ok((child, read_file))
 }

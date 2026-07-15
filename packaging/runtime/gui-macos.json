@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "profile": "gui-macos",
+  "requirements": [
+    {
+      "name": "macos-webkit",
+      "version": ">=13",
+      "purl": "pkg:generic/macos-webkit@%3E%3D13",
+      "sourceInfo": "WebKit framework supplied by macOS 13 or newer"
+    }
+  ]
+}

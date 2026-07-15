@@ -6,10 +6,11 @@
     <RootNamespace>AXIS</RootNamespace>
     <AssemblyName>AXIS</AssemblyName>
     <Platforms>x64;ARM64</Platforms>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Web.WebView2" Version="1.*" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4078.44" />
   </ItemGroup>
 
   <!-- Bundle the shared frontend in production builds -->

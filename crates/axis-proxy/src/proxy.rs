@@ -19,21 +19,25 @@ use axis_core::opa::PolicyEngine;
 use axis_core::policy::Policy;
 use axis_core::types::{NetworkAction, SandboxId};
 use axis_safety::leak_detect::LeakDetector;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::net::TcpListener;
 #[cfg(target_os = "linux")]
 use tokio::net::TcpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::identity::{BinaryFingerprint, IdentityError, TofuStore};
 use crate::secrets::CredentialInjector;
 
 const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
+const MAX_CONNECT_HEADERS: usize = 100;
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+const CONNECT_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_ATTRIBUTION_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 const CONNECT_ATTRIBUTION_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -62,11 +66,7 @@ pub struct ProxyConfig {
     pub sandbox_id: SandboxId,
     pub bind_addr: SocketAddr,
     pub policy: Policy,
-    pub enable_l7: bool,
     pub enable_leak_detection: bool,
-    /// Additional PEM-encoded trust anchors for upstream TLS provider tests or
-    /// private provider deployments. System/webpki roots are always included.
-    pub upstream_tls_roots_pem: Vec<String>,
     /// Local inference server endpoint for `inference.local` virtual host.
     /// When set, CONNECT requests to `inference.local` are routed here
     /// instead of the real internet.
@@ -146,7 +146,6 @@ struct ProxyState {
     audit_log: AuditLog,
     leak_detector: Option<LeakDetector>,
     credential_injector: CredentialInjector,
-    upstream_tls_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     connect_attribution: Option<ConnectAttributionStore>,
     identity_mode: ProxyIdentityMode,
 }
@@ -174,7 +173,11 @@ pub struct AxisProxy {
 
 impl AxisProxy {
     /// Create a new proxy with OPA policy evaluation.
-    pub fn new(mut config: ProxyConfig) -> Result<Self, ProxyError> {
+    pub fn new(config: ProxyConfig) -> Result<Self, ProxyError> {
+        config
+            .policy
+            .validate()
+            .map_err(|error| ProxyError::BindFailed(format!("invalid policy: {error}")))?;
         // Initialize the OPA policy engine with the sandbox policy.
         let mut policy_engine = PolicyEngine::new()
             .map_err(|e| ProxyError::BindFailed(format!("OPA engine init: {e}")))?;
@@ -194,11 +197,6 @@ impl AxisProxy {
 
         let credential_injector = CredentialInjector::from_policy(&config.policy)
             .map_err(|e| ProxyError::BindFailed(format!("credential injection: {e}")))?;
-        if credential_injector.has_rules() {
-            config.enable_l7 = true;
-        }
-        let upstream_tls_roots = parse_upstream_tls_roots(&config.upstream_tls_roots_pem)
-            .map_err(|e| ProxyError::BindFailed(format!("upstream TLS roots: {e}")))?;
         let identity_mode = proxy_identity_mode(&config.policy, config.enable_identity_diagnostics);
 
         let state = Arc::new(Mutex::new(ProxyState {
@@ -207,7 +205,6 @@ impl AxisProxy {
             audit_log: AuditLog::new(),
             leak_detector,
             credential_injector,
-            upstream_tls_roots,
             connect_attribution: config.connect_attribution.clone(),
             identity_mode,
         }));
@@ -224,6 +221,7 @@ impl AxisProxy {
         let listener = bind_proxy_listener(self.config.bind_addr).await?;
 
         let addr = listener.local_addr()?;
+        strict_proxy_expected_peer(addr)?;
         tracing::info!(
             "proxy for sandbox {} listening on {addr}",
             self.config.sandbox_id,
@@ -234,24 +232,48 @@ impl AxisProxy {
 
     /// Run the proxy accept loop. Blocks until shutdown.
     pub async fn run(&self) -> Result<(), ProxyError> {
+        self.run_with_limits(MAX_CONCURRENT_CONNECTIONS, CONNECT_HEADER_TIMEOUT)
+            .await
+    }
+
+    async fn run_with_limits(
+        &self,
+        max_concurrent_connections: usize,
+        connect_header_timeout: Duration,
+    ) -> Result<(), ProxyError> {
         let listener = self
             .listener
             .as_ref()
             .ok_or_else(|| ProxyError::BindFailed("not bound".into()))?;
 
+        let connection_slots = Arc::new(Semaphore::new(max_concurrent_connections));
         loop {
             let (stream, peer_addr) = listener.accept().await?;
+            let permit = match reserve_connection(&connection_slots) {
+                Some(permit) => permit,
+                None => {
+                    tracing::warn!(
+                        "proxy for sandbox {} reached its concurrent connection limit",
+                        self.config.sandbox_id
+                    );
+                    drop(stream);
+                    continue;
+                }
+            };
             let proxy_addr = stream.local_addr()?;
+            let expected_peer_ip = strict_proxy_expected_peer(proxy_addr)?;
             let context = ProxyConnectionContext {
                 sandbox_id: self.config.sandbox_id,
                 proxy_addr,
+                expected_peer_ip,
                 state: Arc::clone(&self.state),
-                enable_l7: self.config.enable_l7,
                 inference_endpoint: self.config.inference_endpoint,
                 timing_tx: self.config.timing_tx.clone(),
+                connect_header_timeout,
             };
 
             tokio::spawn(async move {
+                let _permit = permit;
                 let sandbox_id = context.sandbox_id;
                 if let Err(e) = handle_connection(stream, peer_addr, context).await {
                     tracing::warn!("sandbox {sandbox_id}: connection from {peer_addr} failed: {e}");
@@ -261,13 +283,18 @@ impl AxisProxy {
     }
 }
 
+fn reserve_connection(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(slots).try_acquire_owned().ok()
+}
+
 struct ProxyConnectionContext {
     sandbox_id: SandboxId,
     proxy_addr: SocketAddr,
+    expected_peer_ip: Option<IpAddr>,
     state: Arc<Mutex<ProxyState>>,
-    enable_l7: bool,
     inference_endpoint: Option<SocketAddr>,
     timing_tx: Option<mpsc::UnboundedSender<ProxyTimingEvent>>,
+    connect_header_timeout: Duration,
 }
 
 fn proxy_identity_mode(policy: &Policy, enable_identity_diagnostics: bool) -> ProxyIdentityMode {
@@ -278,6 +305,58 @@ fn proxy_identity_mode(policy: &Policy, enable_identity_diagnostics: bool) -> Pr
     } else {
         ProxyIdentityMode::None
     }
+}
+
+/// Linux strict proxies bind the host endpoint of the allocator's per-sandbox
+/// `/30`. The adjacent address is the only source assigned to the sandbox.
+/// Loopback listeners are explicitly non-strict for tests and benchmarks.
+/// Non-Linux callers receive no peer-authentication claim from this transport;
+/// their containment layer must establish an independent boundary. Wildcard
+/// and arbitrary non-loopback Linux binds fail closed.
+fn strict_proxy_expected_peer(proxy_addr: SocketAddr) -> Result<Option<IpAddr>, ProxyError> {
+    #[cfg(target_os = "linux")]
+    {
+        let IpAddr::V4(proxy_ip) = proxy_addr.ip() else {
+            if proxy_addr.ip().is_loopback() {
+                return Ok(None);
+            }
+            return Err(ProxyError::BindFailed(
+                "strict proxy listeners require the Linux IPv4 netns allocation".into(),
+            ));
+        };
+        if proxy_ip.is_loopback() {
+            return Ok(None);
+        }
+
+        let host_bits = u32::from(proxy_ip);
+        if proxy_ip.octets()[0] != 10 || (host_bits & 0b11) != 1 {
+            return Err(ProxyError::BindFailed(format!(
+                "strict proxy address {proxy_ip} is not a Linux sandbox host-veth address"
+            )));
+        }
+        Ok(Some(IpAddr::V4(Ipv4Addr::from(host_bits + 1))))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = proxy_addr;
+        Ok(None)
+    }
+}
+
+fn authenticate_proxy_peer(
+    expected_peer_ip: Option<IpAddr>,
+    peer_addr: SocketAddr,
+) -> Result<(), ProxyError> {
+    if let Some(expected) = expected_peer_ip
+        && peer_addr.ip() != expected
+    {
+        return Err(ProxyError::ConnectionError(format!(
+            "unauthenticated proxy peer {} (expected sandbox source {expected})",
+            peer_addr.ip()
+        )));
+    }
+    Ok(())
 }
 
 async fn bind_proxy_listener(bind_addr: SocketAddr) -> Result<TcpListener, ProxyError> {
@@ -345,17 +424,28 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     context: ProxyConnectionContext,
 ) -> Result<(), ProxyError> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     let ProxyConnectionContext {
         sandbox_id,
         proxy_addr,
+        expected_peer_ip,
         state,
-        enable_l7,
         inference_endpoint,
         timing_tx,
+        connect_header_timeout,
     } = context;
     let mut timing = ProxyConnectionTimer::start();
+    if let Err(error) = authenticate_proxy_peer(expected_peer_ip, peer_addr) {
+        tracing::warn!("sandbox {sandbox_id}: rejecting proxy peer {peer_addr}: {error}");
+        send_forbidden_response(
+            &mut stream,
+            "AXIS policy denied connection\r\nReason: unauthenticated sandbox peer\r\n",
+        )
+        .await?;
+        timing.finish(ProxyTimingOutcome::Error, None, None, &timing_tx);
+        return Ok(());
+    }
     let identity_mode = {
         let st = state.lock().unwrap();
         st.identity_mode
@@ -385,22 +475,12 @@ async fn handle_connection(
 
     let mut reader = BufReader::new(stream);
 
-    // 1. Read the CONNECT request line.
+    // 1. Read and validate one canonical CONNECT request head.
     let phase_start = Instant::now();
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
-    let (host, port) = parse_connect_target(&request_line)?;
+    let request_head = read_connect_request_head(&mut reader, connect_header_timeout).await?;
+    let (host, port) = parse_connect_request_head(&request_head)?;
 
     tracing::debug!("sandbox {sandbox_id}: CONNECT {host}:{port} from {peer_addr}");
-
-    // 2. Read remaining headers (consume until empty line).
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line.trim().is_empty() {
-            break;
-        }
-    }
     timing.record("request_parse", phase_start.elapsed());
 
     // 4. Evaluate OPA network policy.
@@ -441,11 +521,10 @@ async fn handle_connection(
         );
 
         // Send HTTP 403 Forbidden.
-        let mut stream = reader.into_inner();
         let body =
             format!("AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n");
         let phase_start = Instant::now();
-        send_forbidden_response(&mut stream, &body).await?;
+        send_forbidden_response(reader.get_mut(), &body).await?;
         timing.record("response_write", phase_start.elapsed());
         timing.finish(
             ProxyTimingOutcome::Denied,
@@ -463,36 +542,50 @@ async fn handle_connection(
 
     // 6. Connect to upstream.
     //    If the target is `inference.local`, route to the local inference server.
-    let is_inference_local = host == "inference.local" || host.starts_with("inference.local:");
-    let upstream_target = if is_inference_local {
+    let phase_start = Instant::now();
+    let is_inference_local = host == "inference.local";
+    let upstream = if is_inference_local {
         if let Some(ep) = inference_endpoint {
             tracing::info!("sandbox {sandbox_id}: routing inference.local -> {ep}");
-            ep.to_string()
+            connect_to_resolved_addresses(&host, &[ep]).await?
         } else {
             // No inference endpoint configured — return 502.
-            let mut stream = reader.into_inner();
             let body = "AXIS: no local inference server configured\r\n";
             let response = format!(
                 "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).await?;
+            reader.get_mut().write_all(response.as_bytes()).await?;
             return Ok(());
         }
     } else {
-        format!("{host}:{port}")
+        match connect_authorized_upstream(&host, port).await {
+            Ok(upstream) => upstream,
+            Err(ProxyError::PolicyDenied { reason, .. }) => {
+                tracing::warn!(
+                    "sandbox {sandbox_id}: rejected resolved destination for {host}:{port}: {reason}"
+                );
+                let body = format!(
+                    "AXIS policy denied connection to {host}:{port}\r\nReason: {reason}\r\n"
+                );
+                send_forbidden_response(reader.get_mut(), &body).await?;
+                timing.record("upstream_connect", phase_start.elapsed());
+                timing.finish(
+                    ProxyTimingOutcome::Denied,
+                    Some(host),
+                    Some(port),
+                    &timing_tx,
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     };
-
-    let phase_start = Instant::now();
-    let upstream = tokio::net::TcpStream::connect(&upstream_target)
-        .await
-        .map_err(|e| ProxyError::ConnectionError(format!("upstream {upstream_target}: {e}")))?;
     timing.record("upstream_connect", phase_start.elapsed());
 
     // 7. Send 200 Connection Established.
-    let mut stream = reader.into_inner();
     let phase_start = Instant::now();
-    stream
+    reader
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     timing.record("response_write", phase_start.elapsed());
@@ -503,197 +596,196 @@ async fn handle_connection(
         &timing_tx,
     );
 
-    // 8. Bidirectional relay with optional L7 inspection and leak detection.
+    // 8. Relay opaque traffic, applying plaintext credential and leak policy when configured.
     let leak_enabled = {
         let st = state.lock().unwrap();
         st.leak_detector.is_some()
     };
 
-    if enable_l7 {
-        relay_with_l7_inspection(sandbox_id, &host, port, stream, upstream, state).await
-    } else if leak_enabled {
-        relay_with_leak_detection(sandbox_id, &host, port, false, stream, upstream, state).await
-    } else {
-        relay_plain(stream, upstream).await
-    }
-}
-
-/// L7 relay: peek for TLS, terminate if detected, inspect HTTP, scan for leaks.
-async fn relay_with_l7_inspection(
-    sandbox_id: SandboxId,
-    hostname: &str,
-    port: u16,
-    client: tokio::net::TcpStream,
-    upstream: tokio::net::TcpStream,
-    state: Arc<Mutex<ProxyState>>,
-) -> Result<(), ProxyError> {
-    // Peek first byte to detect TLS ClientHello (0x16 = TLS handshake).
-    let mut peek_buf = [0u8; 1];
-    let n = client.peek(&mut peek_buf).await?;
-
-    if n > 0 && peek_buf[0] == 0x16 {
-        // TLS detected — terminate and inspect.
-        tracing::debug!("sandbox {sandbox_id}: L7 TLS detected for {hostname}, terminating");
-        relay_tls_inspected(sandbox_id, hostname, port, client, upstream, state).await
-    } else {
-        // Not TLS — relay with leak detection on plaintext.
-        tracing::debug!("sandbox {sandbox_id}: L7 plaintext for {hostname}");
-        relay_with_leak_detection(sandbox_id, hostname, port, false, client, upstream, state).await
-    }
-}
-
-/// TLS-terminating relay: accept TLS from client, inspect plaintext, forward to upstream.
-async fn relay_tls_inspected(
-    sandbox_id: SandboxId,
-    hostname: &str,
-    port: u16,
-    client: tokio::net::TcpStream,
-    upstream: tokio::net::TcpStream,
-    state: Arc<Mutex<ProxyState>>,
-) -> Result<(), ProxyError> {
-    // Generate a leaf certificate for this hostname.
-    let leaf = {
-        let ca = crate::l7::tls::SandboxCa::generate(&sandbox_id.to_string())
-            .map_err(|e| ProxyError::ConnectionError(format!("CA generation: {e}")))?;
-        ca.issue_leaf(hostname)
-            .map_err(|e| ProxyError::ConnectionError(format!("leaf cert: {e}")))?
-    };
-
-    // Build rustls ServerConfig with the leaf cert.
-    let cert_chain = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
-    let key = rustls_pemfile::private_key(&mut leaf.key_pem.as_bytes())
-        .ok()
-        .flatten()
-        .ok_or_else(|| ProxyError::ConnectionError("cannot parse leaf key".into()))?;
-
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .map_err(|e| ProxyError::ConnectionError(format!("TLS server config: {e}")))?;
-
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
-
-    // Accept TLS from the client.
-    let tls_client = tls_acceptor
-        .accept(client)
-        .await
-        .map_err(|e| ProxyError::ConnectionError(format!("TLS accept: {e}")))?;
-
-    tracing::info!("sandbox {sandbox_id}: L7 TLS terminated for {hostname}");
-
-    let upstream_tls_roots = {
+    let credential_injection_enabled = {
         let st = state.lock().unwrap();
-        st.upstream_tls_roots.clone()
+        st.credential_injector.has_rules()
     };
-    let upstream = connect_tls_upstream(hostname, upstream, &upstream_tls_roots).await?;
-    relay_tls_inspected_to_upstream(sandbox_id, hostname, port, tls_client, upstream, state).await
+
+    if leak_enabled || credential_injection_enabled {
+        relay_with_leak_detection(sandbox_id, &host, port, false, reader, upstream, state).await
+    } else {
+        relay_plain(reader, upstream).await
+    }
 }
 
-async fn relay_tls_inspected_to_upstream(
-    sandbox_id: SandboxId,
-    hostname: &str,
+async fn connect_authorized_upstream(
+    host: &str,
     port: u16,
-    tls_client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    tls_upstream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    state: Arc<Mutex<ProxyState>>,
-) -> Result<(), ProxyError> {
-    let (mut cr, mut cw) = tokio::io::split(tls_client);
-    let (mut ur, mut uw) = tokio::io::split(tls_upstream);
-
-    let state_c2u = Arc::clone(&state);
-    let sid = sandbox_id;
-    let hostname = hostname.to_string();
-    let c2u = async move {
-        relay_client_to_upstream_with_policy(
-            sid, &hostname, port, true, &mut cr, &mut uw, state_c2u,
-        )
-        .await?;
-        Ok::<_, std::io::Error>(())
-    };
-
-    let u2c = tokio::io::copy(&mut ur, &mut cw);
-
-    tokio::select! {
-        r = c2u => { r.map_err(ProxyError::Io)?; }
-        r = u2c => { r?; }
+) -> Result<tokio::net::TcpStream, ProxyError> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        // An IP literal has already been authorized verbatim by OPA. This is
+        // the only explicit opt-in for loopback or otherwise non-public peers.
+        return connect_to_resolved_addresses(host, &[SocketAddr::new(ip, port)]).await;
     }
-    Ok(())
-}
 
-async fn connect_tls_upstream(
-    hostname: &str,
-    upstream: tokio::net::TcpStream,
-    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
-) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, ProxyError> {
-    let mut root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    for cert in extra_roots {
-        root_store
-            .add(cert.clone())
-            .map_err(|e| ProxyError::ConnectionError(format!("invalid upstream TLS root: {e}")))?;
-    }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-    let server_name =
-        rustls::pki_types::ServerName::try_from(hostname.to_string()).map_err(|_| {
-            ProxyError::ConnectionError(format!("invalid TLS upstream name: {hostname}"))
-        })?;
-    connector
-        .connect(server_name, upstream)
+    // Resolve exactly once. The returned socket addresses are vetted as one
+    // answer set and passed directly to connect, preventing a second lookup.
+    let resolved = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| ProxyError::ConnectionError(format!("TLS upstream {hostname}: {e}")))
+        .map_err(|error| ProxyError::ConnectionError(format!("DNS lookup for {host}: {error}")))?
+        .collect::<Vec<_>>();
+    let vetted = vet_resolved_addresses(host, port, resolved)?;
+    connect_to_resolved_addresses(host, &vetted).await
 }
 
-fn parse_upstream_tls_roots(
-    root_pems: &[String],
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    let mut roots = Vec::new();
-    for pem in root_pems {
-        let mut reader = pem.as_bytes();
-        let certs = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        if certs.is_empty() {
-            return Err("PEM block did not contain a certificate".into());
-        }
-        roots.extend(certs);
+fn vet_resolved_addresses(
+    host: &str,
+    port: u16,
+    resolved: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, ProxyError> {
+    if resolved.is_empty() {
+        return Err(ProxyError::ConnectionError(format!(
+            "DNS lookup for {host} returned no addresses"
+        )));
     }
-    Ok(roots)
+
+    let mut vetted = Vec::with_capacity(resolved.len());
+    for address in resolved {
+        if !is_public_upstream_ip(address.ip()) {
+            return Err(ProxyError::PolicyDenied {
+                host: host.into(),
+                port,
+                reason: format!(
+                    "DNS lookup returned prohibited address {}; authorize a literal IP to permit it",
+                    address.ip()
+                ),
+            });
+        }
+        if !vetted.contains(&address) {
+            vetted.push(address);
+        }
+    }
+    Ok(vetted)
+}
+
+async fn connect_to_resolved_addresses(
+    host: &str,
+    addresses: &[SocketAddr],
+) -> Result<tokio::net::TcpStream, ProxyError> {
+    let mut last_error = None;
+    for address in addresses {
+        match tokio::net::TcpStream::connect(*address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some((*address, error)),
+        }
+    }
+
+    let detail = last_error.map_or_else(
+        || "no vetted addresses".to_string(),
+        |(address, error)| format!("{address}: {error}"),
+    );
+    Err(ProxyError::ConnectionError(format!(
+        "upstream {host} failed: {detail}"
+    )))
+}
+
+fn is_public_upstream_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => is_public_ipv6(ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a == 0
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 240)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(ipv4) = ip.to_ipv4_mapped() {
+        return is_public_ipv4(ipv4);
+    }
+
+    // Longest-prefix entries from IANA's IPv6 Special-Purpose Address
+    // Registry. `true` entries are explicit globally reachable exceptions;
+    // transition mechanisms whose reachability is registry-qualified remain
+    // denied because they can obscure the effective destination.
+    const SPECIAL_PURPOSE: &[(Ipv6Addr, u8, bool)] = &[
+        (Ipv6Addr::new(0x2001, 0x0001, 0, 0, 0, 0, 0, 1), 128, true),
+        (Ipv6Addr::new(0x2001, 0x0001, 0, 0, 0, 0, 0, 2), 128, true),
+        (Ipv6Addr::new(0x2001, 0x0001, 0, 0, 0, 0, 0, 3), 128, true),
+        (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96, true),
+        (Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0), 48, false),
+        (Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0), 48, false),
+        (
+            Ipv6Addr::new(0x2001, 0x0004, 0x0112, 0, 0, 0, 0, 0),
+            48,
+            true,
+        ),
+        (Ipv6Addr::new(0x0100, 0, 0, 1, 0, 0, 0, 0), 64, false),
+        (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64, false),
+        (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32, false),
+        (Ipv6Addr::new(0x2001, 0x0003, 0, 0, 0, 0, 0, 0), 32, true),
+        (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32, false),
+        (Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0), 28, false),
+        (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0), 28, true),
+        (Ipv6Addr::new(0x2001, 0x0030, 0, 0, 0, 0, 0, 0), 28, true),
+        (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23, false),
+        (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16, false),
+        (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20, false),
+        (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16, false),
+        (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7, false),
+        (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10, false),
+        (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8, false),
+    ];
+
+    for (network, prefix_len, globally_reachable) in SPECIAL_PURPOSE {
+        if ipv6_in_prefix(ip, *network, *prefix_len) {
+            return *globally_reachable;
+        }
+    }
+
+    ipv6_in_prefix(ip, Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3)
+}
+
+fn ipv6_in_prefix(address: Ipv6Addr, network: Ipv6Addr, prefix_len: u8) -> bool {
+    let shift = 128 - u32::from(prefix_len);
+    (u128::from(address) >> shift) == (u128::from(network) >> shift)
 }
 
 /// Plain bidirectional TCP relay (no inspection).
-async fn relay_plain(
-    stream: tokio::net::TcpStream,
-    upstream: tokio::net::TcpStream,
-) -> Result<(), ProxyError> {
-    let (mut cr, mut cw) = tokio::io::split(stream);
-    let (mut ur, mut uw) = tokio::io::split(upstream);
-
-    let c2u = tokio::io::copy(&mut cr, &mut uw);
-    let u2c = tokio::io::copy(&mut ur, &mut cw);
-
-    tokio::select! {
-        r = c2u => { r?; }
-        r = u2c => { r?; }
-    }
+async fn relay_plain<S>(
+    mut stream: S,
+    mut upstream: tokio::net::TcpStream,
+) -> Result<(), ProxyError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
     Ok(())
 }
 
 /// Bidirectional relay with leak detection on response data.
-async fn relay_with_leak_detection(
+async fn relay_with_leak_detection<S>(
     sandbox_id: SandboxId,
     hostname: &str,
     port: u16,
     is_tls: bool,
-    stream: tokio::net::TcpStream,
+    stream: S,
     upstream: tokio::net::TcpStream,
     state: Arc<Mutex<ProxyState>>,
-) -> Result<(), ProxyError> {
+) -> Result<(), ProxyError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut cr, mut cw) = tokio::io::split(stream);
     let (mut ur, mut uw) = tokio::io::split(upstream);
 
@@ -706,16 +798,18 @@ async fn relay_with_leak_detection(
             sandbox_id, &hostname, port, is_tls, &mut cr, &mut uw, state_c2u,
         )
         .await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut uw).await?;
         Ok::<_, std::io::Error>(())
     };
 
     // Upstream → client: pass through (response data is less likely to leak creds).
-    let u2c = tokio::io::copy(&mut ur, &mut cw);
+    let u2c = async move {
+        tokio::io::copy(&mut ur, &mut cw).await?;
+        tokio::io::AsyncWriteExt::shutdown(&mut cw).await?;
+        Ok::<_, std::io::Error>(())
+    };
 
-    tokio::select! {
-        r = c2u => { r.map_err(ProxyError::Io)?; }
-        r = u2c => { r?; }
-    }
+    tokio::try_join!(c2u, u2c).map_err(ProxyError::Io)?;
     Ok(())
 }
 
@@ -781,14 +875,14 @@ where
             };
 
             let head = pending[..head_end].to_vec();
-            let next_body_len = http_body_length(&head)?;
             let rewritten = {
                 let st = state.lock().unwrap();
                 st.credential_injector
-                    .rewrite_http_request_head(hostname, port, is_tls, &head)
+                    .rewrite_http_request_head_with_body_length(hostname, port, is_tls, &head)
                     .map_err(secret_error_to_io)?
             };
-            if let Some(rewritten_head) = rewritten {
+            let next_body_len = rewritten.body_length;
+            if let Some(rewritten_head) = rewritten.head {
                 tokio::io::AsyncWriteExt::write_all(upstream_write, &rewritten_head).await?;
             } else {
                 tokio::io::AsyncWriteExt::write_all(upstream_write, &head).await?;
@@ -802,7 +896,15 @@ where
         }
     }
 
-    if body_remaining == 0 && !pending.is_empty() {
+    if body_remaining != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "credential injection failed closed for {hostname}: request body ended with {body_remaining} bytes remaining"
+            ),
+        ));
+    }
+    if !pending.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
@@ -810,53 +912,7 @@ where
             ),
         ));
     }
-    if !pending.is_empty() {
-        tokio::io::AsyncWriteExt::write_all(upstream_write, &pending).await?;
-    }
     Ok(())
-}
-
-fn http_body_length(head: &[u8]) -> std::io::Result<usize> {
-    let text = std::str::from_utf8(head).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "credential injection failed closed: HTTP request head is not UTF-8",
-        )
-    })?;
-    let mut length = None;
-    for line in text.lines().skip(1) {
-        let line = line.trim();
-        if line.is_empty() {
-            break;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "credential injection failed closed: transfer-encoded request bodies are not supported",
-            ));
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            let parsed = value.trim().parse::<usize>().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "credential injection failed closed: invalid Content-Length",
-                )
-            })?;
-            if let Some(existing) = length
-                && existing != parsed
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "credential injection failed closed: conflicting Content-Length values",
-                ));
-            }
-            length = Some(parsed);
-        }
-    }
-    Ok(length.unwrap_or(0))
 }
 
 async fn relay_scanned_bytes<R, W>(
@@ -924,12 +980,6 @@ fn find_http_head_end(bytes: &[u8]) -> Option<usize> {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map(|idx| idx + 4)
-        .or_else(|| {
-            bytes
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|idx| idx + 2)
-        })
 }
 
 /// Resolve the policy identity before any sandbox-controlled request bytes are
@@ -1077,28 +1127,168 @@ async fn send_forbidden_response(
 }
 
 /// Parse "CONNECT host:port HTTP/1.1" into (host, port).
+#[cfg(test)]
 fn parse_connect_target(request_line: &str) -> Result<(String, u16), ProxyError> {
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("CONNECT") {
+    let line = request_line.strip_suffix("\r\n").ok_or_else(|| {
+        ProxyError::ConnectionError("CONNECT request line must use CRLF framing".into())
+    })?;
+    let parts = line.split(' ').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts.iter().any(|part| part.is_empty())
+        || !parts[0].eq_ignore_ascii_case("CONNECT")
+        || parts[2] != "HTTP/1.1"
+    {
         return Err(ProxyError::ConnectionError(format!(
             "invalid CONNECT request: {request_line}"
         )));
     }
 
-    let target = parts[1];
-    if let Some((host, port_str)) = target.rsplit_once(':') {
-        let port: u16 = port_str.parse().map_err(|_| {
-            ProxyError::ConnectionError(format!("invalid port in CONNECT target: {target}"))
-        })?;
-        Ok((host.to_string(), port))
-    } else {
-        Ok((target.to_string(), 443))
+    parse_connect_authority(parts[1])
+}
+
+fn parse_connect_authority(target: &str) -> Result<(String, u16), ProxyError> {
+    if let Ok(address) = target.parse::<SocketAddr>() {
+        return Ok((address.ip().to_string(), address.port()));
     }
+    if let Ok(ip) = target.parse::<IpAddr>() {
+        return Ok((ip.to_string(), 443));
+    }
+    let authority = target
+        .parse::<hyper::http::uri::Authority>()
+        .map_err(|_| ProxyError::ConnectionError(format!("invalid CONNECT target: {target}")))?;
+    if target.contains('@') {
+        return Err(ProxyError::ConnectionError(format!(
+            "invalid CONNECT target: {target}"
+        )));
+    }
+    let host = canonicalize_connect_host(authority.host())?;
+    Ok((host, authority.port_u16().unwrap_or(443)))
+}
+
+async fn read_connect_request_head<R>(
+    reader: &mut R,
+    deadline: Duration,
+) -> Result<Vec<u8>, ProxyError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    tokio::time::timeout(deadline, read_connect_request_head_bounded(reader))
+        .await
+        .map_err(|_| ProxyError::ConnectionError("CONNECT request head deadline exceeded".into()))?
+}
+
+async fn read_connect_request_head_bounded<R>(reader: &mut R) -> Result<Vec<u8>, ProxyError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut head = Vec::with_capacity(1024);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Err(ProxyError::ConnectionError(
+                "unexpected EOF in CONNECT request head".into(),
+            ));
+        }
+
+        let mut consumed = 0;
+        let mut complete = false;
+        for byte in available.iter().copied() {
+            if head.len() == MAX_HTTP_HEAD_BYTES {
+                return Err(ProxyError::ConnectionError(
+                    "CONNECT request head exceeds configured limit".into(),
+                ));
+            }
+            if byte == b'\n' && head.last() != Some(&b'\r') {
+                return Err(ProxyError::ConnectionError(
+                    "CONNECT request head contains a bare line feed".into(),
+                ));
+            }
+            if head.last() == Some(&b'\r') && byte != b'\n' {
+                return Err(ProxyError::ConnectionError(
+                    "CONNECT request head contains a bare carriage return".into(),
+                ));
+            }
+            head.push(byte);
+            consumed += 1;
+            if head.ends_with(b"\r\n\r\n") {
+                complete = true;
+                break;
+            }
+        }
+        reader.consume(consumed);
+        if complete {
+            return Ok(head);
+        }
+    }
+}
+
+fn parse_connect_request_head(head: &[u8]) -> Result<(String, u16), ProxyError> {
+    if !head.ends_with(b"\r\n\r\n") {
+        return Err(ProxyError::ConnectionError(
+            "incomplete CONNECT request head".into(),
+        ));
+    }
+    let mut headers = [httparse::EMPTY_HEADER; MAX_CONNECT_HEADERS];
+    let mut request = httparse::Request::new(&mut headers);
+    let consumed = match request.parse(head).map_err(|error| {
+        ProxyError::ConnectionError(format!("malformed CONNECT request head: {error}"))
+    })? {
+        httparse::Status::Complete(consumed) => consumed,
+        httparse::Status::Partial => {
+            return Err(ProxyError::ConnectionError(
+                "incomplete CONNECT request head".into(),
+            ));
+        }
+    };
+    if consumed != head.len()
+        || request.version != Some(1)
+        || !request
+            .method
+            .is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"))
+    {
+        return Err(ProxyError::ConnectionError(
+            "CONNECT proxy requires one canonical HTTP/1.1 request head".into(),
+        ));
+    }
+
+    for header in request.headers {
+        header
+            .name
+            .parse::<hyper::http::HeaderName>()
+            .map_err(|_| ProxyError::ConnectionError("invalid CONNECT header name".into()))?;
+        hyper::http::HeaderValue::from_bytes(header.value)
+            .map_err(|_| ProxyError::ConnectionError("invalid CONNECT header value".into()))?;
+    }
+
+    let target = request.path.ok_or_else(|| {
+        ProxyError::ConnectionError("CONNECT request is missing a target authority".into())
+    })?;
+    parse_connect_authority(target)
+}
+
+fn canonicalize_connect_host(host: &str) -> Result<String, ProxyError> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty()
+        || !host.is_ascii()
+        || host
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || host.contains(['/', '\\', '@'])
+    {
+        return Err(ProxyError::ConnectionError(
+            "invalid CONNECT hostname".into(),
+        ));
+    }
+    Ok(host
+        .parse::<IpAddr>()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| host.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn parse_connect_host_port() {
@@ -1115,58 +1305,224 @@ mod tests {
     }
 
     #[test]
-    fn parse_connect_invalid() {
-        assert!(parse_connect_target("GET / HTTP/1.1\r\n").is_err());
+    fn parse_connect_canonicalizes_dns_names() {
+        let (host, port) = parse_connect_target("CONNECT EXAMPLE.COM.:8443 HTTP/1.1\r\n").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8443);
     }
 
     #[test]
-    fn find_http_head_end_accepts_crlf_and_lf_heads() {
+    fn parse_connect_ipv6_literal() {
+        let (host, port) = parse_connect_target("CONNECT [2001:db8::1]:8443 HTTP/1.1\r\n").unwrap();
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn parse_connect_invalid() {
+        assert!(parse_connect_target("GET / HTTP/1.1\r\n").is_err());
+        assert!(parse_connect_target("CONNECT example.com HTTP/1.0\r\n").is_err());
+        assert!(parse_connect_target("CONNECT  example.com HTTP/1.1\r\n").is_err());
+        assert!(parse_connect_target("CONNECT example.com HTTP/1.1\n").is_err());
+        assert!(parse_connect_target("CONNECT user@example.com HTTP/1.1\r\n").is_err());
+    }
+
+    #[test]
+    fn connect_head_parser_rejects_too_many_headers() {
+        let mut head = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
+        for index in 0..=MAX_CONNECT_HEADERS {
+            head.extend_from_slice(format!("x-test-{index}: value\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+
+        let error = parse_connect_request_head(&head).unwrap_err();
+        assert!(error.to_string().contains("too many headers"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn connect_head_reader_preserves_fragmentation_and_tunnel_bytes() {
+        let (mut client, server) = tokio::io::duplex(16);
+        let writer = tokio::spawn(async move {
+            for fragment in [
+                b"CON".as_slice(),
+                b"NECT example.com:443 HTTP/1.1\r".as_slice(),
+                b"\nHost: example.com\r\n\r".as_slice(),
+                b"\nearly-tunnel-data".as_slice(),
+            ] {
+                client.write_all(fragment).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut reader = BufReader::new(server);
+
+        let head = read_connect_request_head(&mut reader, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            head,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        );
+        assert_eq!(
+            parse_connect_request_head(&head).unwrap(),
+            ("example.com".into(), 443)
+        );
+        let mut early_data = vec![0; "early-tunnel-data".len()];
+        reader.read_exact(&mut early_data).await.unwrap();
+        assert_eq!(early_data, b"early-tunnel-data");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_head_reader_rejects_oversized_unterminated_and_eof_inputs() {
+        let cases = [
+            vec![b'a'; MAX_HTTP_HEAD_BYTES + 1],
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n".to_vec(),
+            Vec::new(),
+        ];
+
+        for input in cases {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let writer = tokio::spawn(async move {
+                client.write_all(&input).await.unwrap();
+                client.shutdown().await.unwrap();
+            });
+            let mut reader = BufReader::new(server);
+            let error = read_connect_request_head(&mut reader, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("configured limit")
+                    || error.to_string().contains("unexpected EOF"),
+                "{error}"
+            );
+            writer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_head_reader_rejects_noncanonical_and_slow_drip_inputs() {
+        for input in [
+            b"CONNECT example.com:443 HTTP/1.1\n\n".as_slice(),
+            b"CONNECT example.com:443 HTTP/1.1\rX: hidden\r\n\r\n".as_slice(),
+        ] {
+            let mut reader = BufReader::new(input);
+            let error = read_connect_request_head(&mut reader, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("bare"), "{error}");
+        }
+
+        let (mut client, server) = tokio::io::duplex(16);
+        let writer = tokio::spawn(async move {
+            client.write_all(b"C").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = client
+                .write_all(b"ONNECT example.com:443 HTTP/1.1\r\n\r\n")
+                .await;
+        });
+        let mut reader = BufReader::new(server);
+        let error = read_connect_request_head(&mut reader, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"), "{error}");
+        writer.abort();
+    }
+
+    #[test]
+    fn find_http_head_end_accepts_only_crlf_heads() {
         assert_eq!(
             find_http_head_end(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody"),
             Some(37)
         );
         assert_eq!(
             find_http_head_end(b"GET / HTTP/1.1\nHost: example.com\n\nbody"),
-            Some(34)
+            None
         );
     }
 
     #[test]
-    fn http_body_length_reads_content_length() {
-        let len =
-            http_body_length(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 12\r\n\r\n")
-                .unwrap();
-        assert_eq!(len, 12);
+    fn proxy_connection_slots_fail_closed_at_the_limit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = reserve_connection(&slots).expect("first connection must reserve the slot");
+        assert!(reserve_connection(&slots).is_none());
+        drop(permit);
+        assert!(reserve_connection(&slots).is_some());
     }
 
-    #[test]
-    fn http_body_length_rejects_chunked_bodies() {
-        let err = http_body_length(
-            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("transfer-encoded"));
-    }
+    #[tokio::test]
+    async fn proxy_server_saturation_is_bounded_and_recovers_after_header_deadline() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = upstream.accept().await.unwrap();
+        });
+        let policy = Policy::from_yaml(&format!(
+            r#"
+version: 1
+name: saturation
+network:
+  mode: proxy
+  policies:
+    - name: local
+      endpoints:
+        - host: "127.0.0.1"
+          port: {}
+"#,
+            upstream_addr.port()
+        ))
+        .unwrap();
+        let config = ProxyConfig {
+            sandbox_id: SandboxId::new(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            policy,
+            enable_leak_detection: false,
+            inference_endpoint: None,
+            connect_attribution: None,
+            enable_identity_diagnostics: false,
+            timing_tx: None,
+        };
+        let mut proxy = AxisProxy::new(config).unwrap();
+        let proxy_addr = proxy.bind().await.unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let _ = proxy
+                .run_with_limits(MAX_CONCURRENT_CONNECTIONS, Duration::from_millis(500))
+                .await;
+        });
 
-    #[test]
-    fn http_body_length_rejects_invalid_content_length() {
-        let err = http_body_length(
-            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: nope\r\n\r\n",
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("Content-Length"));
-    }
+        let mut slow_clients = Vec::with_capacity(MAX_CONCURRENT_CONNECTIONS);
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+            stream.write_all(b"C").await.unwrap();
+            slow_clients.push(stream);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-    #[test]
-    fn http_body_length_rejects_conflicting_content_lengths() {
-        let err = http_body_length(
-            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n",
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("conflicting Content-Length"));
+        let mut saturated = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        let rejected =
+            tokio::time::timeout(Duration::from_millis(200), saturated.read(&mut byte)).await;
+        assert!(
+            matches!(rejected, Ok(Ok(0)) | Ok(Err(_))),
+            "257th client was not promptly rejected: {rejected:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut valid = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let target = format!("127.0.0.1:{}", upstream_addr.port());
+        valid
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = [0u8; 39];
+        tokio::time::timeout(Duration::from_secs(1), valid.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+        drop(slow_clients);
+        upstream_task.await.unwrap();
+        proxy_task.abort();
     }
 
     #[cfg(target_os = "linux")]
@@ -1184,6 +1540,156 @@ mod tests {
         assert!(!linux_proxy_bind_requires_freebind(
             "[::1]:3128".parse().unwrap()
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_proxy_accepts_only_the_adjacent_sandbox_source() {
+        let expected = strict_proxy_expected_peer("10.42.7.5:3128".parse().unwrap()).unwrap();
+        assert_eq!(expected, Some("10.42.7.6".parse().unwrap()));
+
+        authenticate_proxy_peer(expected, "10.42.7.6:49152".parse().unwrap()).unwrap();
+        let error =
+            authenticate_proxy_peer(expected, "127.0.0.1:49152".parse().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("unauthenticated proxy peer"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_proxy_rejects_non_allocator_bind_addresses() {
+        let error = strict_proxy_expected_peer("10.42.7.10:3128".parse().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("host-veth"));
+
+        let error = strict_proxy_expected_peer("0.0.0.0:3128".parse().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("host-veth"));
+
+        assert_eq!(
+            strict_proxy_expected_peer("127.0.0.1:3128".parse().unwrap()).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn observed_peer(source: Ipv4Addr) -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::new(source.into(), 0)).unwrap();
+        let client = socket
+            .connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        drop((client, server));
+        peer
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn strict_proxy_accepts_kernel_observed_sandbox_source() {
+        let expected_sandbox_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let sandbox_peer = observed_peer(Ipv4Addr::new(127, 0, 0, 2)).await;
+        authenticate_proxy_peer(Some(expected_sandbox_ip), sandbox_peer).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn strict_proxy_rejects_kernel_observed_host_source() {
+        let expected_sandbox_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let host_peer = observed_peer(Ipv4Addr::LOCALHOST).await;
+        let error = authenticate_proxy_peer(Some(expected_sandbox_ip), host_peer).unwrap_err();
+        assert!(error.to_string().contains("unauthenticated proxy peer"));
+    }
+
+    #[test]
+    fn public_dns_answers_are_vetted_and_deduplicated() {
+        let addresses = vec![
+            "93.184.216.34:443".parse().unwrap(),
+            "[2606:2800:220:1:248:1893:25c8:1946]:443".parse().unwrap(),
+            "93.184.216.34:443".parse().unwrap(),
+        ];
+        let vetted = vet_resolved_addresses("example.com", 443, addresses).unwrap();
+        assert_eq!(vetted.len(), 2);
+    }
+
+    #[test]
+    fn mixed_dns_answers_fail_closed_against_rebinding() {
+        for prohibited in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "169.254.169.254:443",
+            "[::1]:443",
+            "[fc00::1]:443",
+            "[fe80::1]:443",
+        ] {
+            let error = vet_resolved_addresses(
+                "allowed.example",
+                443,
+                vec![
+                    "93.184.216.34:443".parse().unwrap(),
+                    prohibited.parse().unwrap(),
+                ],
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("prohibited address"),
+                "{prohibited}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_and_internal_address_classes_are_not_public() {
+        for address in [
+            "0.0.0.0",
+            "100.64.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "3fff::1",
+            "2001:2::1",
+            "100::1",
+            "64:ff9b:1::1",
+            "::ffff:127.0.0.1",
+            "2002:7f00:1::1",
+            "4000::1",
+        ] {
+            let ip = address.parse().unwrap();
+            assert!(!is_public_upstream_ip(ip), "{address} must be prohibited");
+        }
+    }
+
+    #[test]
+    fn representative_public_ipv4_and_ipv6_addresses_are_allowed() {
+        for address in [
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "64:ff9b::c000:201",
+            "2001:1::1",
+            "2001:3::1",
+            "2001:20::1",
+            "2001:30::1",
+        ] {
+            let ip = address.parse().unwrap();
+            assert!(is_public_upstream_ip(ip), "{address} must be public");
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_private_ip_literal_connects_without_dns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let stream = connect_authorized_upstream("127.0.0.1", address.port())
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
+        let (_, peer) = accept.await.unwrap();
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
@@ -1277,9 +1783,7 @@ network:
             sandbox_id: SandboxId::new(),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             policy,
-            enable_l7: false,
             enable_leak_detection: true,
-            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
             enable_identity_diagnostics: false,
@@ -1287,6 +1791,38 @@ network:
         };
         let proxy = AxisProxy::new(config);
         assert!(proxy.is_ok(), "proxy creation failed: {:?}", proxy.err());
+    }
+
+    #[test]
+    fn proxy_revalidates_direct_policy_values() {
+        let mut policy = Policy::from_yaml("version: 1\nname: direct-policy\n").unwrap();
+        policy
+            .inference
+            .routes
+            .push(axis_core::policy::InferenceRoute {
+                name: "external".into(),
+                endpoint: Some("https://api.example.com/v1".into()),
+                provider: None,
+                model: None,
+                api_key_env: Some("EXTERNAL_KEY".into()),
+                protocols: Vec::new(),
+            });
+        let config = ProxyConfig {
+            sandbox_id: SandboxId::new(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            policy,
+            enable_leak_detection: true,
+            inference_endpoint: None,
+            connect_attribution: None,
+            enable_identity_diagnostics: false,
+            timing_tx: None,
+        };
+
+        let err = AxisProxy::new(config).err().unwrap();
+        assert!(
+            err.to_string().contains("HTTPS credential injection"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1307,9 +1843,7 @@ network:
             sandbox_id: SandboxId::new(),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             policy,
-            enable_l7: false,
             enable_leak_detection: false,
-            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
             enable_identity_diagnostics: false,

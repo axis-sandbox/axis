@@ -1,7 +1,10 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the AXIS gateway API.
 // Tests the full HTTP stack (router + handlers) without needing native apps.
 //
-// Run with: cargo test -p axis-gateway --test api_integration
+// Run with: cargo test --locked -p axis-gateway --test api_integration
 
 use axis_gateway::{GatewayConfig, GatewayState, start_gateway};
 use std::net::SocketAddr;

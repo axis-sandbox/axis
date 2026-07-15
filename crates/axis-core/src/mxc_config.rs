@@ -2259,8 +2259,8 @@ mod tests {
             endpoints: vec![Endpoint {
                 host: "api.github.com".into(),
                 port: 443,
-                access: Access::ReadOnly,
-                protocol: Some("https".into()),
+                access: Access::ReadWrite,
+                protocol: None,
                 rules: Vec::new(),
             }],
             binaries: vec![BinaryMatch {

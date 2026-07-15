@@ -64,11 +64,11 @@ network:
 "#,
     },
     PolicyScenario {
-        name: "strict_proxy_binary_l7",
-        description: "strict proxy endpoint policy with binary attribution and L7 rules",
+        name: "strict_proxy_binary",
+        description: "strict proxy endpoint policy with binary attribution",
         yaml: r#"
 version: 1
-name: evidence-strict-proxy-binary-l7
+name: evidence-strict-proxy-binary
 filesystem:
   read_only:
     - /usr
@@ -86,17 +86,13 @@ network:
         - host: "inference.local"
           port: 443
           access: read-write
-          rules:
-            - allow:
-                method: POST
-                path: "/v1/chat/completions"
       binaries:
         - path: "*/python*"
 "#,
     },
     PolicyScenario {
-        name: "inference_local_external_streaming",
-        description: "local inference plus external provider credential injection and streaming",
+        name: "inference_routes_streaming",
+        description: "local inference, local host-boundary credentials, and external streaming",
         yaml: r#"
 version: 1
 name: evidence-inference-local-external-streaming
@@ -124,11 +120,13 @@ inference:
       endpoint: "http://inference.local"
       protocols: [openai_chat_completions, model_discovery]
       model: "llama-4-scout-109b"
-    - name: cloud-fallback
+    - name: external-anthropic
       provider: anthropic
       model: "claude-sonnet-4"
-      api_key_env: ANTHROPIC_API_KEY
       protocols: [messages_streaming]
+    - name: local-authenticated
+      endpoint: "http://inference.local:8081"
+      api_key_env: LOCAL_INFERENCE_KEY
 "#,
     },
 ];

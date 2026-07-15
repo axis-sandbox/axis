@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Default no-dependency security test harness.
 #
 # This script is intentionally limited to Tier 0 and Tier 1 coverage. It must
@@ -13,19 +16,19 @@ echo "cargo: ${CARGO_BIN}"
 echo ""
 
 echo "--- Shared capability planner ---"
-"${CARGO_BIN}" test -p axis-core capability
+"${CARGO_BIN}" test --locked -p axis-core capability
 
 echo "--- Shared process backend planner ---"
-"${CARGO_BIN}" test -p axis-core process_backend
+"${CARGO_BIN}" test --locked -p axis-core process_backend
 
 echo "--- Shared container backend planner ---"
-"${CARGO_BIN}" test -p axis-core container_backend
+"${CARGO_BIN}" test --locked -p axis-core container_backend
 
 echo "--- Shared VM backend planner ---"
-"${CARGO_BIN}" test -p axis-core vm_backend
+"${CARGO_BIN}" test --locked -p axis-core vm_backend
 
 echo "--- Shared MXC wire config generation ---"
-"${CARGO_BIN}" test -p axis-core mxc_config
+"${CARGO_BIN}" test --locked -p axis-core mxc_config
 
 echo "--- MXC fake executor and translation paths ---"
-"${CARGO_BIN}" test -p axis-sandbox mxc -- --skip gated_
+"${CARGO_BIN}" test --locked -p axis-sandbox mxc -- --skip gated_

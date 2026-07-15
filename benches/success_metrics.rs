@@ -3,8 +3,8 @@
 
 //! AXIS Success Metrics Validation
 //!
-//! Measures all success metrics from the implementation plan and reports
-//! pass/fail against the targets.
+//! Measures the public performance and security targets and reports pass/fail
+//! against their acceptance thresholds.
 
 use std::time::{Duration, Instant};
 
@@ -123,9 +123,7 @@ network:
         sandbox_id: SandboxId::new(),
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
-        enable_l7: false,
         enable_leak_detection: false,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: None,
         enable_identity_diagnostics: false,
@@ -312,9 +310,7 @@ async fn main() {
             sandbox_id: axis_core::types::SandboxId::new(),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             policy,
-            enable_l7: false,
             enable_leak_detection: true,
-            upstream_tls_roots_pem: Vec::new(),
             inference_endpoint: None,
             connect_attribution: None,
             enable_identity_diagnostics: false,

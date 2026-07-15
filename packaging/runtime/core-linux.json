@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "profile": "core-linux",
+  "requirements": [
+    {
+      "name": "bubblewrap",
+      "version": "0",
+      "purl": "pkg:generic/bubblewrap@0",
+      "sourceInfo": "Host-provided Bubblewrap executable; required for the default Linux process sandbox backend"
+    }
+  ]
+}

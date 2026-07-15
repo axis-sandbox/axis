@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "artifactProfile": "gui-windows",
+  "normalizedArchiveCompared": true,
+  "cleanBuildBinaryCompared": false,
+  "scope": ".NET and Windows SDK native host output reproducibility is not asserted across hosted runner images."
+}

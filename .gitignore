@@ -1,13 +1,24 @@
-/target
+**/target/
 **/*.rs.bk
-Cargo.lock
 *.swp
 *.swo
 *~
+*.log
+*.profraw
+.DS_Store
+Thumbs.db
+.coverage
+coverage/
+__pycache__/
+*.py[cod]
 .idea/
 .vscode/
+.claude/
+.codex/
+.cursor/
+gui/macos/.build/
 
-# HIP Remote (symlinked from TheRock worktree, not committed)
+# HIP Remote sources are supplied separately.
 hip-remote/client
 hip-remote/worker
 hip-remote/build-client/

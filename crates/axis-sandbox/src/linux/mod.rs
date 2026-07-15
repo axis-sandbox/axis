@@ -21,6 +21,9 @@ use std::io;
 use std::process::Child;
 
 const CLOSED_FD: i32 = -1;
+#[cfg(test)]
+const PARENT_DEATH_GUARD_OWNER_DIED: u8 = 0;
+const PARENT_DEATH_GUARD_DISARM: u8 = 1;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const LINUX_CAPABILITY_U32S_3: usize = 2;
 const CAP_LAST_CAP: i32 = 40;
@@ -249,7 +252,7 @@ impl ParentDeathGuard {
 
     fn disarm(&mut self) {
         if self.write_fd != CLOSED_FD {
-            let disarm = [1u8];
+            let disarm = [PARENT_DEATH_GUARD_DISARM];
             unsafe {
                 let _ = libc::write(self.write_fd, disarm.as_ptr().cast(), disarm.len());
             }
@@ -264,6 +267,8 @@ impl ParentDeathGuard {
     fn trigger_owner_death_for_test(&mut self) {
         if self.write_fd != CLOSED_FD {
             unsafe {
+                let owner_died = [PARENT_DEATH_GUARD_OWNER_DIED];
+                let _ = libc::write(self.write_fd, owner_died.as_ptr().cast(), owner_died.len());
                 libc::close(self.write_fd);
             }
             self.write_fd = CLOSED_FD;
@@ -296,6 +301,55 @@ impl ParentDeathGuard {
 impl Drop for ParentDeathGuard {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+#[derive(Debug)]
+struct NetnsHelperOwnerPidFd {
+    fd: i32,
+}
+
+impl NetnsHelperOwnerPidFd {
+    fn new() -> Result<Self, io::Error> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as i32 };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self { fd })
+        }
+    }
+
+    fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    fn configure_command(&self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+
+        let fd = self.fd;
+        unsafe {
+            command.pre_exec(move || clear_fd_cloexec(fd).map_err(io::Error::from_raw_os_error));
+        }
+    }
+
+    fn spawned(&mut self) {
+        if self.fd != CLOSED_FD {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = CLOSED_FD;
+        }
+    }
+}
+
+impl Drop for NetnsHelperOwnerPidFd {
+    fn drop(&mut self) {
+        if self.fd != CLOSED_FD {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = CLOSED_FD;
+        }
     }
 }
 
@@ -353,17 +407,15 @@ impl LinuxSandbox {
 
     fn cleanup_netns_with_helper_token<F>(&mut self, destroy: F) -> Option<String>
     where
-        F: FnOnce(SandboxId, &str) -> Result<(), String>,
+        F: FnOnce(SandboxId, &str) -> Result<netns::HelperCleanupOutcome, String>,
     {
         let token = self.netns_helper_destroy_token.clone()?;
         let sandbox_id = self.config.id;
 
         match destroy(sandbox_id, &token) {
-            Ok(()) => {}
-            Err(e) if netns::helper_cleanup_already_done(&e) => {
-                tracing::debug!(
-                    "sandbox {sandbox_id}: netns helper state already removed during cleanup: {e}"
-                );
+            Ok(netns::HelperCleanupOutcome::Destroyed) => {}
+            Ok(netns::HelperCleanupOutcome::AlreadyCompleted) => {
+                tracing::debug!("sandbox {sandbox_id}: netns helper cleanup was already completed");
             }
             Err(e) => {
                 tracing::warn!("sandbox {sandbox_id}: netns helper cleanup failed: {e}");
@@ -485,7 +537,7 @@ impl LinuxSandbox {
     ) -> Option<String>
     where
         N: FnOnce(&str) -> Result<(), String>,
-        H: FnOnce(SandboxId, &str) -> Result<(), String>,
+        H: FnOnce(SandboxId, &str) -> Result<netns::HelperCleanupOutcome, String>,
     {
         let mut cleanup_errors = Vec::new();
         self.stop_connect_supervisor();
@@ -544,7 +596,7 @@ impl LinuxSandbox {
     ) -> Option<String>
     where
         N: FnOnce(&str) -> Result<(), String>,
-        H: FnOnce(SandboxId, &str) -> Result<(), String>,
+        H: FnOnce(SandboxId, &str) -> Result<netns::HelperCleanupOutcome, String>,
     {
         close_fd(netns_fd);
         self.stop_connect_supervisor();
@@ -961,6 +1013,20 @@ impl LinuxSandbox {
                 ));
             }
         };
+        let mut owner_guard = match NetnsHelperOwnerPidFd::new() {
+            Ok(guard) => guard,
+            Err(e) => {
+                close_fd(Some(spec_fd));
+                close_fd(Some(sync_read_fd));
+                close_fd(Some(sync_write_fd));
+                close_fd(cgroup_procs_fd);
+                let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+                return Err(append_cleanup_failure(
+                    SandboxError::SpawnFailed(format!("netns helper owner pidfd: {e}")),
+                    cleanup_error,
+                ));
+            }
+        };
 
         let allocation = netns::proxy_netns_allocation(sandbox_id, proxy_port);
         let mut cmd = Command::new(netns::helper_path());
@@ -973,6 +1039,7 @@ impl LinuxSandbox {
             cgroup_procs_fd
                 .map(|fd| fd.to_string())
                 .unwrap_or_else(|| "-1".into()),
+            owner_guard.fd().to_string(),
         ];
         cmd.args(helper_args);
 
@@ -1028,6 +1095,7 @@ impl LinuxSandbox {
                 mxc_config_fd: None,
             },
         );
+        owner_guard.configure_command(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -1043,6 +1111,7 @@ impl LinuxSandbox {
                 ));
             }
         };
+        owner_guard.spawned();
 
         close_fd(Some(spec_fd));
         close_fd(Some(sync_write_fd));
@@ -1052,8 +1121,13 @@ impl LinuxSandbox {
         self.netns_helper_destroy_token = Some(destroy_token);
 
         if let Err(e) = netns::read_helper_sync(sync_read_fd) {
-            let _ = child.wait();
-            let cleanup_error = self.cleanup_parent_resources_after_setup_failure(None);
+            let termination_error = terminate_netns_helper_startup(&mut child)
+                .err()
+                .map(|error| format!("helper termination failed: {error}"));
+            let cleanup_error = combine_cleanup_errors(
+                termination_error,
+                self.cleanup_parent_resources_after_setup_failure(None),
+            );
             return Err(append_cleanup_failure(
                 SandboxError::IsolationFailed(format!("netns helper setup failed: {e}")),
                 cleanup_error,
@@ -1118,6 +1192,44 @@ fn close_fd(fd: Option<i32>) {
         unsafe {
             libc::close(fd);
         }
+    }
+}
+
+pub(super) fn terminate_netns_helper_startup(child: &mut Child) -> Result<(), String> {
+    let pid = child.id() as libc::pid_t;
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => return Err(format!("inspect helper process {pid}: {error}")),
+    }
+    if let Err(error) = child.kill()
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err(format!("terminate helper process {pid}: {error}"));
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(POST_TIMEOUT_REAP_GRACE_SEC);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "helper process {pid} did not exit within {POST_TIMEOUT_REAP_GRACE_SEC}s after SIGKILL"
+                ));
+            }
+            Err(error) => return Err(format!("reap helper process {pid}: {error}")),
+        }
+    }
+}
+
+fn combine_cleanup_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
     }
 }
 
@@ -1500,7 +1612,7 @@ fn run_parent_death_monitor(read_fd: i32, process_group: libc::pid_t) -> ! {
     loop {
         let ret = unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
         if ret > 0 {
-            disarmed = true;
+            disarmed = byte == PARENT_DEATH_GUARD_DISARM;
             break;
         }
         if ret == 0 {
@@ -2652,20 +2764,7 @@ mod tests {
         let mut child = cmd.spawn().unwrap();
         let process_group = child.id() as libc::pid_t;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !pid_path.exists() {
-            if std::time::Instant::now() >= deadline {
-                kill_process_group(process_group);
-                let _ = wait_for_killed_child(&mut child, process_group);
-                panic!("background pid was not recorded");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let background_pid = std::fs::read_to_string(&pid_path)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
+        let background_pid = wait_for_recorded_test_pid(&pid_path, &mut child, process_group);
         assert!(process_exists(background_pid));
 
         let pipe = ParentDeathGuardPipe::new().unwrap();
@@ -2707,20 +2806,7 @@ mod tests {
         let mut child = cmd.spawn().unwrap();
         let process_group = child.id() as libc::pid_t;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !pid_path.exists() {
-            if std::time::Instant::now() >= deadline {
-                kill_process_group(process_group);
-                let _ = wait_for_killed_child(&mut child, process_group);
-                panic!("background pid was not recorded");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let background_pid = std::fs::read_to_string(&pid_path)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
+        let background_pid = wait_for_recorded_test_pid(&pid_path, &mut child, process_group);
 
         let pipe = ParentDeathGuardPipe::new().unwrap();
         let mut guard = ParentDeathGuard::spawn_for_process_group(process_group, pipe).unwrap();
@@ -2732,6 +2818,28 @@ mod tests {
         );
         kill_process_group(process_group);
         let _ = wait_for_killed_child(&mut child, process_group);
+    }
+
+    fn wait_for_recorded_test_pid(
+        pid_path: &Path,
+        child: &mut Child,
+        process_group: libc::pid_t,
+    ) -> libc::pid_t {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(pid_path)
+                && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                && pid > 0
+            {
+                return pid;
+            }
+            if std::time::Instant::now() >= deadline {
+                kill_process_group(process_group);
+                let _ = wait_for_killed_child(child, process_group);
+                panic!("background pid was not recorded");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2947,7 +3055,7 @@ mod tests {
         let cleanup_error = sandbox.cleanup_netns_with_helper_token(|sandbox_id, token| {
             assert_eq!(sandbox_id, id);
             assert_eq!(token, helper_test_token());
-            Ok(())
+            Ok(netns::HelperCleanupOutcome::Destroyed)
         });
 
         assert!(cleanup_error.is_none());
@@ -2956,18 +3064,16 @@ mod tests {
     }
 
     #[test]
-    fn helper_token_cleanup_accepts_supervisor_removed_state() {
+    fn helper_token_cleanup_accepts_authenticated_completed_outcome() {
         let workspace = tempfile::tempdir().unwrap();
         let id = SandboxId::new();
         let mut sandbox = test_sandbox(id, workspace.path(), None);
         sandbox.netns_name = Some("axis-test-cleanup".into());
         sandbox.netns_helper_destroy_token = Some(helper_test_token().into());
 
-        let cleanup_error =
-            sandbox.cleanup_netns_with_helper_token(|_, _| {
-                Err("read helper state /run/axis/netns/test: No such file or directory (os error 2)"
-                .into())
-            });
+        let cleanup_error = sandbox.cleanup_netns_with_helper_token(|_, _| {
+            Ok(netns::HelperCleanupOutcome::AlreadyCompleted)
+        });
 
         assert!(cleanup_error.is_none());
         assert!(sandbox.netns_name.is_none());
@@ -3011,7 +3117,7 @@ mod tests {
             |sandbox_id, token| {
                 assert_eq!(sandbox_id, id);
                 assert_eq!(token, helper_test_token());
-                Ok(())
+                Ok(netns::HelperCleanupOutcome::Destroyed)
             },
         );
 
@@ -3034,7 +3140,7 @@ mod tests {
             |sandbox_id, token| {
                 assert_eq!(sandbox_id, id);
                 assert_eq!(token, helper_test_token());
-                Ok(())
+                Ok(netns::HelperCleanupOutcome::Destroyed)
             },
         );
 
@@ -3113,6 +3219,17 @@ mod tests {
             libc::close(read_fd);
             libc::close(write_fd);
         }
+    }
+
+    #[test]
+    fn stalled_netns_helper_startup_is_terminated_and_reaped() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let started = std::time::Instant::now();
+
+        terminate_netns_helper_startup(&mut child).unwrap();
+
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -3548,12 +3665,7 @@ mod tests {
         assert!(sandbox.netns_name.is_none());
         assert!(sandbox.netns_helper_destroy_token.is_none());
         let stale_destroy = netns::destroy_netns_with_helper_token(id, &helper_token);
-        assert!(
-            stale_destroy
-                .as_ref()
-                .is_err_and(|e| netns::helper_cleanup_already_done(e)),
-            "helper state should be gone after wait, got {stale_destroy:?}"
-        );
+        assert!(stale_destroy.is_err(), "helper state survived wait");
         sandbox.destroy().unwrap();
     }
 

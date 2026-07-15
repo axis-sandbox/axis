@@ -62,25 +62,20 @@ sha2 = "0.10"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
+httparse = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
-
-# Network
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-webpki-roots = "0.26"
-rcgen = "0.13"
-rustls-pemfile = "2"
 
 # Pattern matching (leak detection)
 aho-corasick = "1"
 regex = "1"
 
 # Filesystem watching
-notify = "7"
+notify = "8.2"
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -103,4 +98,4 @@ base64 = "0.22"
 llama-cpp-2 = "0.1"
 
 # HuggingFace model download
-indicatif = "0.17"
+indicatif = "0.18"

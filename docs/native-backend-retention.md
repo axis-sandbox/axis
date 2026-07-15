@@ -1,8 +1,8 @@
 # Native Backend Retention
 
-AXIS keeps native process backends only where they provide a current capability,
+AXIS records whether each native process backend provides a current capability,
 dependency, or performance advantage that MXC-backed paths have not yet matched.
-The retention decisions below are represented in
+The decisions below are represented in
 `axis_core::process_backend` and use the same backend capability vocabulary as
 MXC process backends. Current default-backend status and benchmark evidence
 requirements are documented in
@@ -14,7 +14,7 @@ requirements are documented in
 | --- | --- | --- | --- |
 | Linux | `axis-native-linux` | Retain | Direct Landlock plus seccomp keep strict native filesystem and network controls, lightweight process startup comparisons, strict proxy integration, and seccomp-notify binary attribution available while the MXC default path is expanded. |
 | macOS | `axis-native-macos-seatbelt` | Retain | Direct Seatbelt profile generation preserves the no-extra-runtime process sandbox and platform-native filesystem/network-deny controls while the MXC Seatbelt path is compared for equivalent profile, lifecycle, and packaging behavior. |
-| Windows | `axis-native-windows` | Retain | Job Object, Low Integrity, and process-container primitives remain the current native Windows process sandbox vocabulary, with AXIS-owned credential, lifecycle, and resource handling retained until MXC ProcessContainer proves equivalent behavior. |
+| Windows | `axis-native-windows` | Disabled | Job Object, restricted-token/AppContainer, ACL, proxy, environment, lifecycle, and cleanup controls are implementation assets, but the native launcher rejects before process creation until they are applied and proven as one boundary. |
 
 ## Replacement Rule
 
@@ -29,6 +29,6 @@ an MXC backend exists for the same platform. Replacement requires:
 - public documentation of any weaker behavior that remains and explicit user
   selection when weaker behavior is accepted.
 
-Until that evidence exists, native backends remain selectable through the shared
-planner vocabulary. Backend adapters must continue to reject unsupported or
-weaker policy/backend combinations before spawning user code.
+Until that evidence exists, implemented native backends remain selectable
+through the shared planner vocabulary. Disabled adapters and unsupported or
+weaker policy/backend combinations must reject before spawning user code.

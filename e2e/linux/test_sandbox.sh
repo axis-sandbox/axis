@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Unprivileged Linux e2e proof for standalone `axis run`.
 #
 # This script must not require sudo, a developer-installed setuid helper, or
@@ -55,7 +58,7 @@ capability_skip_output() {
 require_axis() {
     if [ ! -x "$AXIS" ]; then
         echo "ERROR: axis binary not found: $AXIS"
-        echo "Build it with: cargo build --release -p axis-cli"
+        echo "Build it with: cargo build --locked --release -p axis-cli"
         exit 1
     fi
 }
@@ -200,14 +203,15 @@ rm -f "$denied"
 
 echo "--- Environment boundary through axis run ---"
 env_policy="$(write_policy allow)"
-export OPENAI_API_KEY="axis-e2e-provider-value"
-export ANTHROPIC_API_KEY="axis-e2e-provider-value"
+secret_fixture="sandbox-fixture"
+export OPENAI_API_KEY="axis-e2e-openai-${secret_fixture}"
+export ANTHROPIC_API_KEY="axis-e2e-anthropic-${secret_fixture}"
 export HTTPS_PROXY="http://proxy.example.invalid:8080"
 expect_axis_success_or_skip \
     "provider secrets and inherited proxy env are omitted" \
     --policy "$env_policy" -- /bin/sh -c \
     'if env | grep -E "^(OPENAI_API_KEY|ANTHROPIC_API_KEY|HTTPS_PROXY)="; then exit 42; fi'
-unset OPENAI_API_KEY ANTHROPIC_API_KEY HTTPS_PROXY
+unset OPENAI_API_KEY ANTHROPIC_API_KEY HTTPS_PROXY secret_fixture
 
 echo "--- Block-mode network through axis run ---"
 if require_cmd python3 "block-mode network test"; then

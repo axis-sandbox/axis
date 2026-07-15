@@ -1,3 +1,6 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 import { onMount, onCleanup, createEffect } from "solid-js";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -86,9 +89,6 @@ export function Terminal(props: TerminalProps) {
       term!.write("Waiting for agent to start...\r\n\r\n");
     };
 
-    // Wire up the result callback to show prompt.
-    onResultCallback = showPrompt;
-
     ptyConn.ws.onmessage = (msg) => {
       if (msg.data instanceof ArrayBuffer) {
         const view = new Uint8Array(msg.data);
@@ -115,10 +115,7 @@ export function Terminal(props: TerminalProps) {
   );
 }
 
-/** Render output to the terminal, handling both raw text and Claude stream-json.
- *  Returns true if a "result" message was received (agent finished responding). */
-let onResultCallback: (() => void) | null = null;
-
+/** Render output to the terminal, handling both raw text and Claude stream-json. */
 function renderOutput(term: XTerm, text: string) {
   // Try to parse each line as JSON (Claude stream-json format).
   for (const line of text.split("\n")) {

@@ -1,3 +1,6 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // REST + WebSocket client for the AXIS gateway.
 
 const GATEWAY_BASE =

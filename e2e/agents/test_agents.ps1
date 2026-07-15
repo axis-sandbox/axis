@@ -1,3 +1,6 @@
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # AXIS Agent Safety Test Suite (Windows PowerShell)
 #
 # Tests that agent policies validate and sandbox isolation works.

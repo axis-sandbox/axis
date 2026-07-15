@@ -1,0 +1,280 @@
+name: Security
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  distribution-notices:
+    name: Distribution notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Install GUI dependencies for notice verification
+        run: npm ci --prefix gui/shared
+      - name: Run publication Python tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Verify GUI dependency notices
+        run: npm run --prefix gui/shared notices:check
+      - name: Verify authenticated dependency notices
+        run: python3 scripts/generate_third_party_notices.py --check
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # upload CodeQL results
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, javascript-typescript, csharp]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1ad29ea4a422cce9a242a9fae469541dcd08addc # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@1ad29ea4a422cce9a242a9fae469541dcd08addc # v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  codeql-swift:
+    name: CodeQL (swift)
+    runs-on: macos-14
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # upload CodeQL results
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build desktop web resources
+        working-directory: gui/shared
+        run: |
+          npm ci
+          npm run build
+          mkdir -p ../macos/AXIS/Resources/web
+          cp -R dist/. ../macos/AXIS/Resources/web/
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1ad29ea4a422cce9a242a9fae469541dcd08addc # v4
+        with:
+          languages: swift
+          build-mode: manual
+          queries: security-extended
+
+      - name: Build Swift application
+        run: swift build --package-path gui/macos --arch arm64
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@1ad29ea4a422cce9a242a9fae469541dcd08addc # v4
+        with:
+          category: /language:swift
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Reject vulnerable dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: gui/shared/package-lock.json
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo audit
+          cargo audit --file gui/linux/Cargo.lock
+          cargo deny --locked check advisories licenses sources
+          cargo deny --manifest-path gui/linux/Cargo.toml --config deny.toml --locked check advisories licenses sources
+
+      - name: Audit GUI dependencies
+        working-directory: gui/shared
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+  windows-nuget-audit:
+    name: Windows NuGet audit
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Audit Windows NuGet dependencies
+        working-directory: gui/windows/AXIS
+        run: >-
+          dotnet restore --locked-mode -r win-x64
+          -p:NuGetAudit=true
+          -p:NuGetAuditMode=all
+          -p:NuGetAuditLevel=high
+          -p:TreatWarningsAsErrors=true
+
+  python-sast:
+    name: Python SAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/security-requirements.txt
+
+      - name: Install Bandit
+        run: python -m pip install --disable-pip-version-check --require-hashes -r .github/security-requirements.txt
+
+      - name: Scan Python sources
+        run: >-
+          bandit --severity-level high --confidence-level high --quiet
+          e2e/linux/test_hip_sandbox.py
+          scripts/bounded_subprocess.py
+          scripts/bounded_tar.py
+          scripts/generate_third_party_notices.py
+          scripts/release_tools.py
+          scripts/verify_release_archive.py
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Scan reachable history with Gitleaks
+        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --redact --no-banner --exit-code 1 .
+
+  actions-security:
+    name: GitHub Actions security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # upload zizmor SARIF results
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Audit workflows with zizmor
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          advanced-security: true
+          min-severity: medium
+          online-audits: false
+          persona: regular
+          version: 1.26.1
+
+  publication-gate:
+    name: Security publication gate
+    needs:
+      - distribution-notices
+      - codeql
+      - codeql-swift
+      - dependency-audit
+      - windows-nuget-audit
+      - python-sast
+      - secret-scan
+      - actions-security
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every publication security job to succeed
+        env:
+          NOTICES_RESULT: ${{ needs.distribution-notices.result }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+          SWIFT_RESULT: ${{ needs.codeql-swift.result }}
+          AUDIT_RESULT: ${{ needs.dependency-audit.result }}
+          NUGET_RESULT: ${{ needs.windows-nuget-audit.result }}
+          SAST_RESULT: ${{ needs.python-sast.result }}
+          SECRETS_RESULT: ${{ needs.secret-scan.result }}
+          ACTIONS_RESULT: ${{ needs.actions-security.result }}
+        run: |
+          set -euo pipefail
+          for result in "$NOTICES_RESULT" "$CODEQL_RESULT" "$SWIFT_RESULT" \
+            "$AUDIT_RESULT" "$NUGET_RESULT" "$SAST_RESULT" \
+            "$SECRETS_RESULT" "$ACTIONS_RESULT"; do
+            test "$result" = success
+          done

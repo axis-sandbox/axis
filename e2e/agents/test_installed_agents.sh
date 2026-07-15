@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Test that installed agents run ONLY through AXIS sandbox.
 #
 # Verifies:
@@ -13,7 +16,6 @@
 
 set -euo pipefail
 
-AXIS="${AXIS_BIN:-axis}"
 BIN_DIR="${HOME}/.axis/bin"
 TOOLS_DIR="${HOME}/.axis/tools"
 
@@ -96,7 +98,6 @@ for agent in $AGENTS; do
 done
 
 echo "══════════════════════════════════════════════════════════"
-TOTAL=$((PASS+FAIL))
 echo "Result: $PASS passed, $FAIL failed, $SKIP skipped"
 
 if [ $FAIL -gt 0 ]; then

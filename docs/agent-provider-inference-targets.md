@@ -30,26 +30,29 @@ policy and must not expose the user's real SSH directory directly.
 
 | Provider target | Status | Boundary behavior |
 | --- | --- | --- |
-| OpenAI | Host-boundary credential injection supported | `provider: openai` resolves to `api.openai.com`; sandbox-visible values stay placeholders |
-| Anthropic | Host-boundary credential injection supported | `provider: anthropic` resolves to `api.anthropic.com`; sandbox-visible values stay placeholders |
+| OpenAI | Network endpoint policy supported | HTTPS is relayed opaquely; host-boundary credential injection is not available without a per-sandbox CA trust path |
+| Anthropic | Network endpoint policy supported | HTTPS is relayed opaquely; host-boundary credential injection is not available without a per-sandbox CA trust path |
 | GitHub | Network endpoint policy supported | Agent fixtures allow GitHub API and repository endpoints where needed; raw tokens are not injected by the inference credential path |
 | GitLab | Generic endpoint policy only | Use an explicit endpoint policy or generic provider route; no bundled first-party fixture currently exists |
 | Copilot | Generic endpoint policy only | GitHub Copilot CLI is BYO-command only until a dedicated fixture and credential boundary are added |
 | Google Vertex AI | Generic endpoint policy only | Gemini CLI fixtures cover Gemini API and auth endpoints; Vertex-specific inference profiles are not bundled yet |
-| generic providers | Endpoint-scoped credential route supported | Explicit `http://` or `https://` inference endpoints may use host-boundary placeholders |
-| local OpenAI-compatible endpoints | Supported through `inference.local` or explicit local routes | Local endpoints do not require raw provider credentials inside the sandbox |
+| generic providers | Endpoint-scoped network policy supported | External HTTPS traffic is relayed opaquely and remains subject to host/port policy |
+| local OpenAI-compatible endpoints | Supported through `inference.local` or explicit local routes | Explicit local `http://` routes may use host-boundary credential placeholders |
 
 Provider credentials must remain outside sandbox environment variables, backend
-configuration JSON, command-line arguments, logs, and child stdio. The proxy or
-router resolves real secrets only for requests that match the approved provider
-route, host, scheme, port, and inference path.
+configuration JSON, command-line arguments, logs, and child stdio. The proxy
+resolves real secrets only for supported local plaintext routes. HTTPS
+credential routes fail before launch until authenticated per-sandbox TLS
+interception and trust distribution are implemented.
 
-## Inference API Targets
+## Inference API Compatibility Targets
 
-AXIS recognizes the following inference APIs for host-boundary routing and
-credential decisions:
+The following endpoints describe workloads that AXIS must relay correctly.
+They are compatibility targets, not method or path authorization rules. The
+current proxy authorizes a complete host and port and relays HTTPS opaquely;
+policies that request L7 method or path filtering are rejected before launch.
 
-| API target | Supported path pattern | Method |
+| API target | Common path | Common method |
 | --- | --- | --- |
 | OpenAI-compatible chat completions | `/v1/chat/completions` | `POST` |
 | OpenAI-compatible completions | `/v1/completions` | `POST` |
@@ -58,8 +61,8 @@ credential decisions:
 | OpenAI-compatible model discovery | `/v1/models` | `GET` |
 | Anthropic messages | `/v1/messages` | `POST` |
 
-Streaming uses the same approved request paths as the corresponding provider
-API. The proxy must relay streaming response bodies without requiring real cloud
+Streaming uses the same request paths as the corresponding provider API. The
+proxy must relay streaming response bodies without requiring real cloud
 provider credentials in tests. `inference.local` is the explicit managed local
 inference endpoint; external provider hosts remain governed by ordinary network
 and provider policy rather than implicit local rewrites.

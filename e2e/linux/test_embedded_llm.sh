@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Test embedded LLM: start server with TinyLlama, send a request, verify response.
 set -euo pipefail
 

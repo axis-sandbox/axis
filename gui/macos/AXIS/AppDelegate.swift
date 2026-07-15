@@ -1,3 +1,6 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // AXIS Desktop — macOS native app with WKWebView
 // Provides menu bar integration, window management, and hosts the shared frontend.
 
@@ -117,8 +120,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadFrontend() {
-        // Production: load from app bundle.
-        if let indexURL = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "web") {
+        // Production: load from the SwiftPM resource bundle.
+        if let indexURL = Bundle.module.url(forResource: "index", withExtension: "html", subdirectory: "web") {
             webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
         } else {
             // Development: connect to Vite dev server.

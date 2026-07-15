@@ -29,6 +29,7 @@ pub mod host_dependency {
     pub const LINUX_NETNS: &str = "linux.network_namespaces";
     pub const LINUX_SECCOMP_BPF: &str = "linux.seccomp_bpf";
     pub const LINUX_SECCOMP_NOTIFY: &str = "linux.seccomp_notify";
+    pub const LINUX_STRICT_PROXY: &str = "linux.strict_proxy_boundary";
     pub const LINUX_USERNS: &str = "linux.user_namespaces";
     pub const MACOS_SEATBELT: &str = "macos.seatbelt";
     pub const MACOS_XCODE_CLT: &str = "macos.xcode_command_line_tools";
@@ -526,7 +527,7 @@ fn axis_native_linux() -> BackendCapabilities {
             ),
             endpoint_policy: CapabilitySupport::AxisOwned,
             binary_attribution: dep_support(host_dependency::LINUX_SECCOMP_NOTIFY),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: cgroups.clone(),
@@ -570,6 +571,7 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
             host_dependency::LINUX_SECCOMP_NOTIFY,
             host_dependency::LINUX_NETNS,
             host_dependency::AXIS_NETNS_HELPER,
+            host_dependency::LINUX_STRICT_PROXY,
             host_dependency::LINUX_CGROUP_V2,
         ]),
         filesystem: FilesystemCapabilities {
@@ -591,13 +593,13 @@ fn mxc_linux_bubblewrap() -> BackendCapabilities {
         network: NetworkCapabilities {
             allow: dep_support(host_dependency::MXC_EXECUTOR),
             block: mxc_bwrap,
-            strict_proxy: CapabilitySupport::AxisOwned,
+            strict_proxy: dep_support(host_dependency::LINUX_STRICT_PROXY),
             cooperative_proxy: CapabilitySupport::weaker(
                 "MXC cooperative proxy relies on proxy environment variables and cannot stop direct sockets",
             ),
             endpoint_policy: CapabilitySupport::AxisOwned,
             binary_attribution: dep_support(host_dependency::LINUX_SECCOMP_NOTIFY),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: CapabilitySupport::AxisOwned,
@@ -668,7 +670,7 @@ fn mxc_linux_lxc() -> BackendCapabilities {
             ),
             endpoint_policy: CapabilitySupport::AxisOwned,
             binary_attribution: dep_support(host_dependency::LINUX_SECCOMP_NOTIFY),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: cgroups.clone(),
@@ -765,7 +767,7 @@ fn axis_native_macos_seatbelt() -> BackendCapabilities {
             binary_attribution: CapabilitySupport::unsupported(
                 "connect-time executable attribution is not implemented for macOS",
             ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: CapabilitySupport::weaker(
@@ -848,7 +850,7 @@ fn mxc_macos_seatbelt() -> BackendCapabilities {
             binary_attribution: CapabilitySupport::unsupported(
                 "connect-time executable attribution is not implemented for MXC Seatbelt",
             ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: CapabilitySupport::weaker(
@@ -880,76 +882,76 @@ fn mxc_macos_seatbelt() -> BackendCapabilities {
 }
 
 fn axis_native_windows() -> BackendCapabilities {
-    let windows_native = deps_support([
-        host_dependency::WINDOWS_JOBOBJECT,
-        host_dependency::WINDOWS_LOW_INTEGRITY,
-    ]);
+    let unavailable = CapabilitySupport::unsupported(
+        "native Windows containment is disabled until restricted-token, Job Object, filesystem, and network controls are applied to the spawned process",
+    );
 
     BackendCapabilities {
         platform: BackendPlatform::Windows,
         name: BackendCapabilityMapId::AxisNativeWindows.as_str().into(),
-        stability: BackendStability::Preview,
+        stability: BackendStability::Experimental,
         host_dependencies: deps([
             host_dependency::WINDOWS_JOBOBJECT,
             host_dependency::WINDOWS_LOW_INTEGRITY,
             host_dependency::WINDOWS_PROCESS_CONTAINER,
         ]),
         filesystem: FilesystemCapabilities {
-            read_only: windows_native.clone(),
-            read_write: windows_native.clone(),
-            deny: windows_native.clone(),
-            workspace: windows_native.clone(),
+            read_only: unavailable.clone(),
+            read_write: unavailable.clone(),
+            deny: unavailable.clone(),
+            workspace: unavailable.clone(),
         },
         process: ProcessCapabilities {
-            command: windows_native.clone(),
-            working_dir: windows_native.clone(),
-            environment: CapabilitySupport::AxisOwned,
-            stdio: CapabilitySupport::AxisOwned,
-            user_identity: CapabilitySupport::unsupported(
-                "Windows run_as_user parity is not mapped by AXIS",
-            ),
-            syscall_filtering: CapabilitySupport::unsupported(
-                "Windows does not provide AXIS seccomp-style syscall filtering",
-            ),
-            pty: CapabilitySupport::unsupported("Windows PTY support is not mapped by AXIS"),
-            timeout: CapabilitySupport::AxisOwned,
+            command: unavailable.clone(),
+            working_dir: unavailable.clone(),
+            environment: unavailable.clone(),
+            stdio: unavailable.clone(),
+            user_identity: unavailable.clone(),
+            syscall_filtering: unavailable.clone(),
+            pty: unavailable.clone(),
+            timeout: unavailable.clone(),
         },
         network: NetworkCapabilities {
-            allow: windows_native.clone(),
-            block: dep_support(host_dependency::WINDOWS_PROCESS_CONTAINER),
-            strict_proxy: CapabilitySupport::weaker(
-                "Windows native strict proxy requires a WFP/AppContainer adapter that is not mapped yet",
-            ),
-            cooperative_proxy: CapabilitySupport::weaker(
-                "proxy environment variables are advisory and can be ignored by clients",
-            ),
-            endpoint_policy: CapabilitySupport::AxisOwned,
-            binary_attribution: CapabilitySupport::unsupported(
-                "connect-time executable attribution is not implemented for Windows native execution",
-            ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            allow: unavailable.clone(),
+            block: unavailable.clone(),
+            strict_proxy: unavailable.clone(),
+            cooperative_proxy: unavailable.clone(),
+            endpoint_policy: unavailable.clone(),
+            binary_attribution: unavailable.clone(),
+            l7_policy: unavailable.clone(),
         },
         resources: ResourceCapabilities {
-            process_count: dep_support(host_dependency::WINDOWS_JOBOBJECT),
-            memory: dep_support(host_dependency::WINDOWS_JOBOBJECT),
-            cpu: dep_support(host_dependency::WINDOWS_JOBOBJECT),
-            timeout: CapabilitySupport::AxisOwned,
+            process_count: unavailable.clone(),
+            memory: unavailable.clone(),
+            cpu: unavailable.clone(),
+            timeout: unavailable.clone(),
         },
-        credentials: axis_credentials(),
-        inference: axis_inference(),
-        lifecycle: stateful_lifecycle(),
+        credentials: CredentialCapabilities {
+            secret_filtering: unavailable.clone(),
+            host_boundary_injection: unavailable.clone(),
+            placeholder_projection: unavailable.clone(),
+        },
+        inference: InferenceCapabilities {
+            inference_local: unavailable.clone(),
+            external_provider: unavailable.clone(),
+            streaming: unavailable.clone(),
+        },
+        lifecycle: LifecycleCapabilities {
+            start: unavailable.clone(),
+            exec: unavailable.clone(),
+            destroy: unavailable.clone(),
+            stateful: unavailable.clone(),
+        },
         cleanup: CleanupCapabilities {
-            process_tree: dep_support(host_dependency::WINDOWS_JOBOBJECT),
-            resources: dep_support(host_dependency::WINDOWS_JOBOBJECT),
-            temp_state: CapabilitySupport::AxisOwned,
-            backend_state: CapabilitySupport::AxisOwned,
+            process_tree: unavailable.clone(),
+            resources: unavailable.clone(),
+            temp_state: unavailable.clone(),
+            backend_state: unavailable.clone(),
         },
         audit: AuditCapabilities {
-            denials: CapabilitySupport::AxisOwned,
+            denials: unavailable.clone(),
             dependency_reasons: CapabilitySupport::AxisOwned,
-            bypass_evidence: CapabilitySupport::unsupported(
-                "Windows bypass evidence collection is not mapped",
-            ),
+            bypass_evidence: unavailable,
         },
     }
 }
@@ -1005,7 +1007,7 @@ fn mxc_windows_processcontainer() -> BackendCapabilities {
             binary_attribution: CapabilitySupport::unsupported(
                 "connect-time executable attribution is not implemented for MXC ProcessContainer",
             ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: dep_support(host_dependency::WINDOWS_JOBOBJECT),
@@ -1125,7 +1127,7 @@ fn mxc_windows_wslc() -> BackendCapabilities {
             binary_attribution: CapabilitySupport::unsupported(
                 "connect-time executable attribution is not implemented for MXC WSLC",
             ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: CapabilitySupport::unsupported(
@@ -1231,7 +1233,7 @@ fn vm_backend<const N: usize>(
             binary_attribution: CapabilitySupport::unsupported(
                 "connect-time executable attribution is not implemented for VM backends",
             ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: CapabilitySupport::unsupported(
@@ -1330,7 +1332,7 @@ fn windows_vm_like_backend<const N: usize>(
             binary_attribution: CapabilitySupport::unsupported(
                 "connect-time executable attribution is not implemented for Windows VM-style backends",
             ),
-            l7_policy: CapabilitySupport::AxisOwned,
+            l7_policy: unsupported_l7_policy(),
         },
         resources: ResourceCapabilities {
             process_count: CapabilitySupport::unsupported(
@@ -1371,6 +1373,10 @@ fn axis_credentials() -> CredentialCapabilities {
         host_boundary_injection: CapabilitySupport::AxisOwned,
         placeholder_projection: CapabilitySupport::AxisOwned,
     }
+}
+
+fn unsupported_l7_policy() -> CapabilitySupport {
+    CapabilitySupport::unsupported("L7 method/path policy is not enforced")
 }
 
 fn axis_inference() -> InferenceCapabilities {
@@ -1431,6 +1437,9 @@ fn host_dependency_for(name: &'static str) -> HostDependency {
         host_dependency::LINUX_NETNS => "Linux network namespace and veth support",
         host_dependency::LINUX_SECCOMP_BPF => "Linux seccomp-BPF filter support",
         host_dependency::LINUX_SECCOMP_NOTIFY => "Linux seccomp user notification support",
+        host_dependency::LINUX_STRICT_PROXY => {
+            "AXIS strict proxy boundary selected after network namespace, firewall, and privilege checks"
+        }
         host_dependency::LINUX_USERNS => "unprivileged user namespace support",
         host_dependency::MACOS_SEATBELT => "macOS Seatbelt profile execution support",
         host_dependency::MACOS_XCODE_CLT => {
@@ -1472,6 +1481,20 @@ mod tests {
         for backend in maps {
             validate_backend_capability_map(&backend)
                 .unwrap_or_else(|problems| panic!("{}: {problems:?}", backend.name));
+        }
+    }
+
+    #[test]
+    fn no_backend_advertises_unenforced_l7_policy() {
+        for backend in all_backend_capability_maps() {
+            assert!(
+                matches!(
+                    backend.network.l7_policy,
+                    CapabilitySupport::Unsupported { .. }
+                ),
+                "{} advertised L7 policy support",
+                backend.name
+            );
         }
     }
 
@@ -1519,6 +1542,7 @@ mod tests {
             host_dependency::LINUX_BUBBLEWRAP,
             host_dependency::MACOS_XCODE_CLT,
             host_dependency::LINUX_CGROUP_V2,
+            host_dependency::LINUX_STRICT_PROXY,
             host_dependency::LINUX_USERNS,
             host_dependency::MXC_EXECUTOR,
             host_dependency::MXC_HYPERLIGHT_RUNTIME,
@@ -1578,6 +1602,38 @@ mod tests {
             BackendPlanOutcome::ExactWithHostDependency { .. }
         ));
         assert!(plan.spawn_allowed(), "{:?}", plan.pre_spawn_error());
+    }
+
+    #[test]
+    fn native_windows_rejects_launch_until_confinement_is_applied() {
+        let backend = backend_capability_map(BackendCapabilityMapId::AxisNativeWindows);
+        let runtime = RuntimeProbeSnapshot::new()
+            .with_dependency(host_dependency::WINDOWS_JOBOBJECT, DependencyState::Present)
+            .with_dependency(
+                host_dependency::WINDOWS_LOW_INTEGRITY,
+                DependencyState::Present,
+            )
+            .with_dependency(
+                host_dependency::WINDOWS_PROCESS_CONTAINER,
+                DependencyState::Present,
+            );
+        let plan = plan_backend_policy(
+            &policy(NetworkMode::Block),
+            &backend,
+            &runtime,
+            &PlannerOptions::new(),
+        );
+
+        assert!(matches!(
+            plan.outcome,
+            BackendPlanOutcome::Unsupported { .. }
+        ));
+        assert!(!plan.spawn_allowed());
+        assert!(
+            plan.pre_spawn_error()
+                .unwrap()
+                .contains("native Windows containment is disabled")
+        );
     }
 
     #[test]

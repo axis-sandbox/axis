@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Capability-gated Linux e2e proof for the bubblewrap fallback path.
 #
 # This is not part of the default quickstart proof. It runs only when the
@@ -33,7 +36,7 @@ cleanup() {
 trap cleanup EXIT
 cd "$REPO_ROOT"
 
-cargo build --release -p axis-cli
+cargo build --locked --release -p axis-cli
 
 if python3 - <<'PY'
 import ctypes
@@ -89,6 +92,6 @@ sys.exit(42)'
 fi
 
 AXIS_BWRAP_TESTS=1 \
-    cargo test -p axis-sandbox \
+    cargo test --locked -p axis-sandbox \
     gated_bubblewrap_fallback_mounts_workspace_and_blocks_network \
     -- --nocapture

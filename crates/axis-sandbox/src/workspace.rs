@@ -45,6 +45,7 @@ pub fn prepare_agent_workspace(
     let home = user_home()?;
 
     let agent_root = agent_state_root_checked(policy_name)?;
+    create_axis_private_dir(&agent_root, 0o700, "agent state root")?;
 
     let mut symlinks = Vec::new();
 
@@ -930,7 +931,8 @@ fn managed_home_agent_state_mapping_for_policy_path_with_home(
         Ok(relative) => relative.to_path_buf(),
         Err(_) => return Ok(None),
     };
-    let contained_dir = if relative == Path::new(".axis") {
+    // Keep managed-HOME AXIS state separate from private setup siblings such as ssh-staging.
+    let contained_dir = if relative == Path::new(".axis") || expanded == agent_root {
         Some(agent_root.join("axis"))
     } else {
         contained_agent_dir_for_relative(&relative, agent_root)
@@ -1010,6 +1012,7 @@ mod tests {
 
     #[test]
     fn only_known_agent_state_paths_are_contained() {
+        let home = Path::new("/home/user");
         let agent_root = Path::new("/home/user/.axis/agents/test");
 
         assert_eq!(
@@ -1023,6 +1026,32 @@ mod tests {
         assert_eq!(
             contained_agent_dir_for_relative(Path::new("fixture/project"), agent_root),
             None
+        );
+        assert_eq!(
+            agent_state_mapping_for_policy_path_with_home("~/.axis/agents/test", home, agent_root,)
+                .unwrap(),
+            None,
+            "a policy-owned state root is a grant target, not a home alias"
+        );
+        assert_eq!(
+            managed_home_agent_state_mapping_for_policy_path_with_home(
+                "~/.axis/agents/test",
+                home,
+                agent_root,
+            )
+            .unwrap(),
+            Some((home.join(".axis/agents/test"), agent_root.join("axis"))),
+            "managed HOME setup must redirect the explicit policy-owned root"
+        );
+        assert_eq!(
+            managed_home_agent_state_mapping_for_policy_path_with_home(
+                "/home/user/.axis/agents/test",
+                home,
+                agent_root,
+            )
+            .unwrap(),
+            Some((home.join(".axis/agents/test"), agent_root.join("axis"))),
+            "absolute agent-root grants must not expose private setup siblings"
         );
     }
 
@@ -1049,6 +1078,36 @@ mod tests {
                 assert!(
                     mapping_err.contains("policy name"),
                     "expected mapping policy name error for {name:?}, got {mapping_err}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn workspace_preparation_creates_policy_root_without_aliases() {
+        let home = tempfile::tempdir().unwrap();
+
+        with_home(home.path(), || {
+            let policy_root = home.path().join(".axis/agents/agent-base-deny");
+            let created = prepare_agent_workspace(
+                "agent-base-deny",
+                &["~/.axis/agents/agent-base-deny".into()],
+            )
+            .unwrap();
+
+            assert!(created.is_empty());
+            assert!(policy_root.is_dir());
+            assert!(!policy_root.is_symlink());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&policy_root)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
                 );
             }
         });

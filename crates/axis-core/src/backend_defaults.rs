@@ -130,7 +130,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: NATIVE_SECURITY_EVIDENCE,
         benchmark_gate: Some(
-            "AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run -p axis-bench --bin runtime-metrics",
+            "AXIS_RUNTIME_METRICS_PROVIDERS=axis_native cargo run --locked -p axis-bench --bin runtime-metrics",
         ),
     },
     BackendDefaultRecord {
@@ -142,7 +142,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
         benchmark_gate: Some(
-            "AXIS_RUNTIME_METRICS_PROVIDERS=mxc AXIS_RUNTIME_METRICS_PROFILES=mxc_process cargo run -p axis-bench --bin runtime-metrics",
+            "AXIS_RUNTIME_METRICS_PROVIDERS=mxc AXIS_RUNTIME_METRICS_PROFILES=mxc_process cargo run --locked -p axis-bench --bin runtime-metrics",
         ),
     },
     BackendDefaultRecord {
@@ -183,7 +183,7 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         rationale: "Native macOS Seatbelt remains the process default while it preserves the no-extra-runtime sandbox path and platform-native filesystem and network-deny controls.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: NATIVE_SECURITY_EVIDENCE,
-        benchmark_gate: Some("cargo run -p axis-bench --bin success-metrics"),
+        benchmark_gate: Some("cargo run --locked -p axis-bench --bin success-metrics"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcMacosSeatbelt,
@@ -199,18 +199,18 @@ pub const BACKEND_DEFAULT_RECORDS: &[BackendDefaultRecord] = &[
         id: BackendCapabilityMapId::AxisNativeWindows,
         platform: BackendPlatform::Windows,
         execution_class: BackendExecutionClass::Process,
-        status: BackendDefaultStatus::CurrentDefault,
-        rationale: "Native Windows remains the process default while Job Object, Low Integrity, and AXIS-owned process lifecycle behavior are the proven baseline.",
+        status: BackendDefaultStatus::Candidate,
+        rationale: "Native Windows remains unavailable until Restricted Token, Job Object, filesystem, environment, and network controls are applied to the spawned process and validated as one boundary.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: NATIVE_SECURITY_EVIDENCE,
-        benchmark_gate: Some("cargo run -p axis-bench --bin success-metrics"),
+        benchmark_gate: Some("cargo run --locked -p axis-bench --bin success-metrics"),
     },
     BackendDefaultRecord {
         id: BackendCapabilityMapId::MxcWindowsProcessContainer,
         platform: BackendPlatform::Windows,
         execution_class: BackendExecutionClass::Process,
         status: BackendDefaultStatus::Candidate,
-        rationale: "MXC ProcessContainer is the Windows process candidate and must prove equivalent resource, lifecycle, startup, and policy behavior before replacing the native default.",
+        rationale: "MXC ProcessContainer is a Windows process candidate and must prove resource, lifecycle, startup, and policy behavior before becoming a current default.",
         required_benchmark_metrics: PROCESS_METRICS,
         required_security_evidence: SECURITY_EVIDENCE,
         benchmark_gate: Some("AXIS_BENCH_MXC_WINDOWS_PROCESSCONTAINER=1"),
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn current_process_defaults_match_declared_platform_choices() {
+    fn current_process_defaults_match_implemented_platform_choices() {
         for (platform, expected) in [
             (
                 BackendPlatform::Linux,
@@ -310,10 +310,6 @@ mod tests {
             (
                 BackendPlatform::Macos,
                 BackendCapabilityMapId::AxisNativeMacosSeatbelt,
-            ),
-            (
-                BackendPlatform::Windows,
-                BackendCapabilityMapId::AxisNativeWindows,
             ),
         ] {
             let defaults = backend_default_records()
@@ -335,6 +331,15 @@ mod tests {
                 "{platform:?} process default must match the declared backend decision"
             );
         }
+
+        assert!(
+            backend_default_records().iter().all(|record| {
+                record.platform != BackendPlatform::Windows
+                    || record.execution_class != BackendExecutionClass::Process
+                    || record.status != BackendDefaultStatus::CurrentDefault
+            }),
+            "Windows must not advertise a current process default before confinement is implemented"
+        );
     }
 
     #[test]

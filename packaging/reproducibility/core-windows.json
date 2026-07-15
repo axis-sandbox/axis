@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "artifactProfile": "core-windows",
+  "normalizedArchiveCompared": false,
+  "cleanBuildBinaryCompared": false,
+  "scope": "Native binary and ZIP reproducibility are not asserted for the hosted MSVC SDK and PowerShell packaging stack."
+}

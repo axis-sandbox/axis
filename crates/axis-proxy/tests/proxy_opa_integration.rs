@@ -32,7 +32,7 @@ network:
       endpoints:
         - host: "pypi.org"
           port: 443
-          access: read-only
+          access: read-write
     - name: inference
       endpoints:
         - host: "inference.local"
@@ -54,45 +54,45 @@ async fn start_proxy_with_policy(
     policy_yaml: &str,
     inference_ep: Option<std::net::SocketAddr>,
 ) -> (SandboxId, std::net::SocketAddr) {
-    start_proxy_with_policy_and_roots(policy_yaml, inference_ep, Vec::new()).await
+    start_proxy_with_policy_and_attribution(policy_yaml, inference_ep, None).await
 }
 
-async fn start_proxy_with_policy_and_roots(
+async fn start_proxy_with_policy_and_attribution(
     policy_yaml: &str,
     inference_ep: Option<std::net::SocketAddr>,
-    upstream_tls_roots_pem: Vec<String>,
-) -> (SandboxId, std::net::SocketAddr) {
-    start_proxy_with_policy_roots_and_attribution(
-        policy_yaml,
-        inference_ep,
-        upstream_tls_roots_pem,
-        None,
-    )
-    .await
-}
-
-async fn start_proxy_with_policy_roots_and_attribution(
-    policy_yaml: &str,
-    inference_ep: Option<std::net::SocketAddr>,
-    upstream_tls_roots_pem: Vec<String>,
     connect_attribution: Option<ConnectAttributionStore>,
 ) -> (SandboxId, std::net::SocketAddr) {
-    start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+    start_proxy_with_policy_attribution_and_identity_diagnostics(
         policy_yaml,
         inference_ep,
-        upstream_tls_roots_pem,
         connect_attribution,
         false,
     )
     .await
 }
 
-async fn start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+async fn start_proxy_with_policy_attribution_and_identity_diagnostics(
     policy_yaml: &str,
     inference_ep: Option<std::net::SocketAddr>,
-    upstream_tls_roots_pem: Vec<String>,
     connect_attribution: Option<ConnectAttributionStore>,
     enable_identity_diagnostics: bool,
+) -> (SandboxId, std::net::SocketAddr) {
+    start_proxy_with_options(
+        policy_yaml,
+        inference_ep,
+        connect_attribution,
+        enable_identity_diagnostics,
+        true,
+    )
+    .await
+}
+
+async fn start_proxy_with_options(
+    policy_yaml: &str,
+    inference_ep: Option<std::net::SocketAddr>,
+    connect_attribution: Option<ConnectAttributionStore>,
+    enable_identity_diagnostics: bool,
+    enable_leak_detection: bool,
 ) -> (SandboxId, std::net::SocketAddr) {
     let policy = Policy::from_yaml(policy_yaml).unwrap();
     let sandbox_id = SandboxId::new();
@@ -100,9 +100,7 @@ async fn start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
         sandbox_id,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
-        enable_l7: false,
-        enable_leak_detection: true,
-        upstream_tls_roots_pem,
+        enable_leak_detection,
         inference_endpoint: inference_ep,
         connect_attribution,
         enable_identity_diagnostics,
@@ -132,9 +130,7 @@ async fn denied_connect_emits_phase_timing_event() {
         sandbox_id,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
-        enable_l7: false,
         enable_leak_detection: false,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: None,
         enable_identity_diagnostics: false,
@@ -178,9 +174,7 @@ async fn host_port_only_denied_connect_skips_identity_attribution() {
         sandbox_id,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
-        enable_l7: false,
         enable_leak_detection: false,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution: Some(ConnectAttributionStore::new(
             std::time::Duration::from_secs(30),
@@ -219,9 +213,7 @@ async fn host_port_only_allowed_connect_skips_identity_attribution() {
         sandbox_id,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         policy,
-        enable_l7: false,
         enable_leak_detection: false,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: Some(upstream),
         connect_attribution: Some(ConnectAttributionStore::new(
             std::time::Duration::from_secs(30),
@@ -254,10 +246,9 @@ async fn host_port_only_allowed_connect_skips_identity_attribution() {
 async fn optional_identity_diagnostics_do_not_block_host_port_allow() {
     let store = ConnectAttributionStore::new(std::time::Duration::from_millis(1));
     let upstream = start_mock_tcp_server().await;
-    let (sandbox_id, addr) = start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+    let (sandbox_id, addr) = start_proxy_with_policy_attribution_and_identity_diagnostics(
         TEST_POLICY,
         Some(upstream),
-        Vec::new(),
         Some(store.clone()),
         true,
     )
@@ -286,10 +277,9 @@ async fn optional_identity_diagnostics_do_not_block_host_port_allow() {
 #[tokio::test]
 async fn optional_identity_diagnostics_do_not_override_host_port_deny() {
     let store = ConnectAttributionStore::default();
-    let (sandbox_id, addr) = start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
+    let (sandbox_id, addr) = start_proxy_with_policy_attribution_and_identity_diagnostics(
         TEST_POLICY,
         None,
-        Vec::new(),
         Some(store.clone()),
         true,
     )
@@ -369,144 +359,6 @@ async fn start_recording_http_server_until(
         }
     });
     (addr, rx)
-}
-
-async fn start_recording_https_server_until(
-    hostname: &'static str,
-    stop_pattern: &'static str,
-) -> (
-    std::net::SocketAddr,
-    tokio::sync::oneshot::Receiver<String>,
-    String,
-) {
-    let (cert_pem, key_pem, ca_pem) = provider_tls_material(hostname);
-    let mut cert_reader = cert_pem.as_bytes();
-    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
-    let mut key_reader = key_pem.as_bytes();
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .ok()
-        .flatten()
-        .unwrap();
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .unwrap();
-    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            let Ok(mut stream) = acceptor.accept(stream).await else {
-                let _ = tx.send(String::new());
-                return;
-            };
-            let mut received = Vec::new();
-            let mut buf = [0u8; 1024];
-            loop {
-                let read = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
-                )
-                .await;
-                let n = match read {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(_)) | Err(_) => break,
-                };
-                if n == 0 {
-                    break;
-                }
-                received.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&received).contains(stop_pattern) {
-                    break;
-                }
-            }
-            let _ = tx.send(String::from_utf8_lossy(&received).into_owned());
-            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
-        }
-    });
-    (addr, rx, ca_pem)
-}
-
-fn provider_tls_material(hostname: &str) -> (String, String, String) {
-    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .key_usages
-        .push(rcgen::KeyUsagePurpose::DigitalSignature);
-    ca_params
-        .key_usages
-        .push(rcgen::KeyUsagePurpose::KeyCertSign);
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    let mut leaf_params = rcgen::CertificateParams::new(vec![hostname.to_string()]).unwrap();
-    leaf_params
-        .key_usages
-        .push(rcgen::KeyUsagePurpose::DigitalSignature);
-    leaf_params
-        .extended_key_usages
-        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
-    let leaf_key = rcgen::KeyPair::generate().unwrap();
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
-
-    (leaf_cert.pem(), leaf_key.serialize_pem(), ca_cert.pem())
-}
-
-fn insecure_tls_connector() -> tokio_rustls::TlsConnector {
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
-        .with_no_client_auth();
-    tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
-}
-
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-        ]
-    }
 }
 
 /// Send a CONNECT request and return the response status line.
@@ -609,6 +461,557 @@ async fn allowed_host_gets_200() {
 }
 
 #[tokio::test]
+async fn authorized_hostname_resolving_to_localhost_is_denied() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let policy = format!(
+        r#"
+version: 1
+name: hostname-localhost-deny
+network:
+  mode: proxy
+  policies:
+    - name: local-by-name
+      endpoints:
+        - host: "localhost"
+          port: {}
+          access: read-write
+"#,
+        upstream_addr.port()
+    );
+    let (_sandbox_id, proxy_addr) = start_proxy_with_policy(&policy, None).await;
+
+    let response = send_connect(proxy_addr, &format!("localhost:{}", upstream_addr.port())).await;
+    assert!(
+        response.contains("403"),
+        "hostname resolution to a local address must fail closed: {response}"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err(),
+        "the proxy must not connect to a prohibited DNS answer"
+    );
+}
+
+#[tokio::test]
+async fn explicitly_authorized_local_ip_literal_connects() {
+    let upstream = start_mock_tcp_server().await;
+    let policy = format!(
+        r#"
+version: 1
+name: literal-localhost-allow
+network:
+  mode: proxy
+  policies:
+    - name: explicit-local-ip
+      endpoints:
+        - host: "127.0.0.1"
+          port: {}
+          access: read-write
+"#,
+        upstream.port()
+    );
+    let (_sandbox_id, proxy_addr) = start_proxy_with_policy(&policy, None).await;
+
+    let response = send_connect(proxy_addr, &format!("127.0.0.1:{}", upstream.port())).await;
+    assert!(
+        response.contains("200"),
+        "an exact literal-IP policy is the explicit local-address opt-in: {response}"
+    );
+}
+
+#[tokio::test]
+async fn connect_and_initial_tunnel_bytes_in_one_write_reach_upstream_once() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let initial_tunnel_bytes = b"\x16\x03\x01\x00\x08axis-tls".to_vec();
+    let expected_len = initial_tunnel_bytes.len();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut received = vec![0; expected_len];
+        stream.read_exact(&mut received).await.unwrap();
+        let mut extra = [0u8; 1];
+        let duplicate = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.read(&mut extra),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|count| *count > 0)
+        .map(|_| extra[0]);
+        received_tx.send((received, duplicate)).unwrap();
+    });
+
+    let policy = format!(
+        r#"
+version: 1
+name: connect-early-bytes
+network:
+  mode: proxy
+  policies:
+    - name: explicit-local-ip
+      endpoints:
+        - host: "127.0.0.1"
+          port: {}
+          access: read-write
+"#,
+        upstream_addr.port()
+    );
+    let (_sandbox_id, proxy_addr) = start_proxy_with_policy(&policy, None).await;
+
+    let target = format!("127.0.0.1:{}", upstream_addr.port());
+    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").into_bytes();
+    request.extend_from_slice(&initial_tunnel_bytes);
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(&request).await.unwrap();
+    let response = read_response_line(&mut client).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let (received, duplicate) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), received_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(received, initial_tunnel_bytes);
+    assert_eq!(duplicate, None, "initial tunnel bytes were relayed twice");
+}
+
+#[tokio::test]
+async fn plain_connect_relay_drains_response_after_client_write_shutdown() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let request = b"request-before-half-close".to_vec();
+    let response = vec![b'R'; 128 * 1024];
+    let expected_response = response.clone();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received_tx.send(received).unwrap();
+        stream.write_all(&response).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+
+    let policy = format!(
+        r#"
+version: 1
+name: plain-half-close
+network:
+  mode: proxy
+  policies:
+    - name: local
+      endpoints:
+        - host: "127.0.0.1"
+          port: {}
+"#,
+        upstream_addr.port()
+    );
+    let (_sandbox_id, proxy_addr) =
+        start_proxy_with_options(&policy, None, None, false, false).await;
+    let target = format!("127.0.0.1:{}", upstream_addr.port());
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut established = [0u8; 39];
+    client.read_exact(&mut established).await.unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    client.write_all(&request).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut received_response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut received_response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(received_response, expected_response);
+    assert_eq!(received_rx.await.unwrap(), request);
+}
+
+#[tokio::test]
+async fn credential_relay_drains_response_after_client_write_shutdown() {
+    unsafe {
+        std::env::set_var("AXIS_TEST_HALF_CLOSE_KEY", "half-close-secret");
+    }
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let response = vec![b'C'; 128 * 1024];
+    let expected_response = response.clone();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received_tx.send(received).unwrap();
+        stream.write_all(&response).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let policy = r#"
+version: 1
+name: credential-half-close
+network:
+  mode: proxy
+  policies:
+    - name: inference
+      endpoints:
+        - host: "inference.local"
+          port: 443
+inference:
+  routes:
+    - name: local
+      endpoint: "http://inference.local:443/v1"
+      api_key_env: AXIS_TEST_HALF_CLOSE_KEY
+"#;
+    let (_sandbox_id, proxy_addr) =
+        start_proxy_with_options(policy, Some(upstream_addr), None, false, false).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut established = [0u8; 39];
+    client.read_exact(&mut established).await.unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    client
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: 4\r\n\r\nping",
+        )
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    let mut received_response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut received_response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(received_response, expected_response);
+    let forwarded = String::from_utf8(received_rx.await.unwrap()).unwrap();
+    assert!(forwarded.contains("Authorization: Bearer half-close-secret\r\n"));
+    assert!(forwarded.ends_with("\r\nping"));
+    unsafe {
+        std::env::remove_var("AXIS_TEST_HALF_CLOSE_KEY");
+    }
+}
+
+#[tokio::test]
+async fn plain_connect_relay_keeps_client_writes_after_upstream_write_shutdown() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let request = b"request-after-upstream-half-close".to_vec();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        stream
+            .write_all(b"upstream-finished-writing")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received_tx.send(received).unwrap();
+    });
+    let policy = format!(
+        r#"
+version: 1
+name: upstream-half-close
+network:
+  mode: proxy
+  policies:
+    - name: local
+      endpoints:
+        - host: "127.0.0.1"
+          port: {}
+"#,
+        upstream_addr.port()
+    );
+    let (_sandbox_id, proxy_addr) =
+        start_proxy_with_options(&policy, None, None, false, false).await;
+    let target = format!("127.0.0.1:{}", upstream_addr.port());
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut established = [0u8; 39];
+    client.read_exact(&mut established).await.unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    let mut upstream_response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut upstream_response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(upstream_response, b"upstream-finished-writing");
+    client.write_all(&request).await.unwrap();
+    client.shutdown().await.unwrap();
+    assert_eq!(received_rx.await.unwrap(), request);
+}
+
+#[tokio::test]
+async fn credential_relay_keeps_client_writes_after_upstream_write_shutdown() {
+    unsafe {
+        std::env::set_var("AXIS_TEST_REVERSE_HALF_CLOSE_KEY", "reverse-secret");
+    }
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        stream
+            .write_all(b"credential-upstream-finished-writing")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received_tx.send(received).unwrap();
+    });
+    let policy = r#"
+version: 1
+name: credential-reverse-half-close
+network:
+  mode: proxy
+  policies:
+    - name: inference
+      endpoints:
+        - host: "inference.local"
+          port: 443
+inference:
+  routes:
+    - name: local
+      endpoint: "http://inference.local:443/v1"
+      api_key_env: AXIS_TEST_REVERSE_HALF_CLOSE_KEY
+"#;
+    let (_sandbox_id, proxy_addr) =
+        start_proxy_with_options(policy, Some(upstream_addr), None, false, false).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut established = [0u8; 39];
+    client.read_exact(&mut established).await.unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    let mut upstream_response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.read_to_end(&mut upstream_response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(upstream_response, b"credential-upstream-finished-writing");
+    client
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: 4\r\n\r\nping",
+        )
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    let forwarded = String::from_utf8(received_rx.await.unwrap()).unwrap();
+    assert!(forwarded.contains("Authorization: Bearer reverse-secret\r\n"));
+    assert!(forwarded.ends_with("\r\nping"));
+    unsafe {
+        std::env::remove_var("AXIS_TEST_REVERSE_HALF_CLOSE_KEY");
+    }
+}
+
+#[tokio::test]
+async fn buffered_post_connect_bytes_are_inspected_once_in_order() {
+    unsafe {
+        std::env::set_var("AXIS_TEST_BUFFERED_INSPECTION_KEY", "buffered-secret");
+    }
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let expected = b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: 4\r\nX-Order: first\r\nAuthorization: Bearer buffered-secret\r\n\r\nbody".to_vec();
+    let expected_len = expected.len();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut received = vec![0; expected_len];
+        stream.read_exact(&mut received).await.unwrap();
+        let mut extra = [0u8; 1];
+        let duplicate = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.read(&mut extra),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|count| *count > 0)
+        .map(|_| extra[0]);
+        received_tx.send((received, duplicate)).unwrap();
+    });
+    let policy = r#"
+version: 1
+name: buffered-credential-inspection
+network:
+  mode: proxy
+  policies:
+    - name: inference
+      endpoints:
+        - host: "inference.local"
+          port: 443
+inference:
+  routes:
+    - name: local
+      endpoint: "http://inference.local:443/v1"
+      api_key_env: AXIS_TEST_BUFFERED_INSPECTION_KEY
+"#;
+    let (_sandbox_id, proxy_addr) =
+        start_proxy_with_options(policy, Some(upstream_addr), None, false, false).await;
+    let mut combined =
+        b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local:443\r\n\r\n".to_vec();
+    combined.extend_from_slice(
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: 4\r\nX-Order: first\r\n\r\nbody",
+    );
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(&combined).await.unwrap();
+    let mut established = [0u8; 39];
+    client.read_exact(&mut established).await.unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+    let (received, duplicate) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), received_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(received, expected);
+    assert_eq!(
+        duplicate, None,
+        "buffered inspected bytes were relayed twice"
+    );
+    unsafe {
+        std::env::remove_var("AXIS_TEST_BUFFERED_INSPECTION_KEY");
+    }
+}
+
+#[tokio::test]
+async fn incomplete_inspected_requests_terminate_promptly_on_eof() {
+    unsafe {
+        std::env::set_var("AXIS_TEST_INCOMPLETE_REQUEST_KEY", "incomplete-secret");
+    }
+    let cases: [(&str, &[u8], bool); 2] = [
+        (
+            "head",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\n",
+            false,
+        ),
+        (
+            "body",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: 10\r\n\r\npart",
+            true,
+        ),
+    ];
+    for (name, incomplete, forwarded_prefix) in cases {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received_tx.send(received).unwrap();
+        });
+        let policy = r#"
+version: 1
+name: incomplete-inspected-request
+network:
+  mode: proxy
+  policies:
+    - name: inference
+      endpoints:
+        - host: "inference.local"
+          port: 443
+inference:
+  routes:
+    - name: local
+      endpoint: "http://inference.local:443/v1"
+      api_key_env: AXIS_TEST_INCOMPLETE_REQUEST_KEY
+"#;
+        let (_sandbox_id, proxy_addr) =
+            start_proxy_with_options(policy, Some(upstream_addr), None, false, false).await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut established = [0u8; 39];
+        client.read_exact(&mut established).await.unwrap();
+        assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+        client.write_all(incomplete).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} EOF did not terminate the client connection"))
+        .unwrap();
+        assert!(response.is_empty(), "{name}: unexpected proxy response");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_millis(500), received_rx)
+            .await
+            .unwrap_or_else(|_| panic!("{name} EOF did not terminate the upstream connection"))
+            .unwrap();
+        assert_eq!(
+            !forwarded.is_empty(),
+            forwarded_prefix,
+            "{name}: unexpected forwarding state"
+        );
+        if forwarded_prefix {
+            let forwarded = String::from_utf8(forwarded).unwrap();
+            assert!(forwarded.contains("Authorization: Bearer incomplete-secret\r\n"));
+            assert!(forwarded.ends_with("\r\npart"));
+        }
+    }
+    unsafe {
+        std::env::remove_var("AXIS_TEST_INCOMPLETE_REQUEST_KEY");
+    }
+}
+
+#[tokio::test]
+async fn canonical_dns_policy_matches_uppercase_trailing_dot_connect_target() {
+    let upstream = start_mock_tcp_server().await;
+    let policy = r#"
+version: 1
+name: canonical-dns-match
+network:
+  mode: proxy
+  policies:
+    - name: inference
+      endpoints:
+        - host: "INFERENCE.LOCAL."
+          port: 443
+          access: read-write
+"#;
+    let (_sandbox_id, proxy_addr) = start_proxy_with_policy(policy, Some(upstream)).await;
+
+    let response = send_connect(proxy_addr, "INFERENCE.LOCAL.:443").await;
+    assert!(
+        response.contains("200"),
+        "canonical policy and CONNECT host forms must match: {response}"
+    );
+}
+
+#[tokio::test]
 async fn denied_host_gets_403() {
     let (_sandbox_id, addr) = start_proxy().await;
 
@@ -669,13 +1072,8 @@ network:
         binary_path
     );
     let upstream = start_mock_tcp_server().await;
-    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
-        &policy,
-        Some(upstream),
-        Vec::new(),
-        Some(store.clone()),
-    )
-    .await;
+    let (sandbox_id, addr) =
+        start_proxy_with_policy_and_attribution(&policy, Some(upstream), Some(store.clone())).await;
 
     let response = send_connect_with_attribution(
         &store,
@@ -737,14 +1135,9 @@ network:
       binaries:
         - path: "unknown"
 "#;
-    let (_sandbox_id, addr) = start_proxy_with_policy_roots_attribution_and_identity_diagnostics(
-        policy,
-        None,
-        Vec::new(),
-        None,
-        true,
-    )
-    .await;
+    let (_sandbox_id, addr) =
+        start_proxy_with_policy_attribution_and_identity_diagnostics(policy, None, None, true)
+            .await;
 
     let response = send_connect(addr, "inference.local:443").await;
     assert!(
@@ -771,13 +1164,8 @@ network:
       binaries:
         - path: "/usr/bin/allowed"
 "#;
-    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
-        policy,
-        None,
-        Vec::new(),
-        Some(store.clone()),
-    )
-    .await;
+    let (sandbox_id, addr) =
+        start_proxy_with_policy_and_attribution(policy, None, Some(store.clone())).await;
 
     let response = send_connect_with_attribution(
         &store,
@@ -812,13 +1200,8 @@ network:
       binaries:
         - path: "/usr/bin/allowed"
 "#;
-    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
-        policy,
-        None,
-        Vec::new(),
-        Some(store.clone()),
-    )
-    .await;
+    let (sandbox_id, addr) =
+        start_proxy_with_policy_and_attribution(policy, None, Some(store.clone())).await;
 
     let (socket, peer_addr) = bound_tcp_socket();
     store
@@ -858,13 +1241,8 @@ network:
       binaries:
         - path: "/usr/bin/allowed"
 "#;
-    let (sandbox_id, addr) = start_proxy_with_policy_roots_and_attribution(
-        policy,
-        None,
-        Vec::new(),
-        Some(store.clone()),
-    )
-    .await;
+    let (sandbox_id, addr) =
+        start_proxy_with_policy_and_attribution(policy, None, Some(store.clone())).await;
 
     let (socket, peer_addr) = bound_tcp_socket();
     store
@@ -937,7 +1315,7 @@ inference:
     let mut stream = reader.into_inner();
     stream
         .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local\r\nContent-Length: 2\r\n\r\n{}",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: InFeReNcE.LoCaL:443\r\nContent-Length: 2\r\n\r\n{}",
         )
         .await
         .unwrap();
@@ -952,13 +1330,13 @@ inference:
 }
 
 #[tokio::test]
-async fn https_provider_credentials_are_reencrypted_to_upstream_tls() {
+async fn provider_credentials_fail_closed_for_unbound_or_ambiguous_host() {
     unsafe {
-        std::env::set_var("AXIS_TEST_PROXY_TLS_PROVIDER_KEY", "provider-secret");
+        std::env::set_var("AXIS_TEST_PROXY_AUTHORITY_KEY", "authority-secret");
     }
     let policy = r#"
 version: 1
-name: proxy-credential-tls-injection-test
+name: proxy-credential-authority-test
 
 network:
   mode: proxy
@@ -972,14 +1350,68 @@ network:
 inference:
   routes:
     - name: mock-provider
-      endpoint: "https://inference.local:443"
-      api_key_env: AXIS_TEST_PROXY_TLS_PROVIDER_KEY
+      endpoint: "http://inference.local:443"
+      api_key_env: AXIS_TEST_PROXY_AUTHORITY_KEY
 "#;
-    let (mock_addr, received, ca_pem) =
-        start_recording_https_server_until("inference.local", "\r\n\r\n").await;
-    let (_sandbox_id, addr) =
-        start_proxy_with_policy_and_roots(policy, Some(mock_addr), vec![ca_pem]).await;
+    let invalid_requests: &[(&str, &[u8])] = &[
+        (
+            "mismatched virtual host",
+            b"GET /v1/models HTTP/1.1\r\nHost: other.local:443\r\n\r\n",
+        ),
+        (
+            "omitted non-default port",
+            b"GET /v1/models HTTP/1.1\r\nHost: inference.local\r\n\r\n",
+        ),
+        (
+            "missing Host",
+            b"GET /v1/models HTTP/1.1\r\nUser-Agent: test\r\n\r\n",
+        ),
+        (
+            "duplicate Host",
+            b"GET /v1/models HTTP/1.1\r\nHost: inference.local:443\r\nHost: inference.local:443\r\n\r\n",
+        ),
+        (
+            "malformed Host",
+            b"GET /v1/models HTTP/1.1\r\nHost: inference.local:notaport\r\n\r\n",
+        ),
+        (
+            "conflicting absolute-form authority",
+            b"GET http://other.local:443/v1/models HTTP/1.1\r\nHost: inference.local:443\r\n\r\n",
+        ),
+    ];
 
+    for (case, request) in invalid_requests {
+        let (mock_addr, received) = start_recording_http_server().await;
+        let (_sandbox_id, addr) = start_proxy_with_policy(policy, Some(mock_addr)).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line).await.unwrap();
+        assert!(response_line.contains("200"), "{case}: {response_line}");
+
+        let mut stream = reader.into_inner();
+        stream.write_all(request).await.unwrap();
+
+        let forwarded = received.await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "{case} must fail closed without forwarding or injecting: {forwarded}"
+        );
+        assert!(!forwarded.contains("authority-secret"), "{case}");
+    }
+    unsafe {
+        std::env::remove_var("AXIS_TEST_PROXY_AUTHORITY_KEY");
+    }
+}
+
+#[tokio::test]
+async fn opaque_tls_like_bytes_are_relayed_unchanged() {
+    let (mock_addr, received) = start_recording_http_server_until("opaque-payload").await;
+    let (_sandbox_id, addr) = start_proxy_with_policy(TEST_POLICY, Some(mock_addr)).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(b"CONNECT inference.local:443 HTTP/1.1\r\nHost: inference.local\r\n\r\n")
@@ -988,31 +1420,14 @@ inference:
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
     reader.read_line(&mut response_line).await.unwrap();
-    assert!(
-        response_line.contains("200"),
-        "expected CONNECT 200, got: {response_line}"
-    );
+    assert!(response_line.contains("200"), "{response_line}");
 
-    let stream = reader.into_inner();
-    let server_name = rustls::pki_types::ServerName::try_from("inference.local").unwrap();
-    let mut stream = insecure_tls_connector()
-        .connect(server_name, stream)
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local\r\nContent-Length: 2\r\n\r\n{}",
-        )
-        .await
-        .unwrap();
+    let mut stream = reader.into_inner();
+    let payload = b"\x16\x03\x03opaque-payload";
+    stream.write_all(payload).await.unwrap();
 
-    let request = received.await.unwrap();
-    unsafe {
-        std::env::remove_var("AXIS_TEST_PROXY_TLS_PROVIDER_KEY");
-    }
-
-    assert!(request.contains("Authorization: Bearer provider-secret\r\n"));
-    assert!(!request.contains("AXIS_TEST_PROXY_TLS_PROVIDER_KEY"));
+    let request = received.await.unwrap().into_bytes();
+    assert_eq!(request, payload);
 }
 
 #[tokio::test]
@@ -1058,7 +1473,7 @@ inference:
     let mut stream = reader.into_inner();
     stream
         .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local\r\nContent-Length: 2\r\n\r\n{}GET /v1/models HTTP/1.1\r\nHost: inference.local\r\n\r\n",
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\nContent-Length: 2\r\n\r\n{}GET /v1/models HTTP/1.1\r\nHost: inference.local:443\r\n\r\n",
         )
         .await
         .unwrap();
@@ -1120,7 +1535,7 @@ inference:
 
     let mut stream = reader.into_inner();
     stream
-        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local\r\n\r\n")
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: inference.local:443\r\n\r\n")
         .await
         .unwrap();
 

@@ -26,7 +26,7 @@ struct Cli {
 enum Commands {
     /// Create and start a new sandbox.
     Create {
-        /// Path to the policy YAML file.
+        /// Built-in policy name or path to a policy YAML file.
         #[arg(long)]
         policy: PathBuf,
 
@@ -114,7 +114,7 @@ enum Commands {
     /// Run a command in a new sandbox (auto-starts daemon).
     /// Equivalent to: axis create + attach stdio + destroy on exit.
     Run {
-        /// Path to the policy YAML file.
+        /// Built-in policy name or path to a policy YAML file.
         #[arg(long, default_value = "minimal")]
         policy: String,
 
@@ -450,7 +450,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Create { policy, command } => {
-            let policy_yaml = std::fs::read_to_string(&policy)?;
+            let policy_yaml = resolve_policy_yaml(&policy)?;
 
             // Validate policy before sending to daemon.
             let parsed = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
@@ -725,25 +725,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Run { policy, command } => {
-            // Resolve policy: check if it's a built-in name or a file path.
-            let policy_yaml = if std::path::Path::new(&policy).exists() {
-                std::fs::read_to_string(&policy)?
-            } else {
-                // Built-in policies.
-                match policy.as_str() {
-                    "minimal" => include_str!("../../../policies/minimal.yaml").to_string(),
-                    "coding-agent" => {
-                        include_str!("../../../policies/coding-agent.yaml").to_string()
-                    }
-                    "gpu-agent" => include_str!("../../../policies/gpu-agent.yaml").to_string(),
-                    _ => {
-                        eprintln!(
-                            "Policy '{policy}' not found. Use a file path or: minimal, coding-agent, gpu-agent"
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            };
+            let policy_yaml = resolve_policy_yaml(std::path::Path::new(&policy))?;
 
             // Validate.
             let parsed = axis_core::policy::Policy::from_yaml(&policy_yaml)?;
@@ -927,6 +909,27 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_policy_yaml(policy: &std::path::Path) -> anyhow::Result<String> {
+    if policy.exists() {
+        return Ok(std::fs::read_to_string(policy)?);
+    }
+
+    let name = policy
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("policy path is not valid UTF-8: {}", policy.display()))?;
+    let yaml = match name {
+        "minimal" => include_str!("../../../policies/minimal.yaml"),
+        "coding-agent" => include_str!("../../../policies/coding-agent.yaml"),
+        "gpu-agent" => include_str!("../../../policies/gpu-agent.yaml"),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "policy '{name}' not found; use a file path or one of: minimal, coding-agent, gpu-agent"
+            ));
+        }
+    };
+    Ok(yaml.to_string())
 }
 
 #[cfg(unix)]
@@ -1204,6 +1207,13 @@ fn proxy_bind_addr_for_sandbox(
     proxy_port: u16,
     policy: &axis_core::policy::Policy,
 ) -> std::net::SocketAddr {
+    #[cfg(target_os = "linux")]
+    {
+        if matches!(policy.network.mode, axis_core::policy::NetworkMode::Proxy) {
+            return axis_sandbox::linux::netns::proxy_bind_addr(id, proxy_port);
+        }
+    }
+
     let _ = id;
     let _ = policy;
     format!("127.0.0.1:{proxy_port}").parse().unwrap()
@@ -1222,9 +1232,7 @@ fn standalone_proxy_config_for_sandbox(
         sandbox_id: id,
         bind_addr: proxy_bind_addr_for_sandbox(id, 0, policy),
         policy: policy.clone(),
-        enable_l7: false,
         enable_leak_detection: true,
-        upstream_tls_roots_pem: Vec::new(),
         inference_endpoint: None,
         connect_attribution,
         enable_identity_diagnostics: false,
@@ -1307,59 +1315,84 @@ mod tests {
     use super::*;
     use axis_core::policy::{
         FilesystemPolicy, GpuPolicy, InferencePolicy, NetworkMode, NetworkPolicy, Policy,
-        ProcessPolicy, SshPolicy,
+        ProcessPolicy, RuntimeProvider, SshPolicy,
     };
     use axis_core::types::SandboxId;
     use std::str::FromStr;
 
     #[test]
-    fn standalone_proxy_mode_uses_loopback_bind_addr_for_default_mxc_backend() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let policy = test_policy(NetworkMode::Proxy);
-        let bind_addr = proxy_bind_addr_for_sandbox(id, 0, &policy);
-
-        assert_eq!(bind_addr, "127.0.0.1:0".parse().unwrap());
-    }
-
-    #[test]
-    fn standalone_proxy_config_is_only_planned_for_proxy_mode() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-
-        for mode in [NetworkMode::Block, NetworkMode::Allow] {
-            let policy = test_policy(mode);
-
-            assert!(standalone_proxy_config_for_sandbox(id, &policy, None).is_none());
+    fn policy_resolver_supports_builtins_files_and_missing_names() {
+        for name in ["minimal", "coding-agent", "gpu-agent"] {
+            let yaml = resolve_policy_yaml(std::path::Path::new(name)).unwrap();
+            let parsed = axis_core::policy::Policy::from_yaml(&yaml).unwrap();
+            assert!(!parsed.name.is_empty());
         }
-    }
 
-    #[test]
-    fn standalone_proxy_config_uses_default_proxy_bind_addr_for_proxy_mode() {
-        let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let policy = test_policy(NetworkMode::Proxy);
-        let config = standalone_proxy_config_for_sandbox(id, &policy, None)
-            .expect("proxy mode should plan an inline proxy");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom.yaml");
+        let custom = "version: 1\nname: custom-policy\nnetwork:\n  mode: block\n";
+        std::fs::write(&path, custom).unwrap();
+        assert_eq!(resolve_policy_yaml(&path).unwrap(), custom);
 
-        assert_eq!(config.sandbox_id, id);
-        assert_eq!(
-            config.bind_addr,
-            proxy_bind_addr_for_sandbox(id, 0, &policy)
+        let error = resolve_policy_yaml(std::path::Path::new("missing-policy")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("policy 'missing-policy' not found")
         );
-        assert!(!config.enable_l7);
-        assert!(config.enable_leak_detection);
-        assert!(config.inference_endpoint.is_none());
     }
 
     #[test]
-    fn standalone_non_proxy_modes_keep_loopback_bind_addr() {
+    fn standalone_proxy_planning_covers_backend_and_network_mode_matrix() {
         let id = SandboxId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let loopback = "127.0.0.1:0".parse().unwrap();
 
-        for mode in [NetworkMode::Block, NetworkMode::Allow] {
-            let policy = test_policy(mode);
+        for provider in [
+            RuntimeProvider::Auto,
+            RuntimeProvider::Mxc,
+            RuntimeProvider::AxisNative,
+        ] {
+            for mode in [NetworkMode::Block, NetworkMode::Allow, NetworkMode::Proxy] {
+                let policy = test_policy(provider, mode.clone());
+                let bind_addr = proxy_bind_addr_for_sandbox(id, 0, &policy);
+                let proxy_config = standalone_proxy_config_for_sandbox(id, &policy, None);
 
-            assert_eq!(
-                proxy_bind_addr_for_sandbox(id, 0, &policy),
-                "127.0.0.1:0".parse().unwrap()
-            );
+                if matches!(mode, NetworkMode::Proxy) {
+                    #[cfg(target_os = "linux")]
+                    {
+                        assert_eq!(
+                            bind_addr,
+                            axis_sandbox::linux::netns::proxy_bind_addr(id, 0),
+                            "provider {provider:?} must use strict Linux proxy addressing"
+                        );
+                        assert_ne!(
+                            bind_addr, loopback,
+                            "provider {provider:?} must not weaken Linux proxy isolation"
+                        );
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    assert_eq!(
+                        bind_addr, loopback,
+                        "provider {provider:?} must keep the native platform proxy address"
+                    );
+
+                    let config = proxy_config.expect("proxy mode should plan an inline proxy");
+                    assert_eq!(config.sandbox_id, id);
+                    assert_eq!(config.bind_addr, bind_addr);
+                    assert!(config.enable_leak_detection);
+                    assert!(config.inference_endpoint.is_none());
+                } else {
+                    assert_eq!(
+                        bind_addr, loopback,
+                        "provider {provider:?} mode {mode:?} must keep loopback"
+                    );
+                    assert!(
+                        proxy_config.is_none(),
+                        "provider {provider:?} mode {mode:?} must not plan a proxy"
+                    );
+                }
+            }
         }
     }
 
@@ -1383,11 +1416,16 @@ mod tests {
         );
     }
 
-    fn test_policy(network_mode: NetworkMode) -> Policy {
+    fn test_policy(runtime_provider: RuntimeProvider, network_mode: NetworkMode) -> Policy {
+        let runtime = axis_core::policy::RuntimePolicy {
+            provider: runtime_provider,
+            ..Default::default()
+        };
+
         Policy {
             version: 1,
             name: "test-policy".into(),
-            runtime: Default::default(),
+            runtime,
             filesystem: FilesystemPolicy::default(),
             process: ProcessPolicy::default(),
             network: NetworkPolicy {

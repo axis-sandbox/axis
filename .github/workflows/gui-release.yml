@@ -1,57 +1,108 @@
-name: GUI Release & Nightly Build
+name: GUI Release Build
 
 on:
-  push:
-    tags: ["v*"]
-  schedule:
-    # Nightly at 3:17 AM UTC
-    - cron: "17 3 * * *"
+  workflow_call:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: gui-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 22.23.1
+  RUST_TOOLCHAIN: 1.95.0
+  DOTNET_SDK_VERSION: 8.0.422
 
 jobs:
   build-frontend:
-    runs-on: ubuntu-latest
+    name: Build frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: gui/shared/package-lock.json
-      - run: cd gui/shared && npm ci && npm run build
-      - uses: actions/upload-artifact@v4
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Test and build frontend
+        run: |
+          npm ci --prefix gui/shared
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          npm test --prefix gui/shared
+          npm run --prefix gui/shared typecheck
+          npm run --prefix gui/shared notices:check
+          python3 scripts/generate_third_party_notices.py --check
+          npm run --prefix gui/shared build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: frontend-dist
           path: gui/shared/dist/
 
   build-macos:
+    name: Build macOS desktop
     needs: build-frontend
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: frontend-dist
           path: gui/macos/AXIS/Resources/web
       - run: cd gui/macos && swift build -c release
-      - run: |
-          mkdir -p release
-          cp gui/macos/.build/release/AXIS release/AXIS-macos-arm64
-          chmod +x release/AXIS-macos-arm64
-      - uses: actions/upload-artifact@v4
+      - name: Package deterministic macOS archive
+        run: |
+          set -euo pipefail
+          mkdir -p release/axis-desktop-macos-aarch64
+          cp gui/macos/.build/release/AXIS release/axis-desktop-macos-aarch64/AXIS
+          cp LICENSE THIRD_PARTY_NOTICES.md release/axis-desktop-macos-aarch64/
+          cp packaging/runtime/gui-macos.json release/axis-desktop-macos-aarch64/RUNTIME_DEPENDENCIES.json
+          cp packaging/reproducibility/gui-macos.json release/axis-desktop-macos-aarch64/REPRODUCIBILITY.json
+          resource_bundle="$(find gui/macos/.build -type d -path '*/release/AXIS_*.bundle' -print -quit)"
+          test -n "$resource_bundle"
+          cp -R "$resource_bundle" release/axis-desktop-macos-aarch64/
+          test -f release/axis-desktop-macos-aarch64/AXIS_*.bundle/web/index.html
+          chmod +x release/axis-desktop-macos-aarch64/AXIS
+          find release/axis-desktop-macos-aarch64 -exec touch -t 198001010000 {} +
+          cd release
+          COPYFILE_DISABLE=1 find axis-desktop-macos-aarch64 -print | LC_ALL=C sort | \
+            tar -T - --no-recursion --uid 0 --gid 0 --uname root --gname root \
+              -cf - | gzip -n > axis-desktop-macos-aarch64.tar.gz
+          COPYFILE_DISABLE=1 find axis-desktop-macos-aarch64 -print | LC_ALL=C sort | \
+            tar -T - --no-recursion --uid 0 --gid 0 --uname root --gname root \
+              -cf - | gzip -n > axis-desktop-macos-aarch64.second.tar.gz
+          cmp axis-desktop-macos-aarch64.tar.gz axis-desktop-macos-aarch64.second.tar.gz
+          rm axis-desktop-macos-aarch64.second.tar.gz
+          tar tzf axis-desktop-macos-aarch64.tar.gz | grep -E '/AXIS_[^/]+\.bundle/web/index\.html$'
+          cd ..
+          python3 scripts/verify_release_archive.py \
+            release/axis-desktop-macos-aarch64.tar.gz axis-desktop-macos-aarch64 \
+            --require AXIS --require RUNTIME_DEPENDENCIES.json --require REPRODUCIBILITY.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: axis-desktop-macos-arm64
-          path: release/AXIS-macos-arm64
+          name: axis-desktop-macos-aarch64
+          path: release/axis-desktop-macos-aarch64.tar.gz
 
   build-linux:
+    name: Build Linux desktop
     needs: build-frontend
     runs-on: ubuntu-24.04
+    timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: frontend-dist
           path: gui/linux/data/web
@@ -59,68 +110,105 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cd gui/linux && cargo build --release
-      - run: |
-          mkdir -p release
-          cp gui/linux/target/release/axis-desktop release/axis-desktop-linux-x86_64
-          chmod +x release/axis-desktop-linux-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - run: cd gui/linux && cargo build --locked --release
+      - name: Compare independent clean Linux GUI build
+        run: |
+          cp gui/linux/target/release/axis-desktop "$RUNNER_TEMP/axis-desktop.first"
+          cargo clean --manifest-path gui/linux/Cargo.toml
+          cargo build --locked --release --manifest-path gui/linux/Cargo.toml
+          cmp "$RUNNER_TEMP/axis-desktop.first" gui/linux/target/release/axis-desktop
+      - name: Package deterministic Linux archive
+        run: |
+          set -euo pipefail
+          mkdir -p release/axis-desktop-linux-x86_64
+          cp gui/linux/target/release/axis-desktop release/axis-desktop-linux-x86_64/
+          cp -R gui/linux/data/web release/axis-desktop-linux-x86_64/web
+          cp LICENSE THIRD_PARTY_NOTICES.md release/axis-desktop-linux-x86_64/
+          cp packaging/runtime/gui-linux.json release/axis-desktop-linux-x86_64/RUNTIME_DEPENDENCIES.json
+          cp packaging/reproducibility/gui-linux.json release/axis-desktop-linux-x86_64/REPRODUCIBILITY.json
+          test -f release/axis-desktop-linux-x86_64/web/index.html
+          chmod +x release/axis-desktop-linux-x86_64/axis-desktop
+          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner \
+            -cf - -C release axis-desktop-linux-x86_64 | gzip -n > release/axis-desktop-linux-x86_64.tar.gz
+          tar --sort=name --mtime='UTC 1980-01-01' --owner=0 --group=0 --numeric-owner \
+            -cf - -C release axis-desktop-linux-x86_64 | gzip -n > release/axis-desktop-linux-x86_64.second.tar.gz
+          cmp release/axis-desktop-linux-x86_64.tar.gz release/axis-desktop-linux-x86_64.second.tar.gz
+          rm release/axis-desktop-linux-x86_64.second.tar.gz
+          python3 scripts/verify_release_archive.py \
+            release/axis-desktop-linux-x86_64.tar.gz axis-desktop-linux-x86_64 \
+            --require axis-desktop --require web/index.html \
+            --require RUNTIME_DEPENDENCIES.json --require REPRODUCIBILITY.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: axis-desktop-linux-x86_64
-          path: release/axis-desktop-linux-x86_64
+          path: release/axis-desktop-linux-x86_64.tar.gz
 
   build-windows:
+    name: Build Windows desktop
     needs: build-frontend
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: frontend-dist
           path: gui/shared/dist
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
-          dotnet-version: "8.0.x"
-      - run: cd gui\windows\AXIS && dotnet publish -c Release -r win-x64 --self-contained false -o ..\release
-      - uses: actions/upload-artifact@v4
+          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+      - name: Restore Windows dependencies
+        working-directory: gui/windows/AXIS
+        run: dotnet restore --locked-mode -r win-x64
+      - name: Publish Windows desktop
+        working-directory: gui/windows/AXIS
+        run: dotnet publish -c Release -r win-x64 --self-contained false --no-restore -o ../axis-desktop-windows-x86_64
+      - name: Package deterministic Windows archive
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression
+          $source = (Resolve-Path gui/windows/axis-desktop-windows-x86_64).Path
+          Copy-Item LICENSE (Join-Path $source "LICENSE")
+          Copy-Item THIRD_PARTY_NOTICES.md (Join-Path $source "THIRD_PARTY_NOTICES.md")
+          Copy-Item packaging/runtime/gui-windows.json (Join-Path $source "RUNTIME_DEPENDENCIES.json")
+          Copy-Item packaging/reproducibility/gui-windows.json (Join-Path $source "REPRODUCIBILITY.json")
+          $archive = Join-Path (Split-Path $source -Parent) "axis-desktop-windows-x86_64.zip"
+          $root = Split-Path $source -Parent
+          function New-NormalizedZip([string]$destination) {
+            $zip = [System.IO.Compression.ZipFile]::Open(
+              $destination,
+              [System.IO.Compression.ZipArchiveMode]::Create
+            )
+            try {
+              Get-ChildItem -LiteralPath $source -File -Recurse | Sort-Object FullName | ForEach-Object {
+                $relative = [System.IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+                $entry = $zip.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [System.DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+                $input = [System.IO.File]::OpenRead($_.FullName)
+                $output = $entry.Open()
+                try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+              }
+            } finally {
+              $zip.Dispose()
+            }
+          }
+          New-NormalizedZip $archive
+          $second = "$archive.second.zip"
+          New-NormalizedZip $second
+          if ((Get-FileHash $archive).Hash -ne (Get-FileHash $second).Hash) {
+            throw "Normalized Windows archives differ"
+          }
+          Remove-Item $second
+          python scripts/verify_release_archive.py `
+            "$archive" axis-desktop-windows-x86_64 `
+            --require AXIS.exe --require web/index.html `
+            --require RUNTIME_DEPENDENCIES.json --require REPRODUCIBILITY.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: axis-desktop-windows-x64
-          path: gui/windows/release/
-
-  create-release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-macos, build-linux, build-windows]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/axis-desktop-macos-arm64/AXIS-macos-arm64
-            artifacts/axis-desktop-linux-x86_64/axis-desktop-linux-x86_64
-            artifacts/axis-desktop-windows-x64/**
-          generate_release_notes: true
-
-  nightly-release:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [build-macos, build-linux, build-windows]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      - name: Update nightly release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          prerelease: true
-          name: "Nightly Build"
-          body: "Automated nightly build from main branch."
-          files: |
-            artifacts/axis-desktop-macos-arm64/AXIS-macos-arm64
-            artifacts/axis-desktop-linux-x86_64/axis-desktop-linux-x86_64
-            artifacts/axis-desktop-windows-x64/**
+          name: axis-desktop-windows-x86_64
+          path: gui/windows/axis-desktop-windows-x86_64.zip

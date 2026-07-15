@@ -1,10 +1,10 @@
 # OPA Proxy Benchmarks
 
-The README performance table uses release-mode `success-metrics` for the single
-synthetic OPA throughput number. For policy-specific proxy request timing, run:
+For release-mode synthetic OPA throughput, use `success-metrics`. For
+policy-specific proxy request timing, run:
 
 ```bash
-cargo run -p axis-bench --bin opa-scenarios
+cargo run --locked -p axis-bench --bin opa-scenarios
 ```
 
 The command emits JSON and fails instead of reporting timing when a selected
@@ -34,5 +34,5 @@ OPA policy evaluation.
 Increase the request iteration count when collecting stable numbers:
 
 ```bash
-AXIS_OPA_SCENARIO_BENCH_ITERS=50000 cargo run -p axis-bench --bin opa-scenarios
+AXIS_OPA_SCENARIO_BENCH_ITERS=50000 cargo run --locked -p axis-bench --bin opa-scenarios
 ```

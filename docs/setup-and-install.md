@@ -8,14 +8,21 @@ unprivileged while stronger isolation modes have clear prerequisites.
 
 Install release artifacts first:
 
+Prebuilt archives are published for Linux x86-64, macOS Apple silicon, and
+Windows x86-64. Other operating-system and architecture combinations require a
+source build until a matching release job is added.
+
 ```bash
 # Linux / macOS
-curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh | sh
 ```
 
+Windows installation requires PowerShell 7 or later, invoked as `pwsh`. Install
+it from <https://aka.ms/powershell-release> before running the installer.
+
 ```powershell
-# Windows PowerShell
-irm 'https://raw.githubusercontent.com/axis-sandbox/axis/main/install.ps1' | iex
+# PowerShell 7 on Windows
+irm 'https://raw.githubusercontent.com/ROCm/axis/main/install.ps1' | iex
 ```
 
 On Linux, release archives and packages include `axis`, `axisd`,
@@ -42,7 +49,7 @@ run the plain `cargo` commands below.
 
 ```bash
 rustup toolchain install 1.95.0 --profile minimal
-cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
+cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 ./target/release/axis --version
 ```
 
@@ -109,20 +116,25 @@ needs the runtime tools that each selected backend uses.
 | --- | --- | --- | --- |
 | Basic Linux MXC process sandbox | `axis`, `axis-seccomp-launcher`, safe `lxc-exec`, `bwrap`, unprivileged user namespaces, seccomp-BPF | No admin to launch after packages are installed | `axis run -- python3 -c 'print("hello from axis")'` |
 | Linux AXIS-native process sandbox | Linux Landlock ABI v3 or newer, seccomp-BPF; safe system `bwrap` only if using the block-mode fallback | No admin to launch on supported kernels | Set `runtime.provider: axis_native`, then run `axis run --policy <policy> -- <command>` |
-| Resource limits | Writable delegated cgroups v2 subtree with `cpu`, `memory`, and `pids` controllers | No admin to launch once the shell has cgroup delegation | `AXIS_REAL_CGROUP_TESTS=1 cargo test -p axis-sandbox gated_real_cgroup` |
-| Cooperative proxy policies | AXIS proxy plus the selected process backend. Clients must honor proxy environment variables. | No extra admin beyond backend dependencies | `axis run --policy policies/agents/codex.yaml -- <proxy-aware command>` |
+| Resource limits | Writable delegated cgroups v2 subtree with `cpu`, `memory`, and `pids` controllers | No admin to launch once the shell has cgroup delegation | `AXIS_REAL_CGROUP_TESTS=1 cargo test --locked -p axis-sandbox gated_real_cgroup` |
 | Strict Linux proxy policies without binary allowlists | `ip`, `iptables`, network namespaces, and either `axis-netns-helper` or `CAP_NET_ADMIN` on root-owned AXIS binaries | Explicit privileged setup required | `AXIS_RUN_PRIVILEGED_E2E=1 bash e2e/linux/test_netns_helper_launch.sh` in a disposable runner |
 | Binary-restricted Linux proxy policies | Strict native proxy dependencies plus seccomp-notify connect attribution from the native `CAP_NET_ADMIN` launch path. Helper-only hosts currently reject binary allowlists. | Explicit privileged setup required | Gated native proxy proof in a disposable runner |
 | MXC LXC container backend | Safe `lxc-exec`, prepared LXC runtime usable by the current user, configured distribution/release or image inputs, `python3` for the smoke harness | Backend-specific host setup; no AXIS helper install required | `AXIS_RUN_MXC_LXC_E2E=1 bash e2e/linux/test_mxc_lxc_smoke.sh` |
 | MXC microVM backend | Safe `lxc-exec`, readable/writable `/dev/kvm`, MXC microVM runtime artifacts, guest/runtime image inputs | KVM access must be granted by the host; backend is experimental | `AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh` |
 | MXC Hyperlight backend | Safe `lxc-exec`, readable/writable `/dev/kvm`, MXC Hyperlight runtime artifacts or snapshots | KVM access must be granted by the host; backend is experimental | `AXIS_RUN_MXC_HYPERLIGHT_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh` |
-| Windows process sandbox | Windows Job Object, Low Integrity support, and the selected process containment support | Normal user launch for supported process policies | `axis run -- python -c "print('hello from axis')"` |
+| Windows native process sandbox | Disabled until process creation atomically applies Job Object, AppContainer or equivalent token isolation, filesystem ACLs, proxy enforcement, and environment isolation | No user-command launch is currently supported; AXIS rejects before process creation | On Windows: `cargo test --locked -p axis-sandbox native_launcher_rejects_before_workspace_or_process_setup` |
 | Windows VM-style backends | Windows Sandbox, WSL2, Windows Hypervisor Platform, Isolation Session, microVM, or Hyperlight features depending on backend | Explicit Windows feature enablement | Backend-specific gated smoke or benchmark command |
 | macOS Seatbelt process sandbox | macOS Seatbelt profile execution support; Xcode Command Line Tools for source builds and platform test builds | Normal user launch | `axis run -- python3 -c 'print("hello from axis")'` |
 
 Missing dependencies are enforcement failures for policies that need them. AXIS
 must reject before spawning user code rather than silently weakening the
 sandbox.
+
+The Windows install currently provides artifacts only; it does not provide a
+usable native process sandbox. Job Object, AppContainer, restricted-token/Low
+Integrity, ACL, proxy, and environment controls are targets rather than current
+runtime guarantees. Do not use `axis run` on Windows as a containment boundary
+until that launcher is enabled with enforcement and negative-test evidence.
 
 ## Cgroups V2 Setup
 
@@ -154,7 +166,7 @@ test -w "$cg/cgroup.subtree_control" && test -w "$cg/cgroup.procs"
 Then run the cgroup proof:
 
 ```bash
-AXIS_REAL_CGROUP_TESTS=1 cargo test -p axis-sandbox gated_real_cgroup
+AXIS_REAL_CGROUP_TESTS=1 cargo test --locked -p axis-sandbox gated_real_cgroup
 ```
 
 ## KVM Setup For VM-Style Backends
@@ -198,7 +210,7 @@ Build and static validation:
 
 ```bash
 bash scripts/test_security_tier0.sh
-cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
+cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 ```
 
 Default Linux runtime validation also needs the basic process-sandbox runtime
@@ -216,7 +228,7 @@ AXIS_RUN_MXC_PROCESS_E2E=1 bash e2e/linux/test_mxc_process_runtime.sh
 AXIS_RUN_MXC_LXC_E2E=1 bash e2e/linux/test_mxc_lxc_smoke.sh
 AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh
 AXIS_RUN_MXC_HYPERLIGHT_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh
-cargo run -p axis-bench --bin mxc-isolation-matrix
+cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 Benchmark checks:

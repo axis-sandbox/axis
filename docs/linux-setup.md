@@ -16,7 +16,7 @@ delegation, KVM checks, and optional MXC backend smoke tests, see
 Build from a checkout:
 
 ```bash
-cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
+cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 ```
 
 Linux release archives and packages include the MXC `lxc-exec` executor and
@@ -55,7 +55,7 @@ is unavailable for the default provider, AXIS fails before running the command.
 | --- | --- | --- |
 | `network.mode: block` | Denies outbound IP sockets and does not inject proxy environment variables. | Default provider: safe MXC Bubblewrap executor and AXIS seccomp launcher. Native provider: Landlock and seccomp, or a supported block-mode fallback such as bubblewrap when Landlock is unavailable. |
 | `network.mode: allow` | Uses host networking while still applying filesystem, seccomp, identity, timeout, and requested resource policy. | No endpoint policies may be configured. Requested resource limits still need enforcement support. |
-| `network.mode: proxy` | Starts an AXIS CONNECT proxy. Host/port-only policies can use the MXC cooperative proxy path. Binary-restricted or strict direct-egress policies use the native netns proxy path and reject direct egress. | Default host/port policy: safe MXC Bubblewrap executor and AXIS proxy. Strict native proxy: `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
+| `network.mode: proxy` | Starts an AXIS CONNECT proxy behind a netns boundary that rejects direct egress. | `ip`, `iptables`, and either native `CAP_NET_ADMIN` or the optional AXIS netns helper. Kernel-log audit evidence additionally needs readable `/dev/kmsg`. |
 | Resource limits | `max_processes`, `max_memory_mb`, and `cpu_rate_percent` are enforced through cgroups v2 when available. | Writable cgroups v2. Memory-only rlimit fallback is documented; process-count rlimit fallback requires a dedicated `run_as_user`; CPU quota has no rlimit fallback. |
 | `run_as_user` | Drops to a configured non-root user and prepares writable workspace state for that user. | The target user must already exist, must not be root, and must be usable by the current caller. |
 | Bubblewrap fallback | Can provide block-mode fallback when Landlock is unavailable. | A safe root-owned system `bwrap` executable. It is not a proxy-mode fallback unless proxy reachability is also implemented. |
@@ -67,19 +67,22 @@ resource limits; those policies fail closed on hosts that cannot enforce them.
 ## Proxy Credential Handling
 
 Linux sandboxes do not receive common provider API keys or inherited proxy
-credentials in their process environment by default. In proxy mode, inference
-routes with `api_key_env` are resolved in the AXIS proxy process and injected
-only into matching, policy-allowed provider requests. The sandbox sends an
-ordinary request without the raw key; the proxy adds the provider credential at
-the host boundary.
+credentials in their process environment by default. In proxy mode, AXIS can
+inject a credential for an explicit local `http://` inference route after the
+request reaches the host-side proxy. The sandbox sends an ordinary request
+without the raw key.
 
 Credential injection is intentionally fail-closed:
 
 - missing `api_key_env` values are not forwarded upstream,
 - unsupported `axis:resolve:*` placeholders reject the route,
 - injected values are not logged or added to sandbox argv/env/audit fields,
-- L7-readable HTTP is required. Real HTTPS providers require the L7 TLS
-  termination and per-sandbox CA trust path to be configured.
+- credential routes outside proxy mode are rejected,
+- remote plaintext and HTTPS credential injection are rejected before launch.
+
+Ordinary HTTPS endpoint traffic remains an opaque CONNECT tunnel. AXIS does not
+currently distribute a per-sandbox CA trust bundle, so it does not advertise
+method/path filtering or host-boundary credential injection inside HTTPS.
 
 ## Proxy Binary Identity
 
@@ -117,10 +120,13 @@ setuid-root helper at:
 The netns helper is not part of the quickstart requirement. Ordinary local tests
 and block-mode use do not depend on it, and base Linux `.deb` and `.rpm`
 packages do not install setuid content by default. The curl installer keeps the
-default no-admin path, but can install the helper explicitly:
+default no-admin path, but can install the helper explicitly. This option also
+installs the bundled `lxc-exec` at `/usr/local/bin/lxc-exec` with root ownership,
+which is required so the setuid helper cannot execute a user-replaceable MXC
+binary:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh \
+curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \
   | sh -s -- --with-netns-helper
 ```
 
@@ -128,7 +134,7 @@ Advanced users can instead grant `CAP_NET_ADMIN` to root-owned `axis` and
 `axisd` binaries:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/axis-sandbox/axis/main/install.sh \
+curl -sSf https://raw.githubusercontent.com/ROCm/axis/main/install.sh \
   | sh -s -- --with-cap-net-admin --prefix /usr/local/bin
 ```
 
@@ -165,7 +171,7 @@ Default local Linux proof:
 
 ```bash
 bash scripts/test_security_tier0.sh
-cargo build --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
+cargo build --locked --release -p axis-cli -p axis-daemon -p axis-sandbox --bins
 AXIS_BIN=./target/release/axis bash e2e/linux/test_sandbox.sh
 AXIS_BIN=./target/release/axis bash e2e/linux/test_e2e_daemon.sh
 ```
@@ -177,8 +183,8 @@ Capability-gated proofs:
 
 ```bash
 AXIS_RUN_BWRAP_E2E=1 bash e2e/linux/test_bwrap_fallback.sh
-AXIS_REAL_CGROUP_TESTS=1 cargo test -p axis-sandbox gated_real_cgroup
-AXIS_REAL_NETNS_TESTS=1 cargo test -p axis-sandbox gated_real_ip_netns
+AXIS_REAL_CGROUP_TESTS=1 cargo test --locked -p axis-sandbox gated_real_cgroup
+AXIS_REAL_NETNS_TESTS=1 cargo test --locked -p axis-sandbox gated_real_ip_netns
 AXIS_RUN_MXC_PROCESS_E2E=1 bash e2e/linux/test_mxc_process_runtime.sh
 AXIS_RUN_MXC_LXC_E2E=1 bash e2e/linux/test_mxc_lxc_smoke.sh
 AXIS_RUN_MXC_MICROVM_E2E=1 bash e2e/linux/test_mxc_vm_smoke.sh

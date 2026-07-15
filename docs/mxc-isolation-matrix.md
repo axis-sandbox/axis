@@ -4,20 +4,20 @@
 network-mode combinations, plus an AXIS native filesystem-boundary comparison.
 
 ```bash
-cargo run -p axis-bench --bin mxc-isolation-matrix
+cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 The command does not install local artifacts. If `lxc-exec` is not on `PATH`,
 set `AXIS_TEST_MXC_EXECUTOR` to a trusted executor path:
 
 ```bash
-AXIS_TEST_MXC_EXECUTOR=/path/to/lxc-exec cargo run -p axis-bench --bin mxc-isolation-matrix
+AXIS_TEST_MXC_EXECUTOR=/path/to/lxc-exec cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 Increase proxy request-loop iterations with:
 
 ```bash
-AXIS_MXC_MATRIX_ITERS=1000 cargo run -p axis-bench --bin mxc-isolation-matrix
+AXIS_MXC_MATRIX_ITERS=1000 cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 Run a subset of MXC backends with `AXIS_MXC_MATRIX_BACKENDS`. Values are
@@ -25,7 +25,7 @@ comma-separated and accept `bubblewrap`, `lxc`, `microvm`, `hyperlight`, or
 `all`:
 
 ```bash
-AXIS_MXC_MATRIX_BACKENDS=bubblewrap cargo run -p axis-bench --bin mxc-isolation-matrix
+AXIS_MXC_MATRIX_BACKENDS=bubblewrap cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 ## Rows

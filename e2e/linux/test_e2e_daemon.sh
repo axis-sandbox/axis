@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Unprivileged Linux e2e proof for axisd + axis CLI lifecycle behavior.
 set -euo pipefail
 
@@ -58,12 +61,12 @@ capability_skip_output() {
 require_binaries() {
     if [ ! -x "$AXIS" ]; then
         echo "ERROR: axis binary not found: $AXIS"
-        echo "Build it with: cargo build --release -p axis-cli -p axis-daemon"
+        echo "Build it with: cargo build --locked --release -p axis-cli -p axis-daemon"
         exit 1
     fi
     if [ ! -x "$AXSD" ]; then
         echo "ERROR: axisd binary not found: $AXSD"
-        echo "Build it with: cargo build --release -p axis-cli -p axis-daemon"
+        echo "Build it with: cargo build --locked --release -p axis-cli -p axis-daemon"
         exit 1
     fi
 }

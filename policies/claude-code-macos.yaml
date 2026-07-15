@@ -6,9 +6,6 @@ name: claude-code-macos
 # All outbound traffic goes through the AXIS proxy which evaluates OPA policy.
 #
 # Usage:
-#   # With API key:
-#   ANTHROPIC_API_KEY=<value> axis run --policy policies/claude-code-macos.yaml -- claude -p "hello"
-#
 #   # With OAuth (run `claude auth login` first outside sandbox):
 #   axis run --policy policies/claude-code-macos.yaml -- claude -p "hello"
 
@@ -62,7 +59,7 @@ network:
           access: read-write
         - host: "featureassets.org"
           port: 443
-          access: read-only
+          access: read-write
 
     - name: github
       endpoints:
@@ -77,10 +74,10 @@ network:
       endpoints:
         - host: "registry.npmjs.org"
           port: 443
-          access: read-only
+          access: read-write
         - host: "pypi.org"
           port: 443
-          access: read-only
+          access: read-write
         - host: "files.pythonhosted.org"
           port: 443
-          access: read-only
+          access: read-write

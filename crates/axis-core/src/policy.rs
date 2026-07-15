@@ -3,11 +3,12 @@
 
 //! YAML policy schema parsing and validation.
 //!
-//! The policy model mirrors the AXIS YAML policy schema described in the
-//! implementation plan. Policies govern filesystem access, process limits,
-//! network connectivity, inference routing, and AMD-specific features.
+//! The policy model defines the AXIS YAML contract. Policies govern filesystem
+//! access, process limits, network connectivity, inference routing, and
+//! AMD-specific features.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use std::net::IpAddr;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,6 +25,7 @@ pub enum PolicyError {
 
 /// Top-level AXIS policy document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub version: u32,
     pub name: String,
@@ -78,8 +80,296 @@ impl Policy {
         self.runtime.validate()?;
         self.process.validate()?;
         self.network.validate()?;
+        self.validate_proxy_features()?;
         Ok(())
     }
+
+    fn validate_proxy_features(&self) -> Result<(), PolicyError> {
+        for network_policy in &self.network.policies {
+            for endpoint in &network_policy.endpoints {
+                if matches!(endpoint.access, Access::ReadOnly) {
+                    return Err(PolicyError::ValidationError(format!(
+                        "network policy '{}' requests unsupported read-only endpoint access for {}:{}; endpoint policies currently authorize the full host and port",
+                        network_policy.name, endpoint.host, endpoint.port
+                    )));
+                }
+                if endpoint.protocol.is_some() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "network policy '{}' requests unsupported endpoint protocol filtering for {}:{}",
+                        network_policy.name, endpoint.host, endpoint.port
+                    )));
+                }
+                if !endpoint.rules.is_empty() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "network policy '{}' requests unsupported L7 method/path filtering for {}:{}",
+                        network_policy.name, endpoint.host, endpoint.port
+                    )));
+                }
+            }
+        }
+
+        let mut credential_scopes = Vec::new();
+        for route in self
+            .inference
+            .routes
+            .iter()
+            .filter(|route| route.has_host_boundary_credentials())
+        {
+            if let Some(env_name) = route.api_key_env.as_deref() {
+                validate_credential_env_name(&route.name, env_name)?;
+            }
+
+            if !matches!(self.network.mode, NetworkMode::Proxy) {
+                return Err(PolicyError::ValidationError(format!(
+                    "inference route '{}' requires network.mode: proxy for host-boundary credential injection",
+                    route.name
+                )));
+            }
+
+            let endpoint = route.credential_endpoint()?;
+            let query_pairs = endpoint.query_pairs().collect::<Vec<_>>();
+            for (name, value) in &query_pairs {
+                if !value.starts_with("axis:resolve:") {
+                    continue;
+                }
+                if name.is_empty() {
+                    return Err(PolicyError::ValidationError(format!(
+                        "inference route '{}' credential query placeholder must have a name",
+                        route.name
+                    )));
+                }
+                let Some(env_name) = value.strip_prefix("axis:resolve:env:") else {
+                    return Err(PolicyError::ValidationError(format!(
+                        "inference route '{}' contains unsupported credential placeholder '{value}'",
+                        route.name
+                    )));
+                };
+                validate_credential_env_name(&route.name, env_name)?;
+                let occurrences = query_pairs
+                    .iter()
+                    .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                    .count();
+                if occurrences != 1 {
+                    return Err(PolicyError::ValidationError(format!(
+                        "inference route '{}' credential query parameter '{}' must have one unambiguous definition",
+                        route.name, name
+                    )));
+                }
+            }
+            if endpoint.scheme() != "http" {
+                return Err(PolicyError::ValidationError(format!(
+                    "inference route '{}' requests unsupported HTTPS credential injection; a per-sandbox CA trust path is not available",
+                    route.name
+                )));
+            }
+            let host = endpoint.host_str().ok_or_else(|| {
+                PolicyError::ValidationError(format!(
+                    "inference route '{}' credential endpoint must include a host",
+                    route.name
+                ))
+            })?;
+            let host = canonicalize_network_host(host).map_err(|reason| {
+                PolicyError::ValidationError(format!(
+                    "inference route '{}' has an invalid credential endpoint host: {reason}",
+                    route.name
+                ))
+            })?;
+            if host != "inference.local" {
+                return Err(PolicyError::ValidationError(format!(
+                    "inference route '{}' may inject credentials only through inference.local; localhost and loopback origins are denied by runtime SSRF controls",
+                    route.name
+                )));
+            }
+            credential_scopes.push(CredentialScope {
+                route: route.name.as_str(),
+                host,
+                port: endpoint.port_or_known_default().ok_or_else(|| {
+                    PolicyError::ValidationError(format!(
+                        "inference route '{}' credential endpoint has no effective port",
+                        route.name
+                    ))
+                })?,
+                path: canonicalize_credential_path(endpoint.path()).map_err(|reason| {
+                    PolicyError::ValidationError(format!(
+                        "inference route '{}' has an invalid credential endpoint path: {reason}",
+                        route.name
+                    ))
+                })?,
+            });
+        }
+
+        for (index, scope) in credential_scopes.iter().enumerate() {
+            for other in &credential_scopes[index + 1..] {
+                if scope.host == other.host
+                    && scope.port == other.port
+                    && credential_paths_overlap(&scope.path, &other.path)
+                {
+                    return Err(PolicyError::ValidationError(format!(
+                        "inference credential routes '{}' and '{}' have ambiguous overlapping scopes on http://{}:{} ('{}' and '{}')",
+                        scope.route, other.route, scope.host, scope.port, scope.path, other.path
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct CredentialScope<'a> {
+    route: &'a str,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn credential_paths_overlap(left: &str, right: &str) -> bool {
+    credential_path_contains(left, right) || credential_path_contains(right, left)
+}
+
+fn credential_path_contains(prefix: &str, path: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || if prefix.ends_with('/') {
+            path.starts_with(prefix)
+        } else {
+            path.strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }
+}
+
+/// Canonicalize a URL path for credential scope comparison.
+///
+/// Percent-encoded unreserved bytes are decoded, while all other encoded bytes
+/// retain their URL path semantics with uppercase hexadecimal digits.
+pub fn canonicalize_credential_path(path: &str) -> Result<String, &'static str> {
+    if !path.starts_with('/') {
+        return Err("credential path must be absolute");
+    }
+    if path.as_bytes().contains(&b'\\') {
+        return Err("credential path contains a backslash");
+    }
+
+    let bytes = path.as_bytes();
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            canonical.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err("credential path contains malformed percent encoding");
+        }
+        let Some(high) = decode_url_hex(bytes[index + 1]) else {
+            return Err("credential path contains malformed percent encoding");
+        };
+        let Some(low) = decode_url_hex(bytes[index + 2]) else {
+            return Err("credential path contains malformed percent encoding");
+        };
+        let decoded = (high << 4) | low;
+        if decoded.is_ascii_control() {
+            return Err("credential path contains an encoded control byte");
+        }
+        if matches!(decoded, b'\\' | b'%') {
+            return Err("credential path contains an encoded backslash or nested percent encoding");
+        }
+        if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'.' | b'_' | b'~') {
+            canonical.push(decoded);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            canonical.push(b'%');
+            canonical.push(HEX[usize::from(decoded >> 4)]);
+            canonical.push(HEX[usize::from(decoded & 0x0f)]);
+        }
+        index += 3;
+    }
+
+    if canonical
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..")
+    {
+        return Err("credential path contains a dot segment");
+    }
+    String::from_utf8(canonical).map_err(|_| "credential path is not valid UTF-8")
+}
+
+fn decode_url_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Reject malformed percent triplets before a URL component is decoded.
+pub fn validate_url_percent_encoding(value: &str) -> Result<(), &'static str> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || decode_url_hex(bytes[index + 1]).is_none()
+            || decode_url_hex(bytes[index + 2]).is_none()
+        {
+            return Err("URL text contains malformed percent encoding");
+        }
+        index += 3;
+    }
+    Ok(())
+}
+
+/// Parse and validate the URL syntax shared by credential policy and runtime.
+pub fn parse_credential_endpoint(endpoint: &str) -> Result<url::Url, &'static str> {
+    if endpoint.as_bytes().contains(&b'\\') {
+        return Err("credential endpoint must not contain a backslash");
+    }
+    validate_url_percent_encoding(endpoint)?;
+    canonicalize_credential_path(raw_endpoint_path(endpoint)?)?;
+    let endpoint = url::Url::parse(endpoint).map_err(|_| "credential endpoint is not a URL")?;
+    if !matches!(endpoint.scheme(), "http" | "https") {
+        return Err("credential endpoint must use http:// or https://");
+    }
+    if endpoint.host_str().is_none() {
+        return Err("credential endpoint must include a host");
+    }
+    if endpoint.fragment().is_some() {
+        return Err("credential endpoint must not contain a fragment");
+    }
+    canonicalize_credential_path(endpoint.path())?;
+    Ok(endpoint)
+}
+
+/// Detect credential placeholders in structured query data or rejected URL parts.
+pub fn credential_endpoint_has_placeholder(endpoint: &str) -> bool {
+    endpoint.contains("axis:resolve:")
+        || url::Url::parse(endpoint).is_ok_and(|endpoint| {
+            endpoint
+                .query_pairs()
+                .any(|(_, value)| value.starts_with("axis:resolve:"))
+        })
+}
+
+fn raw_endpoint_path(endpoint: &str) -> Result<&str, &'static str> {
+    let (_, after_scheme) = endpoint
+        .split_once("://")
+        .ok_or("credential endpoint is not an absolute URL")?;
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let path_and_more = &after_scheme[authority_end..];
+    if !path_and_more.starts_with('/') {
+        return Ok("/");
+    }
+    let path_end = path_and_more
+        .find(['?', '#'])
+        .unwrap_or(path_and_more.len());
+    Ok(&path_and_more[..path_end])
 }
 
 /// Validate a policy name before it is used as a filesystem path component.
@@ -108,6 +398,7 @@ pub fn validate_policy_name_component(name: &str) -> Result<(), PolicyError> {
 /// Runtime launch metadata. This selects a sandbox implementation without
 /// changing the security policy semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimePolicy {
     #[serde(default = "default_runtime_containment")]
     pub containment: RuntimeContainment,
@@ -178,6 +469,7 @@ impl RuntimeProvider {
 
 /// Filesystem access policy — controls what paths the sandboxed process can read/write.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilesystemPolicy {
     #[serde(default)]
     pub read_only: Vec<String>,
@@ -206,6 +498,7 @@ pub enum Compatibility {
 
 /// Process containment policy — limits on the sandboxed process tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessPolicy {
     /// Maximum process count. 0 disables process-count enforcement.
     #[serde(default = "default_max_processes")]
@@ -268,6 +561,7 @@ fn default_cpu_rate() -> u32 {
 
 /// Network connectivity policy — controls how the sandbox reaches the network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     #[serde(default = "default_network_mode")]
     pub mode: NetworkMode,
@@ -287,6 +581,11 @@ impl Default for NetworkPolicy {
 
 impl NetworkPolicy {
     fn validate(&self) -> Result<(), PolicyError> {
+        if !self.policies.is_empty() && !matches!(self.mode, NetworkMode::Proxy) {
+            return Err(PolicyError::ValidationError(
+                "network endpoint policies require network.mode: proxy".into(),
+            ));
+        }
         for ep in &self.policies {
             if ep.name.is_empty() {
                 return Err(PolicyError::ValidationError(
@@ -298,6 +597,14 @@ impl NetworkPolicy {
                     "network policy '{}' has no endpoints",
                     ep.name
                 )));
+            }
+            for endpoint in &ep.endpoints {
+                canonicalize_network_host(&endpoint.host).map_err(|reason| {
+                    PolicyError::ValidationError(format!(
+                        "network policy '{}' has an invalid endpoint host '{}': {reason}",
+                        ep.name, endpoint.host
+                    ))
+                })?;
             }
         }
         Ok(())
@@ -319,6 +626,7 @@ pub enum NetworkMode {
 
 /// A named group of endpoint rules with optional binary restrictions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointPolicy {
     pub name: String,
     pub endpoints: Vec<Endpoint>,
@@ -328,7 +636,12 @@ pub struct EndpointPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Endpoint {
+    #[serde(
+        deserialize_with = "deserialize_network_host",
+        serialize_with = "serialize_network_host"
+    )]
     pub host: String,
     pub port: u16,
 
@@ -342,36 +655,92 @@ pub struct Endpoint {
     pub rules: Vec<L7Rule>,
 }
 
+fn deserialize_network_host<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let host = String::deserialize(deserializer)?;
+    canonicalize_network_host(&host).map_err(D::Error::custom)
+}
+
+fn serialize_network_host<S>(host: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    canonicalize_network_host(host)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn canonicalize_network_host(host: &str) -> Result<String, &'static str> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        return Err("network endpoint host must not be empty");
+    }
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(address.to_string());
+    }
+    if !host.is_ascii() || host.len() > 253 {
+        return Err("network endpoint host must be an ASCII DNS name of at most 253 bytes");
+    }
+    if !host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    }) {
+        return Err("network endpoint host is not a valid DNS name");
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
 fn default_access() -> Access {
-    Access::ReadOnly
+    Access::ReadWrite
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {
     #[default]
-    ReadOnly,
     ReadWrite,
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L7Rule {
     pub allow: Option<L7Allow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct L7Allow {
     pub method: String,
     pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BinaryMatch {
     pub path: String,
 }
 
 /// Inference routing policy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InferencePolicy {
     #[serde(default)]
     pub default_provider: Option<String>,
@@ -387,6 +756,7 @@ pub struct InferencePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InferenceRoute {
     pub name: String,
 
@@ -406,7 +776,57 @@ pub struct InferenceRoute {
     pub protocols: Vec<String>,
 }
 
+impl InferenceRoute {
+    pub(crate) fn has_host_boundary_credentials(&self) -> bool {
+        self.api_key_env.is_some()
+            || self
+                .endpoint
+                .as_deref()
+                .is_some_and(credential_endpoint_has_placeholder)
+    }
+
+    pub(crate) fn uses_https_credentials(&self) -> bool {
+        if !self.has_host_boundary_credentials() {
+            return false;
+        }
+        self.endpoint
+            .as_deref()
+            .and_then(|endpoint| url::Url::parse(endpoint).ok())
+            .is_none_or(|endpoint| endpoint.scheme() != "http")
+    }
+
+    fn credential_endpoint(&self) -> Result<url::Url, PolicyError> {
+        let endpoint = self.endpoint.as_deref().ok_or_else(|| {
+            PolicyError::ValidationError(format!(
+                "inference route '{}' with host-boundary credentials requires an explicit http:// endpoint",
+                self.name
+            ))
+        })?;
+        parse_credential_endpoint(endpoint).map_err(|reason| {
+            PolicyError::ValidationError(format!(
+                "inference route '{}' has an invalid credential endpoint: {reason}",
+                self.name
+            ))
+        })
+    }
+}
+
+fn validate_credential_env_name(route: &str, env_name: &str) -> Result<(), PolicyError> {
+    let valid = !env_name.is_empty()
+        && env_name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(PolicyError::ValidationError(format!(
+            "inference route '{route}' api_key_env must be a non-empty uppercase environment variable name: {env_name}"
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulingPolicy {
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -435,6 +855,7 @@ pub enum Priority {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenBudget {
     pub max_tokens_per_hour: u64,
 
@@ -467,6 +888,7 @@ pub enum ExhaustAction {
 
 /// AMD hardware-specific policy extensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AmdPolicy {
     #[serde(default)]
     pub gpu_passthrough: bool,
@@ -479,6 +901,7 @@ pub struct AmdPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApexMemoryPolicy {
     #[serde(default)]
     pub allow_overcommit: bool,
@@ -489,6 +912,7 @@ pub struct ApexMemoryPolicy {
 
 /// GPU isolation policy — controls HIP Remote para-virtual GPU access.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GpuPolicy {
     /// Enable GPU access for this sandbox.
     #[serde(default)]
@@ -533,6 +957,7 @@ pub enum GpuTransport {
 
 /// SSH key policy — controls which SSH keys and hosts agents can access.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SshPolicy {
     /// SSH keys the agent is allowed to use.
     #[serde(default)]
@@ -549,6 +974,7 @@ pub struct SshPolicy {
 
 /// A specific SSH key with host restrictions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SshKeySpec {
     /// Display name for the key.
     pub name: String,
@@ -619,7 +1045,7 @@ inference:
       protocols: [openai_chat_completions]
       model: "llama-4-scout-109b"
     - name: cloud-fallback
-      provider: anthropic
+      endpoint: "http://inference.local:8081"
       model: "claude-sonnet-4-20250514"
       api_key_env: ANTHROPIC_API_KEY
   token_budget:
@@ -766,5 +1192,633 @@ runtime:
         let yaml = "version: 1\nname: test\nprocess:\n  cpu_rate_percent: 101\n";
         let err = Policy::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, PolicyError::ValidationError(_)));
+    }
+
+    #[test]
+    fn endpoint_access_defaults_to_full_host_port_authorization() {
+        let policy = Policy::from_yaml(
+            r#"
+version: 1
+name: endpoint-default
+network:
+  mode: proxy
+  policies:
+    - name: example
+      endpoints:
+        - host: example.com
+          port: 443
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            policy.network.policies[0].endpoints[0].access,
+            Access::ReadWrite
+        ));
+    }
+
+    #[test]
+    fn reject_endpoint_policies_outside_proxy_mode() {
+        for mode in ["allow", "block"] {
+            let yaml = format!(
+                r#"
+version: 1
+name: endpoint-mode
+network:
+  mode: {mode}
+  policies:
+    - name: example
+      endpoints:
+        - host: example.com
+          port: 443
+"#
+            );
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("require network.mode: proxy"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unenforced_endpoint_refinements() {
+        let cases = [
+            ("access: read-only", "read-only endpoint access"),
+            ("protocol: rest", "protocol filtering"),
+            (
+                "rules:\n            - allow:\n                method: GET\n                path: /v1/models",
+                "L7 method/path filtering",
+            ),
+        ];
+
+        for (refinement, expected) in cases {
+            let yaml = format!(
+                r#"
+version: 1
+name: unsupported-endpoint-refinement
+network:
+  mode: proxy
+  policies:
+    - name: example
+      endpoints:
+        - host: example.com
+          port: 443
+          {refinement}
+"#
+            );
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn reject_l7_rules_independent_of_transport_hint() {
+        for (port, protocol) in [(80, ""), (443, "          protocol: rest\n")] {
+            let yaml = format!(
+                r#"
+version: 1
+name: unsupported-l7
+network:
+  mode: proxy
+  policies:
+    - name: example
+      endpoints:
+        - host: example.com
+          port: {port}
+{protocol}          rules:
+            - allow:
+                method: GET
+                path: /allowed
+"#
+            );
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("L7 method/path filtering")
+                    || message.contains("protocol filtering"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_inference_virtual_host_credentials_in_proxy_mode() {
+        for endpoint in [
+            "http://inference.local:8080/v1",
+            "http://INFERENCE.LOCAL.:8080/v1?key=axis:resolve:env:LOCAL_KEY",
+        ] {
+            let yaml = format!(
+                r#"
+version: 1
+name: local-http-credentials
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: local
+      endpoint: "{endpoint}"
+      api_key_env: LOCAL_KEY
+"#
+            );
+            Policy::from_yaml(&yaml).unwrap();
+        }
+    }
+
+    #[test]
+    fn reject_credentials_without_proxy_mode() {
+        for mode in ["allow", "block"] {
+            let yaml = format!(
+                r#"
+version: 1
+name: wrong-credential-mode
+network:
+  mode: {mode}
+inference:
+  routes:
+    - name: local
+      endpoint: http://inference.local:8080
+      api_key_env: LOCAL_KEY
+"#
+            );
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(err.to_string().contains("network.mode: proxy"), "{err}");
+        }
+    }
+
+    #[test]
+    fn reject_https_host_boundary_credentials() {
+        let cases = [
+            "endpoint: https://example.com/v1\n      api_key_env: EXTERNAL_KEY",
+            "provider: openai\n      api_key_env: EXTERNAL_KEY",
+            "provider: anthropic\n      api_key_env: EXTERNAL_KEY",
+            "endpoint: https://example.com/v1?key=axis:resolve:env:EXTERNAL_KEY",
+        ];
+
+        for route in cases {
+            let yaml = format!(
+                r#"
+version: 1
+name: unsupported-https-credentials
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: external
+      {route}
+"#
+            );
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("HTTPS credential injection")
+                    || message.contains("explicit http:// endpoint"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_plaintext_credentials_to_remote_endpoint() {
+        let yaml = r#"
+version: 1
+name: remote-http-credentials
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: external
+      endpoint: http://example.com/v1
+      api_key_env: EXTERNAL_KEY
+"#;
+
+        let err = Policy::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("only through inference.local"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_loopback_credential_origins_rejected_by_runtime_ssrf_controls() {
+        for endpoint in [
+            "http://localhost:8080/v1",
+            "http://LOCALHOST.:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://127.1:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://[0:0:0:0:0:0:0:1]:8080/v1",
+        ] {
+            let yaml = format!(
+                r#"
+version: 1
+name: loopback-credential-origin
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: local
+      endpoint: "{endpoint}"
+      api_key_env: LOCAL_KEY
+"#
+            );
+            let error = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(
+                error.to_string().contains("runtime SSRF controls"),
+                "{endpoint}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_overlapping_credential_scopes_independent_of_route_order() {
+        for routes in [
+            r#"
+    - name: broad
+      endpoint: http://INFERENCE.LOCAL.:8080/v1
+      api_key_env: BROAD_KEY
+    - name: narrow
+      endpoint: http://inference.local:8080/v1/chat
+      api_key_env: NARROW_KEY
+"#,
+            r#"
+    - name: narrow
+      endpoint: http://inference.local:8080/v1/chat
+      api_key_env: NARROW_KEY
+    - name: broad
+      endpoint: http://INFERENCE.LOCAL.:8080/v1
+      api_key_env: BROAD_KEY
+"#,
+            r#"
+    - name: first
+      endpoint: http://inference.local:80/v1
+      api_key_env: FIRST_KEY
+    - name: duplicate
+      endpoint: http://INFERENCE.LOCAL./v1
+      api_key_env: SECOND_KEY
+"#,
+            r#"
+    - name: encoded
+      endpoint: http://inference.local/%76%31
+      api_key_env: ENCODED_KEY
+    - name: plain
+      endpoint: http://inference.local/v1/chat
+      api_key_env: PLAIN_KEY
+"#,
+            r#"
+    - name: plain
+      endpoint: http://inference.local/v1/chat
+      api_key_env: PLAIN_KEY
+    - name: encoded
+      endpoint: http://inference.local/%76%31
+      api_key_env: ENCODED_KEY
+"#,
+            r#"
+    - name: lowercase-encoding
+      endpoint: http://inference.local/v1%2fchat
+      api_key_env: LOWER_KEY
+    - name: uppercase-encoding
+      endpoint: http://inference.local/v1%2Fchat
+      api_key_env: UPPER_KEY
+"#,
+            r#"
+    - name: lowercase-unreserved
+      endpoint: http://inference.local/v1/%7euser
+      api_key_env: LOWER_KEY
+    - name: uppercase-unreserved
+      endpoint: http://inference.local/v1/%7Euser
+      api_key_env: UPPER_KEY
+"#,
+        ] {
+            let yaml = format!(
+                "version: 1\nname: ambiguous-scopes\nnetwork:\n  mode: proxy\ninference:\n  routes:{routes}"
+            );
+            let error = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(
+                error.to_string().contains("ambiguous overlapping scopes"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_disjoint_credential_paths_and_ports() {
+        let yaml = r#"
+version: 1
+name: disjoint-scopes
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: chat
+      endpoint: http://inference.local:8080/v1/chat
+      api_key_env: CHAT_KEY
+    - name: models
+      endpoint: http://inference.local:8080/v1/models
+      api_key_env: MODELS_KEY
+    - name: alternate-port
+      endpoint: http://inference.local:8081/v1/chat
+      api_key_env: ALT_KEY
+"#;
+        Policy::from_yaml(yaml).unwrap();
+    }
+
+    #[test]
+    fn preserve_encoded_reserved_separator_scope_boundaries() {
+        let yaml = r#"
+version: 1
+name: reserved-path-boundaries
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: encoded-separator
+      endpoint: http://inference.local/v1%2Fchat
+      api_key_env: ENCODED_KEY
+    - name: path-separator
+      endpoint: http://inference.local/v1/chat
+      api_key_env: PATH_KEY
+"#;
+        Policy::from_yaml(yaml).unwrap();
+    }
+
+    #[test]
+    fn reject_credential_endpoint_fragments_and_malformed_percent_encoding() {
+        for endpoint in [
+            "http://inference.local/v1#fragment?key=axis:resolve:env:LOCAL_KEY",
+            "http://inference.local/v1?key=axis:resolve:env:LOCAL_KEY#fragment",
+            "http://inference.local/v%7?key=axis:resolve:env:LOCAL_KEY",
+            "http://inference.local/v1?key=axis%ZZresolve%3Aenv%3ALOCAL_KEY&other=axis:resolve:env:OTHER_KEY",
+        ] {
+            let yaml = format!(
+                r#"
+version: 1
+name: invalid-credential-endpoint
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: local
+      endpoint: "{endpoint}"
+      api_key_env: LOCAL_KEY
+"#
+            );
+            let error = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid credential endpoint"),
+                "{endpoint}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_percent_encoded_query_credential_placeholders_during_validation() {
+        let yaml = r#"
+version: 1
+name: encoded-query-placeholder
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: remote
+      endpoint: "http://example.com/v1?key=axis%3Aresolve%3Aenv%3AREMOTE_KEY"
+"#;
+        let error = Policy::from_yaml(yaml).unwrap_err();
+        assert!(error.to_string().contains("only through inference.local"));
+    }
+
+    #[test]
+    fn canonicalize_network_policy_dns_and_ip_hosts_before_serialization() {
+        let policy = Policy::from_yaml(
+            r#"
+version: 1
+name: canonical-hosts
+network:
+  mode: proxy
+  policies:
+    - name: endpoints
+      endpoints:
+        - host: API.EXAMPLE.COM.
+          port: 443
+        - host: 2001:0db8:0:0::1
+          port: 443
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.network.policies[0].endpoints[0].host,
+            "api.example.com"
+        );
+        assert_eq!(policy.network.policies[0].endpoints[1].host, "2001:db8::1");
+        let data = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            data["network"]["policies"][0]["endpoints"][0]["host"],
+            "api.example.com"
+        );
+        assert_eq!(
+            data["network"]["policies"][0]["endpoints"][1]["host"],
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn reject_malformed_network_policy_hosts() {
+        for host in [
+            "",
+            ".",
+            "example.com..",
+            "-bad.example",
+            "bad-.example",
+            "bad_host",
+        ] {
+            let yaml = format!(
+                "version: 1\nname: invalid-host\nnetwork:\n  mode: proxy\n  policies:\n    - name: bad\n      endpoints:\n        - host: \"{host}\"\n          port: 443\n"
+            );
+            let error = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(
+                error.to_string().contains("network endpoint host"),
+                "{host}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_invalid_credential_environment_names_and_placeholders() {
+        let cases = [
+            (
+                "http://localhost:8080/v1",
+                "api_key_env: lower_case",
+                "uppercase environment variable",
+            ),
+            (
+                "http://localhost:8080/v1",
+                "api_key_env: ''",
+                "uppercase environment variable",
+            ),
+            (
+                "http://localhost:8080/v1?key=axis:resolve:file:secret",
+                "",
+                "unsupported credential placeholder",
+            ),
+            (
+                "http://localhost:8080/v1?key=axis:resolve:env:lower_case",
+                "",
+                "uppercase environment variable",
+            ),
+            (
+                "http://localhost:8080/v1?=axis:resolve:env:LOCAL_KEY",
+                "",
+                "placeholder must have a name",
+            ),
+            (
+                "http://localhost:8080/v1?api_key=axis:resolve:env:LOCAL_KEY&api%5Fkey=shadow",
+                "",
+                "one unambiguous definition",
+            ),
+        ];
+
+        for (endpoint, route, expected) in cases {
+            let yaml = format!(
+                r#"
+version: 1
+name: invalid-credential-reference
+network:
+  mode: proxy
+inference:
+  routes:
+    - name: local
+      endpoint: {endpoint}
+      {route}
+"#
+            );
+            let err = Policy::from_yaml(&yaml).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    fn assert_unknown_field_rejected(family: &str, yaml: &str, field: &str) {
+        let err = Policy::from_yaml(yaml).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::ParseError(_)),
+            "{family} unknown field must fail during deserialization: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("unknown field `{field}`")),
+            "{family} rejected for an unexpected reason: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_unknown_fields_across_policy_mapping_families() {
+        let cases = [
+            ("policy", "unexpected: true\n", "unexpected"),
+            (
+                "runtime",
+                "runtime:\n  containment: process\n  providre: auto\n",
+                "providre",
+            ),
+            (
+                "filesystem",
+                "filesystem:\n  read_only: [/usr]\n  compatiblity: best_effort\n",
+                "compatiblity",
+            ),
+            (
+                "process",
+                "process:\n  max_processes: 4\n  blocked_syscall: [ptrace]\n",
+                "blocked_syscall",
+            ),
+            (
+                "network",
+                "network:\n  mode: proxy\n  endpoint_policies: []\n",
+                "endpoint_policies",
+            ),
+            (
+                "endpoint",
+                "network:\n  mode: proxy\n  policies:\n    - name: web\n      endpoints:\n        - host: example.com\n          port: 443\n          protcol: tcp\n",
+                "protcol",
+            ),
+            (
+                "L7 rule",
+                "network:\n  mode: proxy\n  policies:\n    - name: web\n      endpoints:\n        - host: example.com\n          port: 443\n          rules:\n            - allow: { method: GET, path: / }\n              audit: true\n",
+                "audit",
+            ),
+            (
+                "L7 allow",
+                "network:\n  mode: proxy\n  policies:\n    - name: web\n      endpoints:\n        - host: example.com\n          port: 443\n          rules:\n            - allow: { method: GET, path: /, query: safe=true }\n",
+                "query",
+            ),
+            (
+                "binary match",
+                "network:\n  mode: proxy\n  policies:\n    - name: web\n      endpoints: [{ host: example.com, port: 443 }]\n      binaries:\n        - path: /usr/bin/curl\n          sha256: deadbeef\n",
+                "sha256",
+            ),
+            (
+                "inference",
+                "inference:\n  default_providr: local\n",
+                "default_providr",
+            ),
+            (
+                "inference route",
+                "inference:\n  routes:\n    - name: local\n      endpoint: http://localhost:8080\n      protcols: [openai]\n",
+                "protcols",
+            ),
+            (
+                "scheduling",
+                "inference:\n  scheduling:\n    weight: 1\n    max_concurent_requests: 2\n",
+                "max_concurent_requests",
+            ),
+            (
+                "token budget",
+                "inference:\n  token_budget:\n    max_tokens_per_hour: 1000\n    max_tokens_per_requst: 100\n",
+                "max_tokens_per_requst",
+            ),
+            ("AMD", "amd:\n  gpu_passthrouh: true\n", "gpu_passthrouh"),
+            (
+                "APEX memory",
+                "amd:\n  apex_memory_policy:\n    allow_overcommit: false\n    max_vram_mib: 1024\n",
+                "max_vram_mib",
+            ),
+            (
+                "GPU",
+                "gpu:\n  enabled: true\n  denied_api: [ipc]\n",
+                "denied_api",
+            ),
+            (
+                "SSH",
+                "ssh:\n  generate_known_hosts: true\n  generate_confg: true\n",
+                "generate_confg",
+            ),
+            (
+                "SSH key",
+                "ssh:\n  allowed_keys:\n    - name: deploy\n      private_key: ~/.ssh/id_ed25519\n      allowed_host: [github.com]\n",
+                "allowed_host",
+            ),
+        ];
+
+        for (family, body, field) in cases {
+            let yaml = format!("version: 1\nname: unknown-field\n{body}");
+            assert_unknown_field_rejected(family, &yaml, field);
+        }
+    }
+
+    #[test]
+    fn endpoint_binary_typo_cannot_broaden_authorization() {
+        let yaml = r#"
+version: 1
+name: endpoint-binary-typo
+network:
+  mode: proxy
+  policies:
+    - name: github
+      endpoints:
+        - host: api.github.com
+          port: 443
+      binaires:
+        - path: /usr/bin/git
+"#;
+
+        assert_unknown_field_rejected("endpoint policy", yaml, "binaires");
     }
 }

@@ -28,8 +28,8 @@ Every policy/backend pair must produce one of these outcomes:
 
 Backends may also mark a policy surface as AXIS-owned when the backend starts
 the workload but AXIS remains responsible for enforcement. Examples include the
-strict network proxy, provider credential injection, inference routing, audit
-aggregation, and some lifecycle cleanup.
+strict network proxy, supported local credential injection, inference routing,
+audit aggregation, and some lifecycle cleanup.
 
 ## Shared Invariants
 
@@ -99,7 +99,7 @@ behavior.
 - the sandbox can reach only the AXIS proxy or router endpoint needed for the
   policy;
 - endpoint policy is evaluated by AXIS outside the sandbox;
-- provider credentials are injected only at the host-side policy boundary;
+- supported local provider credentials are injected only at the host-side policy boundary;
 - direct bypass attempts are denied and auditable where the platform can
   provide evidence;
 - binary-restricted endpoint policy requires reliable connect-time attribution
@@ -152,7 +152,10 @@ Required behavior:
   MXC JSON, backend config files, argv, logs, audit records, or sandbox-visible
   files.
 - Provider credentials are resolved and injected only by AXIS-owned host-side
-  proxy or router code for policy-allowed requests.
+  proxy or router code for supported policy-allowed requests.
+- Host-boundary injection is currently limited to explicit local `http://`
+  routes. Remote plaintext and HTTPS credential routes are unsupported and
+  fail before launch.
 - Missing required credentials fail closed for the route that needs them.
 - Unsupported credential placeholders fail closed.
 - Error messages must name the missing or unsupported credential reference

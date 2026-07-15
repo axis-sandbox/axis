@@ -22,7 +22,7 @@ filesystem:
     - "~/.claude"
     - "~/.local/share/claude"
     - "~/.config"
-    - "~/.axis"
+    - "~/.axis/agents/agent-claude-code"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

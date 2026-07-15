@@ -36,20 +36,20 @@ bash scripts/test_security_tier0.sh
 
 The harness currently runs:
 
-- `cargo test -p axis-core capability`
-- `cargo test -p axis-core process_backend`
-- `cargo test -p axis-core container_backend`
-- `cargo test -p axis-core vm_backend`
-- `cargo test -p axis-core mxc_config`
-- `cargo test -p axis-sandbox mxc -- --skip gated_`
+- `cargo test --locked -p axis-core capability`
+- `cargo test --locked -p axis-core process_backend`
+- `cargo test --locked -p axis-core container_backend`
+- `cargo test --locked -p axis-core vm_backend`
+- `cargo test --locked -p axis-core mxc_config`
+- `cargo test --locked -p axis-sandbox mxc -- --skip gated_`
 
 Backend default evidence can be inspected without host dependencies with:
 
 ```bash
-cargo run -p axis-bench --bin backend-defaults
-cargo run -p axis-bench --bin backend-evidence
-cargo run -p axis-bench --bin opa-scenarios
-cargo run -p axis-bench --bin mxc-isolation-matrix
+cargo run --locked -p axis-bench --bin backend-defaults
+cargo run --locked -p axis-bench --bin backend-evidence
+cargo run --locked -p axis-bench --bin opa-scenarios
+cargo run --locked -p axis-bench --bin mxc-isolation-matrix
 ```
 
 This covers the shared capability planner, process backend planning, container
@@ -102,6 +102,7 @@ visible skip into a failure.
 | `AXIS_RUN_BWRAP_E2E=1` | 2 | Run Bubblewrap fallback e2e proof when a trusted `bwrap` exists. |
 | `AXIS_TEST_MXC_EXECUTOR=<path>` | 2 | Inject a safe MXC executor path for real-runtime tests. |
 | `AXIS_TEST_AXIS_SECCOMP_LAUNCHER=<path>` | 2 | Inject a safe AXIS seccomp launcher path for real-runtime tests. |
+| `AXIS_REAL_MXC_PROCESS_TESTS=1` | 3 | Run real MXC Bubblewrap process tests when a safe executor, seccomp launcher, and host prerequisites are present. |
 | `AXIS_REAL_CGROUP_TESTS=1` | 3 | Run real cgroup tests on hosts with delegated cgroup support. |
 | `AXIS_REAL_NETNS_TESTS=1` | 3 | Run real network namespace tests on hosts with required namespace support. |
 | `AXIS_TEST_SECCOMP_NOTIFY_ATTRIBUTION=1` | 3 | Run seccomp-notify connect-attribution proofs. |

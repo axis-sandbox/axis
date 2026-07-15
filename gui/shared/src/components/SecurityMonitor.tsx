@@ -1,3 +1,6 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 import { createSignal, onMount, onCleanup, For } from "solid-js";
 import { subscribeEvents, type AuditEvent } from "../api/client";
 

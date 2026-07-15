@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,23 +19,35 @@ fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 # ── Test 1: Landlock ABI ──
 echo "--- Test 1: Landlock ABI ---"
-python3 -c "
+if python3 -c "
 import ctypes, ctypes.util
 libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
 ret = libc.syscall(444, None, 0, 1)
 if ret >= 1: print(f'ABI version {ret}')
 else: exit(1)
-" && pass "Landlock available" || fail "Landlock unavailable"
+"; then
+    pass "Landlock available"
+else
+    fail "Landlock unavailable"
+fi
 
 # ── Test 2: Policy validation ──
 echo "--- Test 2: Policy Validation ---"
-"$AXIS" policy validate "$CODING_POLICY" >/dev/null && pass "coding-agent.yaml" || fail "coding-agent.yaml"
-"$AXIS" policy validate "$MINIMAL_POLICY" >/dev/null && pass "minimal.yaml" || fail "minimal.yaml"
+if "$AXIS" policy validate "$CODING_POLICY" >/dev/null; then
+    pass "coding-agent.yaml"
+else
+    fail "coding-agent.yaml"
+fi
+if "$AXIS" policy validate "$MINIMAL_POLICY" >/dev/null; then
+    pass "minimal.yaml"
+else
+    fail "minimal.yaml"
+fi
 
 # ── Test 3: Landlock filesystem isolation ──
 echo "--- Test 3: Landlock Filesystem Isolation ---"
 WORKSPACE=$(mktemp -d /tmp/axis-ws-XXXXXX)
-python3 - "$WORKSPACE" << 'PYEOF'
+if python3 - "$WORKSPACE" << 'PYEOF'
 import ctypes, ctypes.util, os, sys
 
 workspace = sys.argv[1]
@@ -92,7 +107,7 @@ else:
     _, status = os.waitpid(pid, 0)
     sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
 PYEOF
-if [ $? -eq 0 ]; then
+then
     pass "Landlock blocks writes outside workspace"
 else
     fail "Landlock isolation"
@@ -101,7 +116,7 @@ rm -rf "$WORKSPACE"
 
 # ── Test 4: seccomp blocks ptrace ──
 echo "--- Test 4: seccomp Blocks ptrace ---"
-python3 << 'PYEOF'
+if python3 << 'PYEOF'
 import ctypes, ctypes.util, os, sys, struct, errno as errno_mod
 
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -145,11 +160,19 @@ else:
     _, status = os.waitpid(pid, 0)
     sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
 PYEOF
-[ $? -eq 0 ] && pass "seccomp blocks ptrace, allows getpid" || fail "seccomp"
+then
+    pass "seccomp blocks ptrace, allows getpid"
+else
+    fail "seccomp"
+fi
 
 # ── Test 5: Success metrics ──
 echo "--- Test 5: Success Metrics ---"
-"$SUCCESS_METRICS" 2>/dev/null | grep -q "5/5" && pass "All 5/5 metrics pass" || fail "Metrics"
+if "$SUCCESS_METRICS" 2>/dev/null | grep -q "5/5"; then
+    pass "All 5/5 metrics pass"
+else
+    fail "Metrics"
+fi
 
 # ── Summary ──
 echo ""

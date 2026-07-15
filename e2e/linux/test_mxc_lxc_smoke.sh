@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # Gated Linux MXC LXC runtime smoke tests.
 #
 # These tests do not install MXC, configure LXC, or mutate host runtime state.

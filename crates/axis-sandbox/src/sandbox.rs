@@ -171,6 +171,9 @@ impl Sandbox {
                 .validate()
                 .map_err(|e| SandboxError::CreationFailed(format!("invalid sandbox policy: {e}")))
         })?;
+        record_startup_result(&trace, "front_door.platform_availability", || {
+            ensure_platform_backend_available(backend)
+        })?;
 
         let agent_symlinks =
             record_startup_result(&trace, "support_files.agent_workspace", || {
@@ -724,6 +727,31 @@ fn process_backend_for_provider(
     }
 }
 
+fn ensure_platform_backend_available(
+    backend: PlatformBackendSelection,
+) -> Result<(), SandboxError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let _ = backend;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = backend;
+        crate::windows::ensure_containment_available()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = backend;
+        Err(SandboxError::Unsupported(format!(
+            "platform '{}' is not yet supported",
+            std::env::consts::OS
+        )))
+    }
+}
+
 /// Platform-specific sandbox implementation trait.
 pub(crate) trait SandboxImpl: Send {
     /// Start the isolated process. Returns the PID.
@@ -891,6 +919,67 @@ mod tests {
 
         assert!(matches!(err, SandboxError::CreationFailed(_)));
         assert!(err.to_string().contains("cpu_rate_percent"));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_windows_front_door_rejects_without_mutation(
+        create: impl FnOnce(SandboxConfig) -> Result<Sandbox, SandboxError>,
+    ) {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let real_state = home.join(".codex");
+        std::fs::create_dir(&real_state).unwrap();
+        std::fs::write(real_state.join("state.json"), "original").unwrap();
+
+        crate::test_support::with_home(&home, || {
+            let mut config = test_config();
+            config.policy.name = "windows-front-door".into();
+            config.policy.filesystem.read_write = vec!["~/.codex".into()];
+            config.workspace_dir = parent.path().join("workspace");
+            let trace = StartupTrace::new();
+            config.startup_trace = Some(trace.clone());
+
+            let err = match create(config.clone()) {
+                Ok(_) => panic!("disabled Windows containment must reject creation"),
+                Err(err) => err,
+            };
+
+            assert!(matches!(err, SandboxError::Unsupported(_)));
+            assert!(err.to_string().contains("containment is unavailable"));
+            assert!(!config.workspace_dir.exists());
+            assert!(!home.join(".axis").exists());
+            assert!(!home.join(".codex.axis-backup").exists());
+            assert!(real_state.is_dir());
+            assert!(!real_state.is_symlink());
+            assert_eq!(
+                std::fs::read_to_string(real_state.join("state.json")).unwrap(),
+                "original"
+            );
+            assert_eq!(
+                trace
+                    .phases()
+                    .iter()
+                    .map(|timing| timing.phase)
+                    .collect::<Vec<_>>(),
+                vec![
+                    "front_door.policy_validation",
+                    "front_door.platform_availability"
+                ]
+            );
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn public_create_rejects_disabled_windows_backend_without_filesystem_mutation() {
+        assert_windows_front_door_rejects_without_mutation(Sandbox::create);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn public_create_for_exec_rejects_disabled_windows_backend_without_filesystem_mutation() {
+        assert_windows_front_door_rejects_without_mutation(Sandbox::create_for_exec);
     }
 
     #[cfg(target_os = "linux")]
@@ -1576,7 +1665,7 @@ mod tests {
             let mut config = test_config();
             config.policy.name = "agent-ssh".into();
             config.workspace_dir = workspace.path().join("workspace");
-            config.policy.filesystem.read_write = vec!["~/.axis".into()];
+            config.policy.filesystem.read_write = vec!["~/.axis/agents/agent-ssh".into()];
             config.policy.filesystem.deny = vec!["~/.ssh".into()];
             config.policy.ssh = SshPolicy {
                 allowed_keys: vec![SshKeySpec {
@@ -1597,7 +1686,7 @@ mod tests {
             assert!(!managed_home.join(".ssh/id_ed25519").exists());
             assert!(!managed_home.join(".ssh/config").exists());
             assert_eq!(
-                std::fs::read_link(managed_home.join(".axis")).unwrap(),
+                std::fs::read_link(managed_home.join(".axis/agents/agent-ssh")).unwrap(),
                 agent_axis_target
             );
             assert!(
@@ -1609,10 +1698,15 @@ mod tests {
             );
             assert!(
                 !config.policy.filesystem.read_write.iter().any(|path| {
-                    path == "~/.axis"
-                        || path == home.path().join(".axis").to_string_lossy().as_ref()
+                    path == "~/.axis/agents/agent-ssh"
+                        || path
+                            == home
+                                .path()
+                                .join(".axis/agents/agent-ssh")
+                                .to_string_lossy()
+                                .as_ref()
                 }),
-                "missing SSH keys must not leave real ~/.axis mounted"
+                "missing SSH keys must not leave the real policy state root mounted"
             );
             assert!(
                 config.policy.filesystem.deny.contains(&"~/.ssh".into()),
@@ -1728,16 +1822,6 @@ mod tests {
             let private_setup = agent_root.join("ssh-staging");
 
             let grants = [
-                (
-                    "read_write",
-                    agent_root.to_string_lossy().into_owned(),
-                    "broad agent root",
-                ),
-                (
-                    "read_only",
-                    agent_root.to_string_lossy().into_owned(),
-                    "broad read-only agent root",
-                ),
                 (
                     "read_write",
                     "~/.axis/agents/agent-ssh/ssh-staging".to_string(),

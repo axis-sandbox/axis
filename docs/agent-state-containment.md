@@ -2,171 +2,188 @@
 
 ## Problem
 
-AI agents write state to well-known directories in the user's home:
+AI agents write persistent state to well-known directories in the user's home,
+for example:
 
+```text
+~/.claude/          Claude Code sessions, settings, and history
+~/.codex/           Codex CLI configuration and cache
+~/.openclaw/        OpenClaw workspace, skills, and memory
+~/.ironclaw/        Ironclaw configuration, secrets, and routines
+~/.config/          Shared configuration used by multiple agents
 ```
-~/.claude/          Claude Code sessions, settings, history
-~/.codex/           Codex CLI config and cache
-~/.openclaw/        OpenClaw workspace, skills, memory
-~/.ironclaw/        Ironclaw config, secrets, routines
-~/.config/          Shared config (various agents)
-~/Library/          macOS app data
-```
 
-Without containment, these directories:
-- **Accumulate persistent state** that can be poisoned (Microsoft's "indirect prompt injection persistence" attack)
-- **Cross-contaminate** between agents (one agent reads another's state)
-- **Survive sandbox destruction** (data lingers after the sandbox is gone)
-- **Mix with real user data** (hard to audit what the agent wrote vs what the user created)
+Without containment, this state can persist after a sandbox exits, mix with
+user-managed data, or be reused by a later agent invocation. Shared state also
+increases the impact of persistent prompt injection and makes incident review
+harder.
 
-## Solution: ~/.axis/agents/
+## Policy-Owned State Roots
 
-AXIS contains all agent-writable state under a single directory tree:
+AXIS stores redirected agent state under a directory derived from the policy
+name:
 
-```
+```text
 ~/.axis/
 └── agents/
-    ├── agent-claude-code/        ← one dir per policy
-    │   ├── claude/               ← was ~/.claude
-    │   ├── claude-share/         ← was ~/.local/share/claude
-    │   ├── config/               ← was ~/.config
-    │   └── library/              ← was ~/Library (macOS)
-    │
+    ├── agent-claude-code/
+    │   ├── claude/               # target for ~/.claude
+    │   ├── claude-share/         # target for ~/.local/share/claude
+    │   └── config/               # target for ~/.config
     ├── agent-codex/
-    │   ├── codex/                ← was ~/.codex
+    │   ├── codex/                # target for ~/.codex
     │   └── config/
-    │
     ├── agent-openclaw/
-    │   └── openclaw/             ← was ~/.openclaw
-    │
+    │   └── openclaw/             # target for ~/.openclaw
     └── agent-hermes/
-        └── hermes/               ← was ~/.hermes
+        └── hermes/                # target for ~/.hermes
 ```
 
-Agents still see their expected paths (e.g., `~/.claude`) via symlinks:
+Each bundled policy grants its own root, and not the shared `~/.axis` tree. For
+example, a policy named `agent-codex` grants only:
 
+```text
+~/.axis/agents/agent-codex
 ```
-~/.claude     →  ~/.axis/agents/agent-claude-code/claude
-~/.codex      →  ~/.axis/agents/agent-codex/codex
-~/.openclaw   →  ~/.axis/agents/agent-openclaw/openclaw
+
+Granting `~/.axis` or `~/.axis/agents` would allow that policy to reach state
+owned by other policies and defeats this separation.
+
+For recognized home-directory state paths, AXIS creates aliases such as:
+
+```text
+~/.claude -> ~/.axis/agents/agent-claude-code/claude
+~/.codex  -> ~/.axis/agents/agent-codex/codex
 ```
+
+The exact setup differs for backends that use an AXIS-managed home, but the
+contained targets remain under the policy-owned state root.
 
 ### Lifecycle
 
-1. **Sandbox creation** — `prepare_agent_workspace()` runs:
-   - Creates `~/.axis/agents/<policy-name>/` directory tree
-   - If `~/.claude` already exists as a real directory, backs it up to `~/.claude.axis-backup` and copies contents to the containment dir
-   - Creates symlink: `~/.claude → ~/.axis/agents/<name>/claude`
+1. During sandbox preparation, AXIS creates the policy-owned state directories
+   needed for recognized writable home paths.
+2. If a recognized path already exists as a real directory, AXIS copies its
+   contents into the contained target, moves the original to an
+   `.axis-backup`, and installs the alias.
+3. The agent uses its expected home paths while the sandbox grants the
+   corresponding contained targets.
+4. During cleanup, AXIS removes aliases it created and restores an original
+   directory from its backup when one exists.
 
-2. **Agent runs** — the agent writes to `~/.claude` which is actually `~/.axis/agents/<name>/claude`. The agent doesn't know it's contained.
-
-3. **Sandbox destruction** — `cleanup_agent_symlinks()` runs:
-   - Removes symlinks
-   - Restores original directories from `.axis-backup` if they existed
+AXIS does not redirect every arbitrary `~/...` grant. Only supported agent
+state paths are mapped; broad user directories and unknown paths are not
+silently moved.
 
 ### Benefits
 
-| Benefit | How |
+| Benefit | Effect |
 |---|---|
-| **Auditability** | `ls ~/.axis/agents/` shows all agent state. `du -sh ~/.axis/agents/*` shows disk usage per agent. |
-| **Isolation** | Each agent policy gets its own directory. Claude can't read Codex's state. |
-| **Disposability** | `rm -rf ~/.axis/agents/agent-claude-code/` destroys all Claude state. |
-| **Backup** | Back up `~/.axis/agents/` to capture all agent state without home-dir noise. |
-| **Forensics** | After a suspected compromise, inspect `~/.axis/agents/<name>/` to see exactly what the agent wrote. |
+| Policy separation | Each policy receives a distinct state root. |
+| Auditability | Operators can inspect contained state by policy name. |
+| Disposability | Removing one policy root removes that policy's contained state. |
+| Backup | The `~/.axis/agents/` tree can be backed up independently of unrelated home-directory data. |
+| Forensics | A policy root provides a focused view of state redirected for that policy. |
 
 ### Policy Configuration
 
-In the YAML policy, `read_write` paths that start with `~/` are automatically mapped to the containment directory:
-
-```yaml
-filesystem:
-  read_write:
-    - "{workspace}"         # sandbox workspace
-    - "{tmpdir}"            # /tmp
-    - "~/.claude"           # → ~/.axis/agents/<name>/claude
-    - "~/.local/share/claude"  # → ~/.axis/agents/<name>/claude-share
-    - "~/.config"           # → ~/.axis/agents/<name>/config
-    - "~/.axis"             # containment root (always needed)
-```
-
----
-
-## SSH Key Policy
-
-### Problem
-
-AI agents often need SSH access for `git clone`, `scp`, or connecting to remote servers. But exposing `~/.ssh/` gives the agent access to **all** private keys, `known_hosts`, and SSH config — far more than needed.
-
-### Solution: Scoped SSH Key Exposure
-
-AXIS can expose specific SSH keys to the sandbox while denying access to the rest of `~/.ssh/`. The policy uses a new `ssh` section:
-
-```yaml
-# In the agent policy YAML
-ssh:
-  # Expose only specific keys (copied to sandbox, not symlinked).
-  allowed_keys:
-    - name: github-deploy
-      private_key: "~/.ssh/id_ed25519_github"
-      # Optional: restrict which hosts this key can connect to.
-      allowed_hosts:
-        - "github.com"
-        - "gitlab.com"
-
-    - name: staging-server
-      private_key: "~/.ssh/id_rsa_staging"
-      allowed_hosts:
-        - "staging.example.com"
-        - "10.0.1.*"
-
-  # Auto-generate a known_hosts file with only the allowed hosts.
-  # Prevents the agent from discovering other hosts via ~/.ssh/known_hosts.
-  generate_known_hosts: true
-
-  # SSH config restrictions.
-  # AXIS generates a minimal ~/.ssh/config that only allows the specified hosts.
-  generate_config: true
-```
-
-### How It Works
-
-1. **Key isolation**: AXIS copies (not symlinks) the specified private keys into the sandbox workspace at `.ssh/`. The sandbox's `~/.ssh/` is a contained directory, not the real one.
-
-2. **Host restriction**: AXIS generates a sandbox-local `~/.ssh/config` that uses `Match` directives to restrict which hosts each key can connect to:
-
-   ```
-   # Auto-generated by AXIS — only allowed SSH hosts
-   Host github.com gitlab.com
-       IdentityFile ~/.ssh/id_ed25519_github
-       IdentitiesOnly yes
-
-   Host staging.example.com 10.0.1.*
-       IdentityFile ~/.ssh/id_rsa_staging
-       IdentitiesOnly yes
-
-   # Block all other SSH connections
-   Host *
-       IdentityFile /dev/null
-       IdentitiesOnly yes
-   ```
-
-3. **known_hosts scoping**: AXIS generates a `known_hosts` file containing only the fingerprints of allowed hosts (obtained via `ssh-keyscan`). The agent can't discover other hosts from the user's real `known_hosts`.
-
-4. **Network policy alignment**: The SSH allowed hosts are automatically added to the proxy's network whitelist (port 22), so the agent can only SSH to the specified destinations.
-
-### Example: Claude Code with GitHub SSH
+The policy must grant its exact state root in addition to any supported aliases
+the agent expects:
 
 ```yaml
 version: 1
-name: agent-claude-code-with-ssh
+name: agent-claude-code
 
 filesystem:
   read_write:
     - "{workspace}"
+    - "{tmpdir}"
     - "~/.claude"
-    - "~/.axis"
+    - "~/.local/share/claude"
+    - "~/.config"
+    - "~/.axis/agents/agent-claude-code"
+```
+
+The final path must match `~/.axis/agents/<policy-name>` exactly. A shared AXIS
+parent is not a containment grant.
+
+## Scoped SSH Keys
+
+### Problem
+
+Some agent workflows use SSH for Git or remote access. Exposing the user's
+entire `~/.ssh/` directory would reveal every private key, the user's SSH
+configuration, and host history.
+
+### Key Scoping
+
+An `ssh` policy can select individual private keys for AXIS to copy into an
+AXIS-managed SSH directory:
+
+```yaml
+ssh:
+  allowed_keys:
+    - name: github
+      private_key: "~/.ssh/id_ed25519"
+      allowed_hosts:
+        - "github.com"
+  generate_known_hosts: true
+  generate_config: true
+```
+
+Only configured keys that exist are copied. The policy should deny the user's
+real `~/.ssh`; setup can then expose an AXIS-managed `~/.ssh` path without
+exposing the original directory or unselected keys. This is the enforced
+key-exposure boundary.
+
+`allowed_hosts`, `generate_config`, and `generate_known_hosts` configure the
+sandbox's SSH client defaults:
+
+- Generated SSH config associates copied keys with configured host patterns,
+  uses `IdentitiesOnly yes`, and provides a fallback `Host *` entry.
+- AXIS attempts to generate `known_hosts` entries for concrete configured hosts
+  without copying the user's real `known_hosts`.
+
+These generated files are convenience and defense-in-depth for clients that
+use them. They are not a network authorization boundary: a process can invoke
+SSH with different config options or use another network client.
+
+### Network Authorization
+
+SSH egress requires an explicit host and port in `network.policies`. AXIS does
+not add `ssh.allowed_keys[].allowed_hosts` to the network policy automatically.
+For GitHub SSH, the policy must include port 22 directly:
+
+```yaml
+network:
+  mode: proxy
+  policies:
+    - name: github-ssh
+      endpoints:
+        - host: "github.com"
+          port: 22
+```
+
+The SSH client configuration selects a default key for `github.com`; the
+network endpoint rule is what authorizes traffic to `github.com:22`. Omitting
+that endpoint means the SSH key policy alone does not authorize the connection.
+
+### Complete Example
+
+```yaml
+version: 1
+name: agent-claude-code-ssh
+
+filesystem:
+  read_write:
+    - "{workspace}"
+    - "{tmpdir}"
+    - "~/.claude"
+    - "~/.local/share/claude"
+    - "~/.config"
+    - "~/.axis/agents/agent-claude-code-ssh"
   deny:
-    - "~/.ssh"              # deny the REAL ~/.ssh
+    - "~/.ssh"
     - "~/.gnupg"
     - "~/.aws"
 
@@ -189,7 +206,7 @@ network:
     - name: github-ssh
       endpoints:
         - host: "github.com"
-          port: 22          # SSH added automatically from ssh.allowed_hosts
+          port: 22
     - name: github-https
       endpoints:
         - host: "github.com"
@@ -198,39 +215,29 @@ network:
           port: 443
 ```
 
-### What the Agent Sees
-
-```
-~/.ssh/                         ← AXIS-generated, not the real one
-├── config                      ← only allows github.com
-├── id_ed25519                  ← copied from real ~/.ssh/id_ed25519
-├── known_hosts                 ← only github.com fingerprints
-└── .axis-managed               ← marker file (AXIS manages this dir)
-```
-
-The agent can `git clone git@github.com:...` but cannot:
-- Read other SSH keys (`~/.ssh/id_rsa_work`, `~/.ssh/id_rsa_prod`)
-- Connect to other hosts (SSH config blocks `Host *` with `/dev/null` identity)
-- Read the real `known_hosts` (which reveals what servers the user has connected to)
-
 ### Security Properties
 
-| Property | Mechanism |
+| Property | Boundary |
 |---|---|
-| Key scoping | Only named keys are copied to sandbox |
-| Host restriction | SSH config `IdentitiesOnly yes` + proxy whitelist on port 22 |
-| No key discovery | Real `~/.ssh/` is Landlock/Seatbelt denied |
-| No host discovery | known_hosts is AXIS-generated, not copied from real |
-| Network enforcement | Proxy blocks SSH to non-whitelisted hosts |
-| Audit trail | OCSF event logged for each SSH connection through proxy |
+| Key scoping | AXIS copies only configured private keys and does not expose the user's SSH directory. |
+| SSH client defaults | Generated config selects identities for configured host patterns. |
+| Host-key data separation | Generated `known_hosts` does not copy the user's host history. |
+| Network authorization | Explicit `network.policies` host and port rules authorize SSH egress. |
+| Audit coverage | Depends on the selected backend and network path; scoped SSH does not guarantee an event for every connection. |
 
-### Alternatives Considered
+Generated SSH config must not be described as an unbypassable host restriction,
+and configured SSH hosts must not be described as automatically whitelisted.
+AXIS can emit network policy decisions on supported paths, but it does not
+provide universal per-SSH-connection auditing across every backend.
+
+### Alternatives
 
 | Approach | Drawback |
 |---|---|
-| **SSH agent forwarding** | Exposes all keys via the agent socket. Agent can use any key for any host. |
-| **Deploy keys only** | Requires separate key per repo. Doesn't cover non-GitHub SSH use. |
-| **Full ~/.ssh/ exposure** | Agent sees all keys, known_hosts, and config. |
-| **No SSH at all** | Many agent workflows require `git clone` via SSH. |
+| SSH agent forwarding | May expose every key available through the forwarded agent socket. |
+| Deploy keys only | Requires separate key management and does not cover every SSH workflow. |
+| Full `~/.ssh/` exposure | Reveals unrelated keys, config, and host history. |
+| No SSH | Prevents workflows that require SSH transport. |
 
-The AXIS approach is the most granular: per-key, per-host, with network-layer enforcement.
+Scoped key copying plus explicit network rules separates key availability from
+network authorization. Both controls are required for the intended boundary.

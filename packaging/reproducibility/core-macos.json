@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "artifactProfile": "core-macos",
+  "normalizedArchiveCompared": true,
+  "cleanBuildBinaryCompared": false,
+  "scope": "Native binary reproducibility is not asserted for the hosted macOS SDK and linker."
+}

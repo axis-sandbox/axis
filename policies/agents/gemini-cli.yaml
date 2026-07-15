@@ -15,7 +15,7 @@ filesystem:
   read_write:
     - "{workspace}"
     - "{tmpdir}"
-    - "~/.axis"
+    - "~/.axis/agents/agent-gemini-cli"
     - "~/.gemini"
     - "~/.config"
   deny:

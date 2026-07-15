@@ -1,9 +1,9 @@
 version: 1
 name: agent-claude-code-ssh
 
-# Claude Code with scoped SSH access (GitHub only).
-# The agent can git clone/push via SSH to github.com but cannot
-# access other SSH keys or connect to other hosts.
+# Claude Code with a scoped SSH key for GitHub.
+# The explicit github.com:22 network endpoint authorizes SSH egress;
+# generated SSH client files select the copied key but are not a network boundary.
 
 filesystem:
   read_only:
@@ -22,7 +22,7 @@ filesystem:
     - "~/.claude"
     - "~/.local/share/claude"
     - "~/.config"
-    - "~/.axis"
+    - "~/.axis/agents/agent-claude-code-ssh"
   deny:
     - "~/.ssh"
     - "~/.gnupg"

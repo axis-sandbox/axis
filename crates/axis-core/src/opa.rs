@@ -3,11 +3,11 @@
 
 //! OPA/Rego policy engine wrapper using the `regorus` crate.
 //!
-//! Evaluates policy decisions for sandbox creation, network connections,
-//! L7 HTTP requests, and inference routing.
+//! Evaluates policy decisions for sandbox creation, network connections, and
+//! inference routing.
 
 use crate::policy::Policy;
-use crate::types::{HttpAction, InferenceAction, NetworkAction, PolicyDecision};
+use crate::types::{InferenceAction, NetworkAction, PolicyDecision};
 use thiserror::Error;
 
 /// Baked-in Rego rules for AXIS policy evaluation.
@@ -55,12 +55,6 @@ impl PolicyEngine {
     pub fn eval_network(&mut self, action: &NetworkAction) -> Result<PolicyDecision, OpaError> {
         let input_json = serde_json::to_string(action)?;
         self.eval_query("data.axis.network.decision", &input_json)
-    }
-
-    /// Evaluate whether an L7 HTTP request should be allowed.
-    pub fn eval_http(&mut self, action: &HttpAction) -> Result<PolicyDecision, OpaError> {
-        let input_json = serde_json::to_string(action)?;
-        self.eval_query("data.axis.http.decision", &input_json)
     }
 
     /// Evaluate inference routing for a request.
@@ -126,7 +120,7 @@ network:
       endpoints:
         - host: "pypi.org"
           port: 443
-          access: read-only
+          access: read-write
 inference:
   default_provider: local-rocm
   routes:

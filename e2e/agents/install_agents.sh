@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 # AXIS Agent Installer
 #
 # Installs agent runtimes into ~/.axis/tools/.
@@ -165,7 +168,7 @@ install_codex() {
         npm install --prefix "$dir" @openai/codex 2>&1 | tail -3
         echo "$dir/node_modules/.bin/codex"
     elif command -v codex >/dev/null 2>&1; then
-        echo "$(which codex)"
+        command -v codex
     else
         echo "npm not found, cannot install codex" >&2
         return 1
@@ -182,7 +185,7 @@ install_openclaw() {
         npm install --prefix "$dir" openclaw@latest 2>&1 | tail -3
         echo "$dir/node_modules/.bin/openclaw"
     elif command -v openclaw >/dev/null 2>&1; then
-        echo "$(which openclaw)"
+        command -v openclaw
     else
         echo "npm not found" >&2
         return 1
@@ -200,7 +203,7 @@ install_ironclaw() {
         chmod +x "$dir/ironclaw"
         echo "$dir/ironclaw"
     elif command -v ironclaw >/dev/null 2>&1; then
-        echo "$(which ironclaw)"
+        command -v ironclaw
     else
         echo "Download failed" >&2
         return 1
@@ -218,7 +221,7 @@ install_aider() {
         "$dir/venv/bin/pip" install -q aider-chat 2>&1 | tail -3
         echo "$dir/venv/bin/aider"
     elif command -v aider >/dev/null 2>&1; then
-        echo "$(which aider)"
+        command -v aider
     else
         echo "python3 not found" >&2
         return 1
@@ -230,16 +233,17 @@ install_goose() {
     sys_bin=$(try_system_binary "goose") && { echo "$sys_bin"; return 0; }
 
     local dir="$TOOLS_DIR/goose"
+    local bin
     mkdir -p "$dir"
     if [ "$OS" = "darwin" ] && command -v brew >/dev/null 2>&1; then
         brew install block-goose-cli 2>&1 | tail -3
-        echo "$(which goose)"
+        command -v goose
     else
         curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh \
             | INSTALL_DIR="$dir" bash 2>&1 || true
-        local bin=$(find "$dir" -name "goose" -type f 2>/dev/null | head -1)
+        bin=$(find "$dir" -name "goose" -type f 2>/dev/null | head -1)
         if [ -z "$bin" ] && command -v goose >/dev/null 2>&1; then
-            bin="$(which goose)"
+            bin="$(command -v goose)"
         fi
         echo "$bin"
     fi
@@ -257,7 +261,7 @@ install_gemini_cli() {
         if [ -x "$bin" ]; then echo "$bin"; return 0; fi
     fi
     if command -v gemini >/dev/null 2>&1; then
-        echo "$(which gemini)"
+        command -v gemini
     fi
 }
 
@@ -273,7 +277,7 @@ install_opencode() {
         if [ -x "$bin" ]; then echo "$bin"; return 0; fi
     fi
     if command -v opencode >/dev/null 2>&1; then
-        echo "$(which opencode)"
+        command -v opencode
     fi
 }
 

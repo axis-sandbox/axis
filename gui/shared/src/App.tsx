@@ -1,3 +1,6 @@
+// Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 import { createSignal, Show } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
 import { Terminal } from "./components/Terminal";
