@@ -754,12 +754,12 @@ class WorkflowStructureTests(unittest.TestCase):
             verifier.verify_security_workflow(matrix)
 
         rewired = copy.deepcopy(self.security)
-        rewired["jobs"]["publication-gate"]["needs"].remove("python-sast")
+        rewired["jobs"]["publication-gate"]["needs"].remove("secret-scan")
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong dependencies"):
             verifier.verify_security_workflow(rewired)
 
         continued = copy.deepcopy(self.security)
-        self.find_step(continued, "python-sast", "Scan Python sources")[
+        self.find_step(continued, "secret-scan", "Scan branch history with Gitleaks")[
             "continue-on-error"
         ] = True
         with self.assertRaisesRegex(verifier.WorkflowError, "continue on error"):
@@ -778,7 +778,7 @@ class WorkflowStructureTests(unittest.TestCase):
                 verifier.verify_security_workflow(gate)
 
         topology = copy.deepcopy(self.security)
-        topology["jobs"]["python-sast"]["defaults"] = {"run": {"shell": "true"}}
+        topology["jobs"]["secret-scan"]["defaults"] = {"run": {"shell": "true"}}
         with self.assertRaisesRegex(verifier.WorkflowError, "execution defaults"):
             verifier.verify_security_workflow(topology)
 
@@ -786,6 +786,65 @@ class WorkflowStructureTests(unittest.TestCase):
         workflow_defaults["defaults"] = {"run": {"shell": "bash {0} || true"}}
         with self.assertRaisesRegex(verifier.WorkflowError, "execution defaults"):
             verifier.verify_security_workflow(workflow_defaults)
+
+    def test_rejects_diluted_security_scans(self):
+        unhashed_bandit = copy.deepcopy(self.security)
+        self.find_step(unhashed_bandit, "python-sast", "Install Bandit")["run"] = (
+            "python -m pip install --disable-pip-version-check "
+            "-r .github/security-requirements.txt"
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "not exact"):
+            verifier.verify_security_workflow(unhashed_bandit)
+
+        incomplete_bandit = copy.deepcopy(self.security)
+        scan = self.find_step(incomplete_bandit, "python-sast", "Scan Python sources")
+        scan["run"] = scan["run"].replace(
+            " scripts/verify_release_archive.py", ""
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "not exact"):
+            verifier.verify_security_workflow(incomplete_bandit)
+
+        shallow = copy.deepcopy(self.security)
+        shallow["jobs"]["secret-scan"]["steps"][0]["with"]["fetch-depth"] = 1
+        with self.assertRaisesRegex(verifier.WorkflowError, "exact reviewed step"):
+            verifier.verify_security_workflow(shallow)
+
+        floating_go = copy.deepcopy(self.security)
+        floating_go["jobs"]["secret-scan"]["steps"][1]["with"]["go-version"] = (
+            "1.25.x"
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "exact reviewed step"):
+            verifier.verify_security_workflow(floating_go)
+
+        nonblocking_gitleaks = copy.deepcopy(self.security)
+        self.find_step(
+            nonblocking_gitleaks,
+            "secret-scan",
+            "Scan branch history with Gitleaks",
+        )["run"] = (
+            "go run github.com/zricethezav/gitleaks/v8@v8.30.1 git "
+            "--log-opts=HEAD --redact --no-banner --exit-code 0 ."
+        )
+        with self.assertRaisesRegex(verifier.WorkflowError, "not exact"):
+            verifier.verify_security_workflow(nonblocking_gitleaks)
+
+        sarif_only_zizmor = copy.deepcopy(self.security)
+        self.find_step(
+            sarif_only_zizmor,
+            "actions-security",
+            "Audit workflows with Zizmor",
+        )["with"]["advanced-security"] = True
+        with self.assertRaisesRegex(verifier.WorkflowError, "exact reviewed step"):
+            verifier.verify_security_workflow(sarif_only_zizmor)
+
+        high_only_zizmor = copy.deepcopy(self.security)
+        self.find_step(
+            high_only_zizmor,
+            "actions-security",
+            "Audit workflows with Zizmor",
+        )["with"]["min-severity"] = "high"
+        with self.assertRaisesRegex(verifier.WorkflowError, "exact reviewed step"):
+            verifier.verify_security_workflow(high_only_zizmor)
 
     def test_rejects_nightly_gate_bypass_and_echoed_clean_build(self):
         gate_bypass = copy.deepcopy(self.nightly)

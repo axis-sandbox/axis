@@ -184,6 +184,43 @@ jobs:
           scripts/release_tools.py
           scripts/verify_release_archive.py
 
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.25.12"
+
+      - name: Scan branch history with Gitleaks
+        run: >-
+          go run github.com/zricethezav/gitleaks/v8@v8.30.1 git
+          --log-opts=HEAD --redact --no-banner --exit-code 1 .
+
+  actions-security:
+    name: GitHub Actions security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Audit workflows with Zizmor
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          advanced-security: false
+          min-severity: medium
+          online-audits: false
+          persona: regular
+          version: 1.26.1
+
   publication-gate:
     name: Security publication gate
     needs:
@@ -192,6 +229,8 @@ jobs:
       - dependency-audit
       - windows-nuget-audit
       - python-sast
+      - secret-scan
+      - actions-security
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -203,9 +242,12 @@ jobs:
           AUDIT_RESULT: ${{ needs.dependency-audit.result }}
           NUGET_RESULT: ${{ needs.windows-nuget-audit.result }}
           SAST_RESULT: ${{ needs.python-sast.result }}
+          SECRETS_RESULT: ${{ needs.secret-scan.result }}
+          ACTIONS_RESULT: ${{ needs.actions-security.result }}
         run: |
           set -euo pipefail
           for result in "$CODEQL_RESULT" "$SWIFT_RESULT" "$AUDIT_RESULT" \
-            "$NUGET_RESULT" "$SAST_RESULT"; do
+            "$NUGET_RESULT" "$SAST_RESULT" "$SECRETS_RESULT" \
+            "$ACTIONS_RESULT"; do
             test "$result" = success
           done

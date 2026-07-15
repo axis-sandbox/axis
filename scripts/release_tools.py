@@ -61,6 +61,8 @@ REQUIRED_WORKFLOW_JOB_NAMES = {
         "Dependency audit",
         "Windows NuGet audit",
         "Python SAST",
+        "Secret scan",
+        "GitHub Actions security",
         "Security publication gate",
     },
 }

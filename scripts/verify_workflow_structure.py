@@ -23,6 +23,9 @@ ATTEST_ACTION = "actions/attest@a1948c3f048ba23858d222213b7c278aabede763"
 CHECKOUT_ACTION = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
 NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"
 RUST_ACTION = "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30"
+GO_ACTION = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
+PYTHON_ACTION = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+ZIZMOR_ACTION = "zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d"
 GUI_WORKFLOW = "./.github/workflows/gui-release.yml"
 SBOM_COMMAND = [
     "scripts/generate_release_sboms.sh",
@@ -132,6 +135,8 @@ SECURITY_JOBS = {
     "dependency-audit",
     "windows-nuget-audit",
     "python-sast",
+    "secret-scan",
+    "actions-security",
     "publication-gate",
 }
 ALWAYS_CONDITION = "${{ always() }}"
@@ -1753,6 +1758,8 @@ def verify_security_workflow(workflow: dict[str, Any]) -> None:
         "dependency-audit": "Dependency audit",
         "windows-nuget-audit": "Windows NuGet audit",
         "python-sast": "Python SAST",
+        "secret-scan": "Secret scan",
+        "actions-security": "GitHub Actions security",
         "publication-gate": "Security publication gate",
     }
     expected_runtime = {
@@ -1770,6 +1777,8 @@ def verify_security_workflow(workflow: dict[str, Any]) -> None:
         "dependency-audit": ("ubuntu-24.04", 20, None),
         "windows-nuget-audit": ("windows-latest", 15, None),
         "python-sast": ("ubuntu-24.04", 10, None),
+        "secret-scan": ("ubuntu-24.04", 15, None),
+        "actions-security": ("ubuntu-24.04", 10, None),
         "publication-gate": ("ubuntu-24.04", 5, None),
     }
     for job_name, expected_name in expected_names.items():
@@ -1818,10 +1827,13 @@ def verify_security_workflow(workflow: dict[str, Any]) -> None:
             "AUDIT_RESULT": "${{ needs.dependency-audit.result }}",
             "NUGET_RESULT": "${{ needs.windows-nuget-audit.result }}",
             "SAST_RESULT": "${{ needs.python-sast.result }}",
+            "SECRETS_RESULT": "${{ needs.secret-scan.result }}",
+            "ACTIONS_RESULT": "${{ needs.actions-security.result }}",
         },
         """set -euo pipefail
 for result in "$CODEQL_RESULT" "$SWIFT_RESULT" "$AUDIT_RESULT" \\
-  "$NUGET_RESULT" "$SAST_RESULT"; do
+  "$NUGET_RESULT" "$SAST_RESULT" "$SECRETS_RESULT" \\
+  "$ACTIONS_RESULT"; do
   test "$result" = success
 done
 """,
@@ -1831,6 +1843,135 @@ done
         require_job(workflow, "dependency-review"),
         "Reject vulnerable dependency changes",
         "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294",
+    )
+    python_sast = require_job(workflow, "python-sast")
+    bandit_install_step = {
+        "name": "Install Bandit",
+        "run": (
+            "python -m pip install --disable-pip-version-check --require-hashes "
+            "-r .github/security-requirements.txt"
+        ),
+    }
+    require_exact_command_step(
+        python_sast,
+        bandit_install_step,
+        [
+            "python",
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--require-hashes",
+            "-r",
+            ".github/security-requirements.txt",
+        ],
+        "Bandit installation step",
+    )
+    bandit_scan_step = {
+        "name": "Scan Python sources",
+        "run": (
+            "bandit --severity-level high --confidence-level high --quiet "
+            "e2e/linux/test_hip_sandbox.py scripts/bounded_subprocess.py "
+            "scripts/bounded_tar.py scripts/generate_third_party_notices.py "
+            "scripts/release_tools.py scripts/verify_release_archive.py"
+        ),
+    }
+    require_exact_command_step(
+        python_sast,
+        bandit_scan_step,
+        [
+            "bandit",
+            "--severity-level",
+            "high",
+            "--confidence-level",
+            "high",
+            "--quiet",
+            "e2e/linux/test_hip_sandbox.py",
+            "scripts/bounded_subprocess.py",
+            "scripts/bounded_tar.py",
+            "scripts/generate_third_party_notices.py",
+            "scripts/release_tools.py",
+            "scripts/verify_release_archive.py",
+        ],
+        "Bandit scan step",
+    )
+    require_exact_job_steps(
+        python_sast,
+        [
+            {
+                "uses": CHECKOUT_ACTION,
+                "with": {"persist-credentials": False},
+            },
+            {
+                "uses": PYTHON_ACTION,
+                "with": {
+                    "python-version": "3.12",
+                    "cache": "pip",
+                    "cache-dependency-path": ".github/security-requirements.txt",
+                },
+            },
+            bandit_install_step,
+            bandit_scan_step,
+        ],
+        "Bandit scan job",
+    )
+    secret_scan = require_job(workflow, "secret-scan")
+    gitleaks_step = {
+        "name": "Scan branch history with Gitleaks",
+        "run": (
+            "go run github.com/zricethezav/gitleaks/v8@v8.30.1 git "
+            "--log-opts=HEAD --redact --no-banner --exit-code 1 ."
+        ),
+    }
+    require_exact_command_step(
+        secret_scan,
+        gitleaks_step,
+        [
+            "go",
+            "run",
+            "github.com/zricethezav/gitleaks/v8@v8.30.1",
+            "git",
+            "--log-opts=HEAD",
+            "--redact",
+            "--no-banner",
+            "--exit-code",
+            "1",
+            ".",
+        ],
+        "Gitleaks scan step",
+    )
+    require_exact_job_steps(
+        secret_scan,
+        [
+            {
+                "uses": CHECKOUT_ACTION,
+                "with": {"fetch-depth": 0, "persist-credentials": False},
+            },
+            {"uses": GO_ACTION, "with": {"go-version": "1.25.12"}},
+            gitleaks_step,
+        ],
+        "Gitleaks scan job",
+    )
+    require_exact_job_steps(
+        require_job(workflow, "actions-security"),
+        [
+            {
+                "uses": CHECKOUT_ACTION,
+                "with": {"persist-credentials": False},
+            },
+            {
+                "name": "Audit workflows with Zizmor",
+                "uses": ZIZMOR_ACTION,
+                "with": {
+                    "advanced-security": False,
+                    "min-severity": "medium",
+                    "online-audits": False,
+                    "persona": "regular",
+                    "version": "1.26.1",
+                },
+            },
+        ],
+        "Zizmor audit job",
     )
     for job_name in ("codeql", "codeql-swift"):
         require_action_step(
