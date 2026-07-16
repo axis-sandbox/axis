@@ -151,6 +151,61 @@ class WorkflowStructureTests(unittest.TestCase):
             ):
                 verifier.verify_security_workflow(security)
 
+    def test_ci_change_detection_requires_complete_noncredentialed_checkout(self):
+        mutations = (
+            ("fetch-depth", None),
+            ("fetch-depth", 1),
+            ("persist-credentials", True),
+        )
+        for key, value in mutations:
+            ci = copy.deepcopy(self.ci)
+            checkout = ci["jobs"]["changes"]["steps"][0]["with"]
+            if value is None:
+                del checkout[key]
+            else:
+                checkout[key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(
+                verifier.WorkflowError, "complete history"
+            ):
+                verifier.verify_ci_workflow(ci)
+
+    def test_ci_change_detection_requires_local_git_without_api_token(self):
+        mutations = []
+
+        missing_step = copy.deepcopy(self.ci)
+        del missing_step["jobs"]["changes"]["steps"][1]
+        mutations.append(("missing step", missing_step))
+
+        wrong_action = copy.deepcopy(self.ci)
+        wrong_action["jobs"]["changes"]["steps"][1][
+            "uses"
+        ] = verifier.CHECKOUT_ACTION
+        mutations.append(("wrong action", wrong_action))
+
+        missing_id = copy.deepcopy(self.ci)
+        del missing_id["jobs"]["changes"]["steps"][1]["id"]
+        mutations.append(("missing id", missing_id))
+
+        malformed_inputs = copy.deepcopy(self.ci)
+        malformed_inputs["jobs"]["changes"]["steps"][1]["with"] = []
+        mutations.append(("malformed inputs", malformed_inputs))
+
+        missing_token = copy.deepcopy(self.ci)
+        del missing_token["jobs"]["changes"]["steps"][1]["with"]["token"]
+        mutations.append(("missing token", missing_token))
+
+        api_token = copy.deepcopy(self.ci)
+        api_token["jobs"]["changes"]["steps"][1]["with"][
+            "token"
+        ] = "${{ github.token }}"
+        mutations.append(("API token", api_token))
+
+        for label, ci in mutations:
+            with self.subTest(mutation=label), self.assertRaisesRegex(
+                verifier.WorkflowError, "local git history"
+            ):
+                verifier.verify_ci_workflow(ci)
+
     def test_rejects_command_text_that_is_not_executed(self):
         document = copy.deepcopy(self.release)
         step = self.find_step(

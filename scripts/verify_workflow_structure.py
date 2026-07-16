@@ -21,11 +21,12 @@ import yaml
 
 ATTEST_ACTION = "actions/attest@a1948c3f048ba23858d222213b7c278aabede763"
 CHECKOUT_ACTION = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+PATHS_FILTER_ACTION = "dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050"
 NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"
 RUST_ACTION = "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30"
 GO_ACTION = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
 PYTHON_ACTION = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
-ZIZMOR_ACTION = "zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d"
+ZIZMOR_ACTION = "zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02"
 GUI_WORKFLOW = "./.github/workflows/gui-release.yml"
 SBOM_COMMAND = [
     "scripts/generate_release_sboms.sh",
@@ -1575,6 +1576,32 @@ def verify_ci_workflow(workflow: dict[str, Any]) -> None:
         "changes",
     ):
         require_needs(require_job(workflow, job_name), set(), f"CI {job_name} job")
+    changes = require_job(workflow, "changes")
+    expected_changes_checkout = {
+        "uses": CHECKOUT_ACTION,
+        "with": {"fetch-depth": 0, "persist-credentials": False},
+    }
+    changes_steps = changes.get("steps")
+    if not isinstance(changes_steps, list) or changes_steps[:1] != [
+        expected_changes_checkout
+    ]:
+        raise WorkflowError(
+            "CI change detection checkout must fetch complete history without "
+            "persisting credentials"
+        )
+    if len(changes_steps) < 2:
+        raise WorkflowError("CI change detection must use local git history")
+    filter_step = changes_steps[1]
+    filter_inputs = filter_step.get("with")
+    if (
+        filter_step.get("uses") != PATHS_FILTER_ACTION
+        or filter_step.get("id") != "filter"
+        or not isinstance(filter_inputs, dict)
+        or filter_inputs.get("token") != ""
+    ):
+        raise WorkflowError(
+            "CI change detection must use local git history without an API token"
+        )
     for job_name in (
         "test-linux",
         "test-macos",
