@@ -108,6 +108,49 @@ class WorkflowStructureTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.WorkflowError, "wrong permissions"):
             verifier.verify_release_workflow(permissions)
 
+    def test_release_commands_require_bounded_process_supervision(self):
+        cases = (
+            (self.release, verifier.verify_release_workflow, "identity"),
+            (self.release, verifier.verify_release_workflow, "gate"),
+            (self.release, verifier.verify_release_workflow, "release"),
+            (self.nightly, verifier.verify_nightly_workflow, "source"),
+            (self.nightly, verifier.verify_nightly_workflow, "gate"),
+            (self.nightly, verifier.verify_nightly_workflow, "publish"),
+        )
+        for original, verify, job_name in cases:
+            missing_setup = copy.deepcopy(original)
+            setup = self.find_step(
+                missing_setup, job_name, "Install release process supervisor"
+            )
+            missing_setup["jobs"][job_name]["steps"].remove(setup)
+            with self.subTest(job=job_name, mutation="setup"), self.assertRaisesRegex(
+                verifier.WorkflowError, "process supervisor"
+            ):
+                verify(missing_setup)
+
+            disabled_restore = copy.deepcopy(original)
+            self.find_step(
+                disabled_restore, job_name, "Restore release process supervisor"
+            )["if"] = False
+            with self.subTest(
+                job=job_name, mutation="restore"
+            ), self.assertRaisesRegex(verifier.WorkflowError, "condition"):
+                verify(disabled_restore)
+
+    def test_ci_and_codeql_jobs_require_read_only_metadata_permissions(self):
+        ci = copy.deepcopy(self.ci)
+        del ci["jobs"]["changes"]["permissions"]["pull-requests"]
+        with self.assertRaisesRegex(verifier.WorkflowError, "wrong permissions"):
+            verifier.verify_ci_workflow(ci)
+
+        for job_name in ("codeql", "codeql-swift"):
+            security = copy.deepcopy(self.security)
+            del security["jobs"][job_name]["permissions"]["actions"]
+            with self.subTest(job=job_name), self.assertRaisesRegex(
+                verifier.WorkflowError, "wrong permissions"
+            ):
+                verifier.verify_security_workflow(security)
+
     def test_rejects_command_text_that_is_not_executed(self):
         document = copy.deepcopy(self.release)
         step = self.find_step(

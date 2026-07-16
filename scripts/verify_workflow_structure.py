@@ -53,6 +53,35 @@ WORKFLOW_REVALIDATION_ARGV = [
     "--workflow",
     "security.yml",
 ]
+RELEASE_SUPERVISOR_SETUP_RUN = """set -euo pipefail
+sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap
+if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+  userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+  test "$userns_restriction" = "1"
+  printf '%s\\n' "$userns_restriction" > "$RUNNER_TEMP/axis-release-apparmor-userns"
+  sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+fi
+bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
+"""
+RELEASE_SUPERVISOR_SETUP_STEP = {
+    "name": "Install release process supervisor",
+    "timeout-minutes": 5,
+    "run": RELEASE_SUPERVISOR_SETUP_RUN,
+}
+RELEASE_SUPERVISOR_RESTORE_RUN = """set -euo pipefail
+state="$RUNNER_TEMP/axis-release-apparmor-userns"
+if [ -f "$state" ]; then
+  sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+  rm -f "$state"
+fi
+"""
+RELEASE_SUPERVISOR_RESTORE_STEP = {
+    "name": "Restore release process supervisor",
+    "if": "${{ always() }}",
+    "timeout-minutes": 2,
+    "run": RELEASE_SUPERVISOR_RESTORE_RUN,
+}
 COMMON_RELEASE_ENVIRONMENT = {
     "SOURCE_DATE_EPOCH": "315532800",
     "RUST_TOOLCHAIN": "1.95.0",
@@ -91,25 +120,25 @@ NIGHTLY_JOBS = {
 GUI_JOBS = {"build-frontend", "build-macos", "build-linux", "build-windows"}
 # Canonical job digests cover every field and preserve ordered step lists.
 EXACT_RELEASE_JOB_DIGESTS = {
-    "identity": "efe85eb1f638e95d48bdc9b75189b07b2471523b246104499f9c0d74e6031efa",
-    "gate": "08bf398f811f1b822c18aefb626911ccb9a8353692a0444e38f0458e033bfb7c",
+    "identity": "05735ee8c1cc6d84a864dd6af4b64ba42bf28212ec00684bf459debdf25e769a",
+    "gate": "19bc28d632fa6e42ae6c36e3a50c1e11ad77e01d60e848ae6ec9a0b757ba81e1",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
     "build": "6f5da916d56c27c467cbf58eca9df3ac0b0140cbfb405146f8ad9515ebb15d65",
     "package-linux": "4ce896e982fd69d5455b6aa361cf949207384c11d73100e0f41ef7bd7b9839ad",
     "sbom": "b190f1d6383a35219aef49f631c6e5f76a063fcc80c3dce4d1974ade86019bd9",
     "checksums": "8bdb3588e2f3cd78b7dd260468d195a7073b691768c05633847568d40cf72ed1",
     "attest": "d20312d6e8cbfaad5460e151cb5b4d86e9a8d12c6fe93fd51546bb54837903dc",
-    "release": "439f1600c09c49f730dff4f56b450ddb1e7a1d8bcebf5c3c8e4bb8567c36df28",
+    "release": "a2c5e7112b67398928b8d8cfaabf3265ceb2a1c9d64cdcbdfdb8144f31f6cd30",
 }
 EXACT_NIGHTLY_JOB_DIGESTS = {
-    "source": "39f951a77aa65045095f5f0ae32bd283746822c668f1d05a9a9b7e8d70775bd4",
-    "gate": "22a9ffdf0568d78134f6a3e94b914759bedc95463ef7959eea1e556b58193bd5",
+    "source": "610e1d3697303b3929c176524d63b57d773cf3c54e048f7c2c748538d9d7ee8b",
+    "gate": "b9848a04b1489697a31aacdf6a8af778533c98e535a52c4d0a7b7767d6609e07",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
     "build": "07e0d0966499a02af95c6daf8f3f8472653b889148320549d4217a93d200e3ab",
     "sbom": "39aa01781a2f15ab42742c711974680099c9bf4ee0b9d5b079d7f7fffe75c0ae",
     "checksums": "e0ffa207884b568f7f99226aab32e0ad72417ec9d734fb0c4f77444ddbb78232",
     "attest": "41efe2b79e4796f4931b033ef0b2e87f7ec6b92e30c137471a795861a9cab8d5",
-    "publish": "9759ae707a94ae2f2a172508b4a74bcfa1a1e3f1f9152cfa62994b94e01b7195",
+    "publish": "95b186262694bfc7b3add9e6b00ad9fa3b8acd753ed939171c58465dd5a2c040",
 }
 EXACT_GUI_JOB_DIGESTS = {
     "build-frontend": "bb570d4ee04233ad829af7969e0098c050ae2acd41299735bc59674a32489a3f",
@@ -516,6 +545,17 @@ def require_permissions(
         raise WorkflowError(
             f"{label} has wrong permissions: expected {expected}, got {actual}"
         )
+
+
+def require_release_process_supervisor(job: dict[str, Any], label: str) -> None:
+    setup = require_step(job, "Install release process supervisor")
+    if setup != RELEASE_SUPERVISOR_SETUP_STEP:
+        raise WorkflowError(f"{label} has an invalid process supervisor setup")
+    restore = require_step(
+        job, "Restore release process supervisor", condition=ALWAYS_CONDITION
+    )
+    if restore != RELEASE_SUPERVISOR_RESTORE_STEP:
+        raise WorkflowError(f"{label} has an invalid process supervisor restoration")
 
 
 def require_environment(
@@ -973,7 +1013,8 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
         require_unconditional_job(require_job(workflow, job_name), f"{job_name} job")
 
     identity = require_job(workflow, "identity")
-    require_job_runtime(identity, "ubuntu-24.04", 5, "release identity job")
+    require_job_runtime(identity, "ubuntu-24.04", 10, "release identity job")
+    require_release_process_supervisor(identity, "release identity job")
     identity_run = (
         "python3 scripts/release_tools.py verify-identity --repository-root . "
         '--tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA"'
@@ -1009,7 +1050,9 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
                     "persist-credentials": False,
                 },
             },
+            RELEASE_SUPERVISOR_SETUP_STEP,
             identity_step,
+            RELEASE_SUPERVISOR_RESTORE_STEP,
         ],
         "release identity job",
     )
@@ -1022,6 +1065,7 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
         "release gate job",
         {"actions": "read", "contents": "read"},
     )
+    require_release_process_supervisor(gate, "release gate job")
     gate_run = (
         "python3 scripts/release_tools.py verify-workflows "
         '--repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" '
@@ -1060,7 +1104,9 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
                     "persist-credentials": False,
                 },
             },
+            RELEASE_SUPERVISOR_SETUP_STEP,
             gate_step,
+            RELEASE_SUPERVISOR_RESTORE_STEP,
         ],
         "release gate job",
     )
@@ -1149,6 +1195,7 @@ def verify_release_workflow(workflow: dict[str, Any]) -> None:
         {"gate", "build", "package-linux", "gui", "sbom", "checksums", "attest"},
         "release publication job",
     )
+    require_release_process_supervisor(publish, "release publication job")
     require_permissions(
         publish,
         {"actions": "read", "contents": "write"},
@@ -1200,7 +1247,8 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
     for job_name in ("source", "gate", "sbom", "checksums", "attest", "publish"):
         require_unconditional_job(require_job(workflow, job_name), f"{job_name} job")
     source = require_job(workflow, "source")
-    require_job_runtime(source, "ubuntu-24.04", 5, "nightly source job")
+    require_job_runtime(source, "ubuntu-24.04", 10, "nightly source job")
+    require_release_process_supervisor(source, "nightly source job")
     source_run = (
         "python3 scripts/release_tools.py verify-default-source "
         '--repository-root . --repository "$GITHUB_REPOSITORY" '
@@ -1240,7 +1288,9 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
                     "persist-credentials": False,
                 },
             },
+            RELEASE_SUPERVISOR_SETUP_STEP,
             source_step,
+            RELEASE_SUPERVISOR_RESTORE_STEP,
         ],
         "nightly source job",
     )
@@ -1253,6 +1303,7 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
         "nightly gate job",
         {"actions": "read", "contents": "read"},
     )
+    require_release_process_supervisor(gate, "nightly gate job")
     gate_run = (
         "python3 scripts/release_tools.py verify-workflows "
         '--repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" '
@@ -1291,7 +1342,9 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
                     "persist-credentials": False,
                 },
             },
+            RELEASE_SUPERVISOR_SETUP_STEP,
             gate_step,
+            RELEASE_SUPERVISOR_RESTORE_STEP,
         ],
         "nightly gate job",
     )
@@ -1338,6 +1391,7 @@ def verify_nightly_workflow(workflow: dict[str, Any]) -> None:
         {"source", "gate", "build", "gui", "sbom", "checksums", "attest"},
         "nightly publication job",
     )
+    require_release_process_supervisor(publish, "nightly publication job")
     require_permissions(
         publish,
         {"actions": "read", "contents": "write"},
@@ -1477,14 +1531,18 @@ def verify_ci_workflow(workflow: dict[str, Any]) -> None:
         "publication-gate": "CI publication gate",
     }
     expected_runtime = {
-        "format": ("ubuntu-24.04", 10),
-        "clippy": ("ubuntu-24.04", 20),
-        "changes": ("ubuntu-24.04", 5),
-        "test-linux": ("ubuntu-24.04", 60),
-        "test-macos": ("macos-14", 45),
-        "test-linux-netns-helper": ("ubuntu-24.04", 30),
-        "test-windows": ("windows-2022", 45),
-        "publication-gate": ("ubuntu-24.04", 5),
+        "format": ("ubuntu-24.04", 10, None),
+        "clippy": ("ubuntu-24.04", 20, None),
+        "changes": (
+            "ubuntu-24.04",
+            5,
+            {"contents": "read", "pull-requests": "read"},
+        ),
+        "test-linux": ("ubuntu-24.04", 60, None),
+        "test-macos": ("macos-14", 45, None),
+        "test-linux-netns-helper": ("ubuntu-24.04", 30, None),
+        "test-windows": ("windows-2022", 45, None),
+        "publication-gate": ("ubuntu-24.04", 5, None),
     }
     for job_name, expected_name in expected_names.items():
         job = require_job(workflow, job_name)
@@ -1495,8 +1553,10 @@ def verify_ci_workflow(workflow: dict[str, Any]) -> None:
             require_unconditional_job(job, f"CI {job_name} job")
         require_no_strategy(job, f"CI {job_name} job")
         if job_name != "gui-release-validation":
-            runner, timeout = expected_runtime[job_name]
-            require_job_runtime(job, runner, timeout, f"CI {job_name} job")
+            runner, timeout, permissions = expected_runtime[job_name]
+            require_job_runtime(
+                job, runner, timeout, f"CI {job_name} job", permissions
+            )
             reject_step_bypasses(job, f"CI {job_name} job")
 
     gui = require_job(workflow, "gui-release-validation")
@@ -1766,12 +1826,12 @@ def verify_security_workflow(workflow: dict[str, Any]) -> None:
         "codeql": (
             "ubuntu-24.04",
             30,
-            {"contents": "read", "security-events": "write"},
+            {"actions": "read", "contents": "read", "security-events": "write"},
         ),
         "codeql-swift": (
             "macos-14",
             30,
-            {"contents": "read", "security-events": "write"},
+            {"actions": "read", "contents": "read", "security-events": "write"},
         ),
         "dependency-review": ("ubuntu-24.04", 10, None),
         "dependency-audit": ("ubuntu-24.04", 20, None),

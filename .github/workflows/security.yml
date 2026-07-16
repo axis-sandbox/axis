@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       security-events: write # upload CodeQL results
     strategy:
@@ -50,6 +51,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       security-events: write # upload CodeQL results
     steps:

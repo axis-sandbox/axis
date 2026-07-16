@@ -26,19 +26,42 @@ jobs:
   identity:
     name: Verify release identity
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Install release process supervisor
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap
+          if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-release-apparmor-userns"
+            sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
       - name: Bind tag, version, and commit
         run: >-
           python3 scripts/release_tools.py verify-identity
           --repository-root .
           --tag "$GITHUB_REF_NAME"
           --sha "$GITHUB_SHA"
+      - name: Restore release process supervisor
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/axis-release-apparmor-userns"
+          if [ -f "$state" ]; then
+            sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi
 
   gate:
     name: Verify required workflow results
@@ -53,6 +76,19 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Install release process supervisor
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap
+          if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-release-apparmor-userns"
+            sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
       - name: Require successful CI and security runs for the release commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -62,6 +98,16 @@ jobs:
           --sha "$GITHUB_SHA"
           --workflow ci.yml
           --workflow security.yml
+      - name: Restore release process supervisor
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/axis-release-apparmor-userns"
+          if [ -f "$state" ]; then
+            sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi
 
   gui:
     name: GUI release artifacts
@@ -482,6 +528,19 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Install release process supervisor
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y bubblewrap
+          if ! bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true; then
+            userns_restriction="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+            test "$userns_restriction" = "1"
+            printf '%s\n' "$userns_restriction" > "$RUNNER_TEMP/axis-release-apparmor-userns"
+            sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / -- true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: axis-*
@@ -527,3 +586,14 @@ jobs:
           done < <(find artifacts -type f -print0)
           scripts/publish_github_release.sh \
             stable "$RELEASE_TAG" publish-assets "$RELEASE_TAG"
+
+      - name: Restore release process supervisor
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/axis-release-apparmor-userns"
+          if [ -f "$state" ]; then
+            sudo -n sysctl -q -w "kernel.apparmor_restrict_unprivileged_userns=$(cat "$state")"
+            rm -f "$state"
+          fi

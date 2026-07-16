@@ -188,6 +188,12 @@ class FakeGhTestCase(unittest.TestCase):
                 {"name": job_name, "status": "completed", "conclusion": "success"}
                 for job_name in sorted(expected)
             ]
+            jobs.extend(
+                {"name": job_name, "status": "completed", "conclusion": "skipped"}
+                for job_name in sorted(
+                    release_tools.SKIPPED_WORKFLOW_JOB_NAMES.get(name, set())
+                )
+            )
             (self.gh_root / f"jobs-{item['id']}.json").write_text(
                 json.dumps({"total_count": len(jobs), "jobs": jobs}),
                 encoding="utf-8",
@@ -280,6 +286,34 @@ class WorkflowGateTests(FakeGhTestCase):
                 ):
                     self.run_gate()
 
+    def test_requires_reviewed_push_only_jobs_to_skip(self):
+        for mutation in (
+            None,
+            {"status": "completed", "conclusion": "success"},
+            {"status": "completed", "conclusion": "failure"},
+            {"status": "in_progress", "conclusion": None},
+        ):
+            self.workflow_response("ci.yml", self.success())
+            self.workflow_response("security.yml", self.success())
+            path = self.gh_root / "jobs-200.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if mutation is None:
+                document["jobs"] = [
+                    job
+                    for job in document["jobs"]
+                    if job["name"] != "Dependency review"
+                ]
+                document["total_count"] -= 1
+                path.write_text(json.dumps(document), encoding="utf-8")
+                message = "omitted expected jobs"
+            else:
+                self.mutate_job(200, "Dependency review", **mutation)
+                message = "did not skip as reviewed"
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                release_tools.ReleaseError, message
+            ):
+                self.run_gate()
+
     def test_rejects_incomplete_or_noisy_job_inspection(self):
         self.workflow_response("ci.yml", self.success())
         self.workflow_response("security.yml", self.success())
@@ -345,11 +379,16 @@ class WorkflowGateTests(FakeGhTestCase):
 
         def successful_jobs(workflow):
             names = release_tools.REQUIRED_WORKFLOW_JOB_NAMES[workflow]
+            skipped = release_tools.SKIPPED_WORKFLOW_JOB_NAMES.get(workflow, set())
             return {
-                "total_count": len(names),
+                "total_count": len(names) + len(skipped),
                 "jobs": [
                     {"name": name, "status": "completed", "conclusion": "success"}
                     for name in names
+                ]
+                + [
+                    {"name": name, "status": "completed", "conclusion": "skipped"}
+                    for name in skipped
                 ],
             }
 
@@ -951,6 +990,10 @@ class WorkflowStaticTests(unittest.TestCase):
         self.assertEqual(
             release_tools.REQUIRED_WORKFLOW_JOB_NAMES["security.yml"],
             security_names,
+        )
+        self.assertEqual(
+            release_tools.SKIPPED_WORKFLOW_JOB_NAMES["security.yml"],
+            {security["jobs"]["dependency-review"]["name"]},
         )
 
 

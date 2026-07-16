@@ -66,6 +66,9 @@ REQUIRED_WORKFLOW_JOB_NAMES = {
         "Security publication gate",
     },
 }
+SKIPPED_WORKFLOW_JOB_NAMES = {
+    "security.yml": {"Dependency review"},
+}
 
 
 class ReleaseError(RuntimeError):
@@ -279,6 +282,9 @@ def verify_workflow_jobs(repository: str, workflow: str, run_id: int) -> None:
     expected = REQUIRED_WORKFLOW_JOB_NAMES.get(workflow)
     if expected is None:
         raise ReleaseError(f"no reviewed job manifest for workflow: {workflow}")
+    skipped = SKIPPED_WORKFLOW_JOB_NAMES.get(workflow, set())
+    if expected & skipped:
+        raise ReleaseError(f"reviewed job manifests overlap for workflow: {workflow}")
     document = gh_api(
         repository,
         f"repos/{repository}/actions/runs/{run_id}/jobs",
@@ -302,12 +308,13 @@ def verify_workflow_jobs(repository: str, workflow: str, run_id: int) -> None:
         if name in by_name:
             raise ReleaseError(f"required workflow {workflow} duplicated job {name}")
         by_name[name] = job
-    missing = sorted(expected - set(by_name))
+    reviewed = expected | skipped
+    missing = sorted(reviewed - set(by_name))
     if missing:
         raise ReleaseError(
             f"required workflow {workflow} omitted expected jobs: {', '.join(missing)}"
         )
-    unexpected = sorted(set(by_name) - expected)
+    unexpected = sorted(set(by_name) - reviewed)
     if unexpected:
         raise ReleaseError(
             f"required workflow {workflow} returned unexpected jobs: "
@@ -323,6 +330,17 @@ def verify_workflow_jobs(repository: str, workflow: str, run_id: int) -> None:
         raise ReleaseError(
             f"required workflow {workflow} jobs did not succeed: "
             + ", ".join(unsuccessful)
+        )
+    incorrectly_skipped = sorted(
+        name
+        for name in skipped
+        if by_name[name].get("status") != "completed"
+        or by_name[name].get("conclusion") != "skipped"
+    )
+    if incorrectly_skipped:
+        raise ReleaseError(
+            f"required workflow {workflow} jobs did not skip as reviewed: "
+            + ", ".join(incorrectly_skipped)
         )
 
 
