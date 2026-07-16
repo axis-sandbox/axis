@@ -263,7 +263,11 @@ impl MxcExecutor {
     fn command(&self) -> Command {
         #[cfg(test)]
         {
-            let mut command = Command::new(&self.path);
+            let mut command = if self.injected_script.is_some() && self.path.is_file() {
+                Command::new("/bin/sh")
+            } else {
+                Command::new(&self.path)
+            };
             if let Some(script) = &self.injected_script {
                 command.arg(script);
             }
@@ -5108,7 +5112,7 @@ mod tests {
 
         assert_eq!(executor.path(), executable);
         let command = executor.command();
-        assert_eq!(command.get_program(), &*executable);
+        assert_eq!(command.get_program(), OsStr::new("/bin/sh"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [&*injected_executor_script_path(&executable)]
@@ -8621,8 +8625,7 @@ os.execv({shell_literal}, [{shell_literal}, "-c", "sleep 1"])
             && mode & 0o022 == 0
         {
             write_file(&injected_executor_script_path(path), script, 0o600);
-            fs::copy("/bin/sh", path).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            write_file(path, script, mode);
             return;
         }
         write_file(path, script, mode);
