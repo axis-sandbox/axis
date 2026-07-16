@@ -20,9 +20,9 @@ import yaml
 
 
 ATTEST_ACTION = "actions/attest@a1948c3f048ba23858d222213b7c278aabede763"
-CHECKOUT_ACTION = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
-PATHS_FILTER_ACTION = "dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050"
-NODE_ACTION = "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"
+CHECKOUT_ACTION = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+PATHS_FILTER_ACTION = "dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590"
+NODE_ACTION = "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
 RUST_ACTION = "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30"
 GO_ACTION = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
 PYTHON_ACTION = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
@@ -121,31 +121,31 @@ NIGHTLY_JOBS = {
 GUI_JOBS = {"build-frontend", "build-macos", "build-linux", "build-windows"}
 # Canonical job digests cover every field and preserve ordered step lists.
 EXACT_RELEASE_JOB_DIGESTS = {
-    "identity": "05735ee8c1cc6d84a864dd6af4b64ba42bf28212ec00684bf459debdf25e769a",
-    "gate": "19bc28d632fa6e42ae6c36e3a50c1e11ad77e01d60e848ae6ec9a0b757ba81e1",
+    "identity": "6294ecb850d44565fa8a2943defd1395a9665c5fe562bb9e2f0da3bd3c5c148b",
+    "gate": "fc94d9feb6f93110b6bedce5e09da23c7d031574a6d575c4192fd06eb05b4a16",
     "gui": "385abeea4a0aac4cb93b8fc4f50c08bdf89d6949b9a217c2c000efa04bc3eaeb",
-    "build": "6f5da916d56c27c467cbf58eca9df3ac0b0140cbfb405146f8ad9515ebb15d65",
-    "package-linux": "4ce896e982fd69d5455b6aa361cf949207384c11d73100e0f41ef7bd7b9839ad",
-    "sbom": "b190f1d6383a35219aef49f631c6e5f76a063fcc80c3dce4d1974ade86019bd9",
-    "checksums": "8bdb3588e2f3cd78b7dd260468d195a7073b691768c05633847568d40cf72ed1",
-    "attest": "d20312d6e8cbfaad5460e151cb5b4d86e9a8d12c6fe93fd51546bb54837903dc",
-    "release": "a2c5e7112b67398928b8d8cfaabf3265ceb2a1c9d64cdcbdfdb8144f31f6cd30",
+    "build": "4e183d9e7aeab170221e195546c1e928bc8b9b609fe69aff28873b54169af89a",
+    "package-linux": "21e55ae45b81a72b31525ffe4109bd3247661c931ee36a05c630f5b7622afea4",
+    "sbom": "5ad3b64222cba6805099381d74434212b7762f86fdaef758857f127a36723c3a",
+    "checksums": "fc4e16e505ca0b1615f92184a47701a1fee165c9c84faa89c18fd4c68c424244",
+    "attest": "f6490623e3e762e6c577148057f6becfda8dd0a18a628c45fcae6a1ef3f226d9",
+    "release": "16e2d0d224b32106bf19fa04f4d60a30e6bf1adb90816128835d7d492c7aea55",
 }
 EXACT_NIGHTLY_JOB_DIGESTS = {
-    "source": "610e1d3697303b3929c176524d63b57d773cf3c54e048f7c2c748538d9d7ee8b",
-    "gate": "b9848a04b1489697a31aacdf6a8af778533c98e535a52c4d0a7b7767d6609e07",
+    "source": "d63a4365d5bee45367b514de586c88040c4f1e1ce35622dd5459bf8833a5b103",
+    "gate": "b84a2d8debf8476fb38e7fcd255ebc7b17eb54e9ecf8549bad7a2ce7aa4ffe94",
     "gui": "d2e806ebd8d87b3d84ea52d7d7b8f171117bc344abfd76e0e77c7f46e1e2e740",
-    "build": "07e0d0966499a02af95c6daf8f3f8472653b889148320549d4217a93d200e3ab",
-    "sbom": "39aa01781a2f15ab42742c711974680099c9bf4ee0b9d5b079d7f7fffe75c0ae",
-    "checksums": "e0ffa207884b568f7f99226aab32e0ad72417ec9d734fb0c4f77444ddbb78232",
-    "attest": "41efe2b79e4796f4931b033ef0b2e87f7ec6b92e30c137471a795861a9cab8d5",
-    "publish": "95b186262694bfc7b3add9e6b00ad9fa3b8acd753ed939171c58465dd5a2c040",
+    "build": "476b88832348bd78320dcb9c0ab899d878de6c818f5abf14952bb4c8cd86cdc3",
+    "sbom": "150ce03d29e1847b65425b801d31640da6085adc3e475d0eee1c92c1c14cd41d",
+    "checksums": "a49bf91fc21806960ce8e444c4e5ea615798c8f4f518f94c1e7765113e808a63",
+    "attest": "1afb5eaa52877a128c776660566c1e076615468790fcaeecf4b3cbaa61c4ea16",
+    "publish": "a588292d1bd1fcacdae4080ae22dbe5e768627e15cc1f9e05dd8bcbb2fd3dc00",
 }
 EXACT_GUI_JOB_DIGESTS = {
-    "build-frontend": "bb570d4ee04233ad829af7969e0098c050ae2acd41299735bc59674a32489a3f",
-    "build-macos": "f8c575b81409c28b43b98dd052670c6065e961f51dab1f03f4ca12d38903877c",
-    "build-linux": "f8f742362aaf8a2a44c3186b8bcbb2abc4ba3392f554baa5e9ffd6ffa7f756ca",
-    "build-windows": "41f52c5b49423293e2daf6f8e8f1770f30aab7c658d8495c3c132a3aa4c4915b",
+    "build-frontend": "03ff2e23d4c21caa80f900ec2cdbc28c26918e8d00e2a14c0018b4bbbc82b31e",
+    "build-macos": "52baf4504ecfb656158e4e91956ea3c4a8d70ca17382990b93e6869e7a106c10",
+    "build-linux": "03dad9cb07d46595b3ceeb2585692739d2225e204248b8c6e708f77201942b50",
+    "build-windows": "005f4aefadde80251f5a5fab3eddffdb32c0c8686d073ddc1aba5ae0676399fa",
 }
 CI_JOBS = {
     "format",
