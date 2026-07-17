@@ -2107,7 +2107,11 @@ impl SandboxImpl for MxcLinuxSandbox {
                 Ok(status) => status,
                 Err(err) => {
                     self.exit_code = Some(-1);
-                    kill_process_group(pid);
+                    if err.kind() == io::ErrorKind::TimedOut {
+                        signal_process_group(pid);
+                    } else {
+                        kill_process_group(pid);
+                    }
                     if let Err(cleanup_error) = self.cleanup_after_stop() {
                         return Err(SandboxError::IsolationFailed(format!(
                             "process cleanup failed after wait error {err}: {cleanup_error}"
@@ -3861,19 +3865,23 @@ async fn wait_runtime_child_with_timeout(
         result = &mut wait_task => join_child_wait(result),
         _ = &mut timeout => {
             tracing::warn!("MXC sandbox child pid={pid} exceeded timeout of {timeout_sec}s");
-            kill_process_group_until_stopped(pid, Duration::from_millis(500));
+            signal_process_group(pid);
             let reap_grace = Duration::from_secs(POST_TIMEOUT_REAP_GRACE_SEC);
             match tokio::time::timeout(reap_grace, &mut wait_task).await {
                 Ok(result) => {
+                    let result = join_child_wait(result);
                     kill_process_group_until_stopped(pid, Duration::from_millis(500));
-                    join_child_wait(result)
+                    result
                 }
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "MXC child pid={pid} did not exit within {POST_TIMEOUT_REAP_GRACE_SEC}s after SIGKILL"
-                    ),
-                )),
+                Err(_) => {
+                    signal_process_group(pid);
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "MXC child pid={pid} did not exit within {POST_TIMEOUT_REAP_GRACE_SEC}s after SIGKILL"
+                        ),
+                    ))
+                }
             }
         }
     }
@@ -3908,9 +3916,13 @@ fn wait_for_killed_child(child: &mut Child, pid: i32) -> i32 {
 }
 
 fn kill_process_group(pid: i32) {
+    signal_process_group(pid);
+    unsafe { while libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
+}
+
+fn signal_process_group(pid: i32) {
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
-        while libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
     }
 }
 
@@ -3945,6 +3957,28 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn process_group_signal_leaves_group_leader_for_child_waiter() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as i32;
+
+        signal_process_group(pid);
+        let status = child.wait().unwrap();
+
+        assert!(!status.success());
+        kill_process_group(pid);
+    }
 
     #[test]
     fn netns_helper_owner_pidfd_is_inherited_only_by_the_helper() {

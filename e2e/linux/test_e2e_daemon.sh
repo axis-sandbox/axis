@@ -22,6 +22,8 @@ SKIP=0
 TMP_ROOT="$(mktemp -d /tmp/axis-daemon-e2e-XXXXXX)"
 SOCKET="${TMP_ROOT}/axis.sock"
 AXSD_PID=""
+READY_WORKSPACE=""
+READY_PID=""
 
 cleanup() {
     if [ -n "$AXSD_PID" ]; then
@@ -109,6 +111,7 @@ EOF
     cat >>"$POLICY_FILE" <<EOF
   read_write:
     - "{workspace}"
+    - /dev/null
 
 process:
   max_processes: 0
@@ -176,6 +179,36 @@ pid_alive() {
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+wait_for_sandbox_child() {
+    local id="$1"
+    local attempts="${2:-50}"
+    local workspace=""
+    local pid=""
+    READY_WORKSPACE=""
+    READY_PID=""
+    for _ in $(seq 1 "$attempts"); do
+        workspace="$(sandbox_workspace "$id" 2>/dev/null || true)"
+        if [ -n "$workspace" ] && [ -d "$workspace" ]; then
+            READY_WORKSPACE="$workspace"
+            if [ -s "${workspace}/sleep.pid" ]; then
+                pid="$(cat "${workspace}/sleep.pid")"
+                if pid_alive "$pid"; then
+                    READY_PID="$pid"
+                    return 0
+                fi
+            fi
+        fi
+        sleep 0.1
+    done
+    if [ -n "$READY_WORKSPACE" ]; then
+        echo "--- sandbox stdout ---" >&2
+        cat "${READY_WORKSPACE}/stdout.log" >&2 2>/dev/null || true
+        echo "--- sandbox stderr ---" >&2
+        cat "${READY_WORKSPACE}/stderr.log" >&2 2>/dev/null || true
+    fi
+    return 1
+}
+
 cleanup_pid_if_alive() {
     local pid="$1"
     if pid_alive "$pid"; then
@@ -200,6 +233,11 @@ summary() {
     echo ""
     echo "  ---------------------------------------------------------"
     echo "  Result: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
+    if [ "$FAIL" -ne 0 ]; then
+        echo ""
+        echo "--- axisd log ---"
+        cat "${TMP_ROOT}/axisd.log" 2>/dev/null || true
+    fi
     [ "$FAIL" -eq 0 ]
 }
 
@@ -245,17 +283,19 @@ elif [ "$create_status" -ne 0 ]; then
 else
     pass "sandbox created: $SANDBOX_ID"
 
-    sandbox_dir="$(sandbox_workspace "$SANDBOX_ID")"
+    if wait_for_sandbox_child "$SANDBOX_ID"; then
+        child_ready=1
+    else
+        child_ready=0
+    fi
+    sandbox_dir="$READY_WORKSPACE"
+    sleep_pid="$READY_PID"
     if [ -n "$sandbox_dir" ] && [ -d "$sandbox_dir" ]; then
         pass "sandbox visible in list"
     else
         fail "sandbox visible in list"
     fi
-    sleep_pid=""
-    if [ -n "$sandbox_dir" ] && [ -s "${sandbox_dir}/sleep.pid" ]; then
-        sleep_pid="$(cat "${sandbox_dir}/sleep.pid")"
-    fi
-    if [ -n "$sleep_pid" ] && pid_alive "$sleep_pid"; then
+    if [ "$child_ready" -eq 1 ]; then
         pass "sandbox child process is running"
     else
         fail "sandbox child process is running"
@@ -318,16 +358,13 @@ elif [ "$timeout_create_status" -ne 0 ]; then
 else
     timeout_id="$SANDBOX_ID"
     pass "timeout sandbox created: $timeout_id"
-    timeout_dir="$(sandbox_workspace "$timeout_id")"
-    timeout_pid=""
-    if [ -n "$timeout_dir" ] && [ -s "${timeout_dir}/sleep.pid" ]; then
-        timeout_pid="$(cat "${timeout_dir}/sleep.pid")"
-    fi
-    if [ -n "$timeout_pid" ] && pid_alive "$timeout_pid"; then
+    if wait_for_sandbox_child "$timeout_id"; then
         pass "timeout sandbox child process is running"
     else
         fail "timeout sandbox child process is running"
     fi
+    timeout_dir="$READY_WORKSPACE"
+    timeout_pid="$READY_PID"
     if wait_for_absent "$timeout_id"; then
         pass "timeout destroys sandbox and cleanup removes it from list"
     else
@@ -356,16 +393,13 @@ if command -v python3 >/dev/null 2>&1; then
         fail "block-mode sandbox created"
     else
         block_id="$SANDBOX_ID"
-        block_dir="$(sandbox_workspace "$block_id")"
-        block_pid=""
-        if [ -n "$block_dir" ] && [ -s "${block_dir}/sleep.pid" ]; then
-            block_pid="$(cat "${block_dir}/sleep.pid")"
-        fi
-        if [ -n "$block_pid" ] && pid_alive "$block_pid"; then
+        if wait_for_sandbox_child "$block_id"; then
             pass "block-mode sandbox child process is running"
         else
             fail "block-mode sandbox child process is running"
         fi
+        block_dir="$READY_WORKSPACE"
+        block_pid="$READY_PID"
         set +e
         axis_cli exec --sandbox "$block_id" -- python3 -c 'import socket, sys
 checks = [
@@ -411,22 +445,13 @@ elif [ "$crash_create_status" -ne 0 ]; then
     fail "crash-cleanup sandbox created"
 else
     crash_id="$SANDBOX_ID"
-    crash_dir="$(sandbox_workspace "$crash_id")"
-    crash_pid=""
-    if [ -n "$crash_dir" ]; then
-        for _ in $(seq 1 50); do
-            if [ -s "${crash_dir}/sleep.pid" ]; then
-                crash_pid="$(cat "${crash_dir}/sleep.pid")"
-                break
-            fi
-            sleep 0.1
-        done
-    fi
-    if [ -n "$crash_pid" ] && pid_alive "$crash_pid"; then
+    if wait_for_sandbox_child "$crash_id"; then
         pass "crash-cleanup sandbox child process is running"
     else
         fail "crash-cleanup sandbox child process is running"
     fi
+    crash_dir="$READY_WORKSPACE"
+    crash_pid="$READY_PID"
 
     if [ -n "$AXSD_PID" ]; then
         kill -KILL "$AXSD_PID" 2>/dev/null || true

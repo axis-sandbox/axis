@@ -67,6 +67,11 @@ const ACCESS_READ_WRITE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_REFER
     | LANDLOCK_ACCESS_FS_TRUNCATE;
 
+const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+    | LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_READ_FILE
+    | LANDLOCK_ACCESS_FS_TRUNCATE;
+
 // ── Landlock structs (must match kernel ABI) ──────────────────────────────
 
 #[repr(C)]
@@ -431,6 +436,14 @@ fn add_path_rule(
         };
     }
 
+    let access = match access_for_open_path(fd, access) {
+        Ok(access) => access,
+        Err(err) => {
+            unsafe { libc::close(fd) };
+            return Err(format!("cannot inspect '{path}': {err}"));
+        }
+    };
+
     let rule = LandlockPathBeneathAttr {
         allowed_access: access,
         parent_fd: fd,
@@ -450,6 +463,19 @@ fn add_path_rule(
     }
 
     Ok(())
+}
+
+fn access_for_open_path(fd: RawFd, requested: u64) -> Result<u64, std::io::Error> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        Ok(requested)
+    } else {
+        Ok(requested & ACCESS_FILE)
+    }
 }
 
 fn set_close_on_exec(fd: RawFd) -> Result<(), String> {
@@ -745,6 +771,7 @@ fn normalize_existing_or_absolute_path(path: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn detect_landlock_abi() {
@@ -780,6 +807,43 @@ mod tests {
         let err = handled_access_for_abi(2).unwrap_err();
         assert!(err.contains("require Landlock ABI >= 3"));
         assert_eq!(handled_access_for_abi(3).unwrap(), ACCESS_READ_WRITE);
+    }
+
+    #[test]
+    fn file_rules_exclude_directory_only_access_rights() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("file");
+        std::fs::write(&file_path, b"data").unwrap();
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let file = std::fs::File::open(&file_path).unwrap();
+        let null = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+
+        assert_eq!(
+            access_for_open_path(directory.as_raw_fd(), ACCESS_READ_WRITE).unwrap(),
+            ACCESS_READ_WRITE
+        );
+        assert_eq!(
+            access_for_open_path(file.as_raw_fd(), ACCESS_READ_WRITE).unwrap(),
+            ACCESS_FILE
+        );
+        assert_eq!(
+            access_for_open_path(null.as_raw_fd(), ACCESS_READ_WRITE).unwrap(),
+            ACCESS_FILE
+        );
+        assert_eq!(
+            access_for_open_path(file.as_raw_fd(), ACCESS_READ).unwrap(),
+            ACCESS_READ & ACCESS_FILE
+        );
+        assert_eq!(
+            access_for_open_path(-1, ACCESS_READ_WRITE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 
     #[test]
@@ -1174,6 +1238,33 @@ mod tests {
         };
 
         let ruleset = prepare_landlock(&policy, dir.path()).unwrap();
+        drop(ruleset);
+    }
+
+    #[test]
+    fn hard_requirement_prepare_accepts_file_and_character_device_rules() {
+        if !contract_landlock_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let read_only = dir.path().join("read-only");
+        let read_write = dir.path().join("read-write");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&read_only, b"read-only").unwrap();
+        std::fs::write(&read_write, b"read-write").unwrap();
+        let policy = FilesystemPolicy {
+            read_only: vec![read_only.to_string_lossy().into_owned()],
+            read_write: vec![
+                read_write.to_string_lossy().into_owned(),
+                "/dev/null".into(),
+            ],
+            compatibility: Compatibility::HardRequirement,
+            ..Default::default()
+        };
+
+        let ruleset = prepare_landlock(&policy, &workspace).unwrap();
         drop(ruleset);
     }
 
