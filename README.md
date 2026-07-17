@@ -270,3 +270,8 @@ retention decisions are documented in
 ## License
 
 Apache 2.0
+
+## Experimental Status
+
+AXIS is at an early experimental development stage and is under active development.
+APIs, policies, and sandbox behavior are subject to change.
