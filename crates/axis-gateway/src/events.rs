@@ -72,7 +72,7 @@ pub async fn handle_ws_upgrade(
                     match event {
                         Ok(e) => {
                             let json = serde_json::to_string(&e).unwrap_or_default();
-                            if ws_tx.send(Message::Text(json)).await.is_err() { break; }
+                            if ws_tx.send(Message::Text(json.into())).await.is_err() { break; }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("ws events lagged {n}");
@@ -149,7 +149,7 @@ pub async fn handle_pty_upgrade(
                 let mut frame = Vec::with_capacity(1 + chunk.len());
                 frame.push(0x00);
                 frame.extend_from_slice(chunk);
-                if ws_tx.send(Message::Binary(frame)).await.is_err() {
+                if ws_tx.send(Message::Binary(frame.into())).await.is_err() {
                     return;
                 }
             }
@@ -163,7 +163,7 @@ pub async fn handle_pty_upgrade(
                                 let mut frame = Vec::with_capacity(1 + bytes.len());
                                 frame.push(0x00);
                                 frame.extend_from_slice(&bytes);
-                                if ws_tx.send(Message::Binary(frame)).await.is_err() { break; }
+                                if ws_tx.send(Message::Binary(frame.into())).await.is_err() { break; }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("pty ws lagged {n}");
@@ -193,9 +193,10 @@ pub async fn handle_pty_upgrade(
             }
         } else {
             let _ = ws_tx
-                .send(Message::Text(format!(
-                    "\r\nSandbox {sandbox_id} not found or output not captured.\r\n"
-                )))
+                .send(Message::Text(
+                    format!("\r\nSandbox {sandbox_id} not found or output not captured.\r\n")
+                        .into(),
+                ))
                 .await;
         }
         tracing::debug!("pty ws disconnected for {sandbox_id}");
